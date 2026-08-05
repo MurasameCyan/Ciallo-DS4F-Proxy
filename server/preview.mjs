@@ -80,8 +80,27 @@ function available() {
   return NODES.filter((n) => !state.cooldowns.has(n));
 }
 
-/** 模拟一次请求:多数成功,偶发 429 触发冷却 + 换节点 */
+/**
+ * 模拟一次请求:多数成功,偶发 429 触发冷却。
+ *
+ * 换节点必须发生在「发请求之前」而不是「429 之后」—— 真网关就是先
+ * pickAvailable 再出站。写在 429 分支里的话,等某一刻全员冷却、那次挑选
+ * 失败后,current 就再也不会被重新挑一遍,日志会一直拿那个冷却中的节点刷
+ * 成功行,而节点池又按规则把它排进冷却区,两边对不上。
+ */
 function simulate() {
+  coolingList();                       // 先清过期项,否则 available() 会把已恢复的节点当成还在冷却
+
+  if (state.cooldowns.has(state.current)) {
+    const next = available()[0];
+    if (!next) {
+      log('error', '[cooldown] 所有节点冷却中,等待恢复');
+      return;                          // 不计数:这一发根本没出去
+    }
+    state.current = next;
+    log('info', `[switch] -> ${next}`);
+  }
+
   const u = state.usage.total;
   u.requests++;
   state.usage.lastRequest = Date.now();
@@ -90,12 +109,12 @@ function simulate() {
     u.fail++;
     state.cooldowns.set(state.current, Date.now());
     log('warn', `[429] ${state.current} 限流,冷却 90s`);
+    // 当场换,别把 current 留在冷却节点上等下一 tick —— 那几秒里 /api/nodes
+    // 会报一个自己正在冷却的 current,面板读到的是个自相矛盾的状态
     const next = available()[0];
     if (next) {
       state.current = next;
       log('info', `[switch] -> ${next}`);
-    } else {
-      log('error', '[cooldown] 所有节点冷却中,等待恢复');
     }
     return;
   }

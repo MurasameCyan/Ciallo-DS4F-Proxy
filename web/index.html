@@ -57,15 +57,41 @@
 
   <div class="grid main">
 
+   <!-- 主栏 -->
+   <div class="col">
+
     <!-- ── 节点池 ───────────────────────────────────────── -->
-    <section class="card span2" aria-labelledby="h-nodes">
+    <section class="card" aria-labelledby="h-nodes">
       <div class="card-head">
         <h2 id="h-nodes">节点池</h2>
         <p class="hint">从上往下就是网关接下来会用的顺序。429 后冷却 90 秒。</p>
       </div>
       <ul class="nodes" id="nodes" aria-live="polite"></ul>
-      <p class="empty" id="nodes-empty" hidden>还没有节点 —— 先在下面填订阅地址。</p>
+      <p class="empty" id="nodes-empty" hidden>还没有节点 —— 先填右边的订阅地址。</p>
     </section>
+
+    <!-- ── 日志 ─────────────────────────────────────────── -->
+    <section class="card" aria-labelledby="h-log">
+      <div class="card-head">
+        <h2 id="h-log">运行日志</h2>
+        <div class="log-tools">
+          <div class="segs" role="group" aria-label="按级别过滤">
+            <button type="button" class="seg on" data-lv="all">全部</button>
+            <button type="button" class="seg" data-lv="ok">成功</button>
+            <button type="button" class="seg" data-lv="warn">警告</button>
+            <button type="button" class="seg" data-lv="error">错误</button>
+          </div>
+          <label class="chk"><input type="checkbox" id="f-follow" checked><span>自动滚动</span></label>
+          <button type="button" class="btn tiny" id="btn-logclear">清屏</button>
+        </div>
+      </div>
+      <ol class="log" id="log" tabindex="0" aria-label="日志输出"></ol>
+    </section>
+
+   </div>
+
+   <!-- 侧栏 -->
+   <div class="col">
 
     <!-- ── 接入信息 ─────────────────────────────────────── -->
     <section class="card" aria-labelledby="h-conn">
@@ -114,23 +140,7 @@
       </form>
     </section>
 
-    <!-- ── 日志 ─────────────────────────────────────────── -->
-    <section class="card span3" aria-labelledby="h-log">
-      <div class="card-head">
-        <h2 id="h-log">运行日志</h2>
-        <div class="log-tools">
-          <div class="segs" role="group" aria-label="按级别过滤">
-            <button type="button" class="seg on" data-lv="all">全部</button>
-            <button type="button" class="seg" data-lv="ok">成功</button>
-            <button type="button" class="seg" data-lv="warn">警告</button>
-            <button type="button" class="seg" data-lv="error">错误</button>
-          </div>
-          <label class="chk"><input type="checkbox" id="f-follow" checked><span>自动滚动</span></label>
-          <button type="button" class="btn tiny" id="btn-logclear">清屏</button>
-        </div>
-      </div>
-      <ol class="log" id="log" tabindex="0" aria-label="日志输出"></ol>
-    </section>
+   </div>
 
   </div>
 </main>

@@ -84,13 +84,17 @@ function renderNodes() {
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
-  ul.replaceChildren(...rows.map((n) => {
+  ul.replaceChildren(...rows.map((n, k) => {
     const li = document.createElement('li');
     li.className = `node ${n.state}`;
 
+    // 编号用排序后的位次,不是订阅里的下标(n.i)。卡片说「从上往下就是网关
+    // 接下来会用的顺序」,那这一列就得是那个顺序;拿订阅下标去标一个已排过序
+    // 的列表,冷却的节点被排到看不见的下面之后,剩下的会显示成 1,2,3,4,7,8,
+    // 读着像丢了两行。要回查订阅位置的话节点名本来就是唯一的。
     const idx = document.createElement('span');
     idx.className = 'idx';
-    idx.textContent = n.i + 1;
+    idx.textContent = k + 1;
 
     const nm = document.createElement('span');
     nm.className = 'nm';

@@ -14,3 +14,6 @@ data/
 # 内核二进制体积大,由构建时下载
 bin/
 resources/mihomo/
+
+# scripts/shot.mjs 的截图产物
+.shots/
