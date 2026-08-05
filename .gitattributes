@@ -1,0 +1,6 @@
+# 统一用 LF。这项目最终跑在 Linux 容器里,CRLF 会让 shell 脚本
+# 报 "bad interpreter: /bin/sh^M" 而无法执行。
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
