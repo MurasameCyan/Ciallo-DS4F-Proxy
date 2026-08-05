@@ -1,0 +1,16 @@
+node_modules/
+*.log
+
+# 运行时数据:含订阅凭据和 API Key,绝不入库
+config.json
+usage.json
+last-node.txt
+mihomo-zen.yaml
+mihomo-data/
+data/
+.env
+.env.*
+
+# 内核二进制体积大,由构建时下载
+bin/
+resources/mihomo/
