@@ -10,6 +10,8 @@ mihomo-data/
 data/
 .env
 .env.*
+# 例外:模板里没有真凭据,而用户就是靠它起步的(cp .env.example .env)
+!.env.example
 
 # 内核二进制体积大,由构建时下载
 bin/
@@ -17,3 +19,7 @@ resources/mihomo/
 
 # scripts/shot.mjs 的截图产物
 .shots/
+
+# 设计稿参考图和提取脚本:一次性产物,不是交付内容
+.refs/
+scripts/extract-imgs.mjs

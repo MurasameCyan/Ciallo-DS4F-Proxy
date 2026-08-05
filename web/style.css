@@ -122,24 +122,33 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 /* ── 布局 ─────────────────────────────────────────────── */
 
+/* 三列:上排 概览(2×2 一块) | 接入 | 配置,下排 日志(跨两列) | 节点池。
+   卡片直接当 grid item,DOM 顺序就是视觉顺序,不用显式定位。
+   不做「一栏一个 div 各自叠」:那样两栏底边对不齐,而这里下排两张卡
+   要等高(grid 行默认 stretch,免费拿到)。 */
 main {
   max-width: 1240px;
   margin: 0 auto;
   padding: 22px 22px 56px;
-  display: grid; gap: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 340px;
+  gap: 16px;
 }
 
 .grid { display: grid; gap: 16px; }
-.stats { grid-template-columns: repeat(4, 1fr); }
+.stats { grid-template-columns: repeat(2, 1fr); }  /* 2×2,占三列里的第一格 */
+.span2 { grid-column: span 2; }
 
-/* 两栏:主栏(节点池 + 日志)+ 侧栏(接入 + 配置)。
-   刻意不做「卡片自由流」—— 卡片高度天生不齐,自由流会让矮卡片掉到
-   下一行、旁边空出一大片。分栏后各栏内部自己叠,不互相牵连。 */
-.main { grid-template-columns: minmax(0, 1fr) 340px; align-items: start; }
-.col  { display: grid; gap: 16px; min-width: 0; }
+/* 下排两张卡:高度由行决定(取两者较高),内部滚动区吃掉剩余空间。
+   日志的 300px 是基准高,节点池跟着它长 —— 于是不用再手算「几行半」
+   那种魔数,节点多了就滚动,底边永远和日志齐平。 */
+.fill { display: flex; flex-direction: column; }
 
 @media (max-width: 1080px) {
-  .main { grid-template-columns: 1fr; }
+  /* 单列。此时行高不再由邻居撑起,.nodes 自己的 basis 兜底 */
+  main { grid-template-columns: minmax(0, 1fr); }
+  .span2 { grid-column: auto; }
+  .stats { grid-template-columns: repeat(4, 1fr); }
 }
 @media (max-width: 900px) {
   .stats { grid-template-columns: repeat(2, 1fr); }
@@ -203,20 +212,18 @@ main {
 /* ── 节点池 ───────────────────────────────────────────── */
 
 /* 限高滚动:机场订阅动辄几十上百个节点,不限高的话这张卡会把页面拉到几屏长。
-   这里用固定 max-height 而非按视口算;真要更贴合可换 dvh。
-
-   388 不是随手取的:一行 52px(45 行高 + 7 gap),388 / 52 = 7.46,于是第 8 行
-   正好露出一半。切在行中间本身就是「下面还有」的提示 —— 比渐隐、比额外加个
-   「共 N 个」脚注都省,而且不会被误读成列表到此为止(420px 那版就是切在行
-   边界上,12 个节点看起来像只有 8 个)。
-   ponytail: 代价是这个数字咬死了行距。改 .node 的 padding/字号就得回来重算,
-   要免维护得上 JS 量 offsetHeight,为半行提示不值当。 */
+   高度不写死 —— 三列布局下由 .fill 撑满行(和日志卡等高),单列布局下退回
+   flex-basis 的 300px。列表撑不满时 align-content: start 让行别被拉散。
+   ponytail: 300px 只在单列时生效,是个「大约七行」的手感值,没和行距挂钩。 */
 .nodes {
-  display: grid; gap: 7px;
-  max-height: 388px; overflow-y: auto;
+  display: grid; gap: 7px; align-content: start;
+  flex: 1 1 300px; min-height: 0; overflow-y: auto;
   padding-right: 4px;                /* 给滚动条留位,避免压住徽章 */
   overscroll-behavior: contain;
 }
+
+/* 空态时别占着 300px 的坑,让位给下面那句提示 */
+.nodes:empty { flex: none; }
 
 /* 滚动条降噪,不然深色底上一条亮灰很抢眼 */
 .nodes::-webkit-scrollbar, .log::-webkit-scrollbar { width: 9px; }
@@ -354,7 +361,8 @@ input[readonly] { color: var(--fg-2); }
 .chk input { accent-color: var(--mint); }
 
 .log {
-  height: 300px; overflow-y: auto;
+  /* 300px 是基准高;三列布局下和节点池互相看谁高,矮的那张跟着长 */
+  flex: 1 1 300px; min-height: 0; overflow-y: auto;
   padding: 11px 13px;
   border: 1px solid var(--line); border-radius: var(--r-sm);
   background: var(--bg);

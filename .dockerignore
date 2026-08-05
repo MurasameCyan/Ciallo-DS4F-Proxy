@@ -1,0 +1,22 @@
+# 构建上下文里不该有的东西。前两组是关键:
+# config.json 含订阅凭据和 API Key,绝不能被 COPY 进镜像层。
+config.json
+usage.json
+last-node.txt
+mihomo-zen.yaml
+mihomo-data/
+data/
+.env
+.env.*
+
+.git
+.github
+node_modules
+.refs
+.shots
+test
+scripts
+README.md
+Dockerfile
+docker-compose.yml
+*.log
