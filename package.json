@@ -8,7 +8,8 @@
     "preview": "node server/preview.mjs",
     "start": "node server/index.mjs",
     "test": "node test/check.mjs && node test/server.mjs",
-    "verify:tunnel": "node scripts/verify-tunnel.mjs"
+    "verify:tunnel": "node scripts/verify-tunnel.mjs",
+    "verify:upstream": "node scripts/verify-upstream.mjs"
   },
   "engines": {
     "node": ">=20"
