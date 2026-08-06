@@ -122,23 +122,23 @@ await t('reset 把三个维度一起清空,并且落盘', () => {
   assert.equal(new UsageTracker(f, () => {}).getStats().total.requests, 0);
 });
 
-// ── 节点测速与排序 ──────────────────────────────────────
+// ── 节点延迟与排序 ──────────────────────────────────────
 
-/** 造一个不需要内核的 Gateway:mihomoApi 换成假的 */
+/** 造一个不需要内核的 Gateway:mihomoApi 换成假的。
+ *  照真内核的行为回 —— 组延迟只回测通的那些,一个都没通就 500。 */
 function fakeGateway(delays) {
   const g = new Gateway(load(), () => {});
   const names = Object.keys(delays);
   g.mihomoApi = async (p) => {
-    const m = decodeURIComponent(p).match(/^\/proxies\/(.+?)\/delay/);
-    if (!m) return { all: names, now: names[0] };
-    const d = delays[m[1]];
-    if (d == null) throw new Error('HTTP 503');   // mihomo 对不通的节点回非 2xx
-    return { delay: d };
+    if (!p.startsWith('/group/')) return { all: names, now: names[0] };
+    const mp = Object.fromEntries(Object.entries(delays).filter(([, d]) => d != null));
+    if (!Object.keys(mp).length) throw new Error('HTTP 500: all proxies timeout');
+    return mp;
   };
   return g;
 }
 
-await t('测速:不通的记 null,通的记毫秒', async () => {
+await t('测延迟:不通的记 null,通的记毫秒', async () => {
   const g = fakeGateway({ A: 300, B: null, C: 80 });
   const r = await g.testNodes();
   assert.equal(r.tested, 3);
@@ -147,6 +147,28 @@ await t('测速:不通的记 null,通的记毫秒', async () => {
   assert.deepEqual(r.fastest, { node: 'C', delay: 80 });
   assert.deepEqual(g.delayMap(), { A: 300, B: null, C: 80 });
   assert.ok(g.testedAt > 0);
+});
+
+await t('节点名里带斜杠也能测(机场爱写「1.4MB/s」)', async () => {
+  // 逐个打 /proxies/{名字}/delay 时这种名字要靠内核反转义 %2F 才对得上;
+  // 走组接口名字只出现在响应体里,这条锁住的就是这个选择
+  const g = fakeGateway({ '🇫🇮FI_1|1.4MB/s': 240, '🇯🇵JP_1|6.1MB/s': null });
+  const r = await g.testNodes();
+  assert.equal(r.alive, 1);
+  assert.deepEqual(r.fastest, { node: '🇫🇮FI_1|1.4MB/s', delay: 240 });
+  assert.deepEqual(r.dead, ['🇯🇵JP_1|6.1MB/s']);
+});
+
+await t('探针参数:打 https,timeout 在内核解析得了的范围里', async () => {
+  const g = fakeGateway({ A: 100 });
+  let seen = '';
+  const inner = g.mihomoApi;
+  g.mihomoApi = (p, ...a) => { if (p.startsWith('/group/')) seen = p; return inner(p, ...a); };
+  await g.testNodes();
+  const q = new URLSearchParams(seen.split('?')[1]);
+  assert.match(q.get('url'), /^https:\/\//, '得走 443 —— 机场封 80 端口很常见,那会把好节点全判死');
+  const to = Number(q.get('timeout'));
+  assert.ok(to > 0 && to <= 32767, '内核那边 timeout 按 int16 解析,超了整个请求直接 400');
 });
 
 await t('rankNodes 按延迟排序并剔除不通的', async () => {
@@ -162,7 +184,7 @@ await t('没测过时 rankNodes 原样返回(退化成订阅顺序,不是空表)
   assert.deepEqual(g.excludedNodes(['A', 'B']), [], '没数据就别声称谁不可用');
 });
 
-await t('全灭时不剔除 —— 测速地址不可达不等于节点不可用', async () => {
+await t('全灭时不剔除 —— 探针地址不可达不等于节点不可用', async () => {
   const g = fakeGateway({ A: null, B: null });
   const r = await g.testNodes();
   assert.equal(r.alive, 0);
@@ -170,7 +192,21 @@ await t('全灭时不剔除 —— 测速地址不可达不等于节点不可用
   assert.deepEqual(g.excludedNodes(['A', 'B']), []);
 });
 
-await t('测速之后才出现的节点保留在表尾,不当成死的', async () => {
+await t('全灭时 rankNodes 不打日志(面板每 2 秒轮一次,会刷满屏)', async () => {
+  const lines = [];
+  const g = new Gateway(load(), (lv, m) => lines.push(m));
+  g.mihomoApi = async (p) => {
+    if (!p.startsWith('/group/')) return { all: ['A', 'B'], now: 'A' };
+    throw new Error('HTTP 500: all proxies timeout');
+  };
+  await g.testNodes();
+  const n = lines.length;
+  for (let i = 0; i < 5; i++) { g.rankNodes(['A', 'B']); g.excludedNodes(['A', 'B']); }
+  assert.equal(lines.length, n, '原因由测延迟那次说清楚,排序本身不该出声');
+  assert.ok(lines.some((m) => m.includes('all proxies timeout')), '内核给的原因必须落到日志里');
+});
+
+await t('测过之后才出现的节点保留在表尾,不当成死的', async () => {
   const g = fakeGateway({ A: 300, B: 80 });
   await g.testNodes();
   assert.deepEqual(g.rankNodes(['A', 'B', 'NEW']), ['B', 'A', 'NEW']);
@@ -184,18 +220,18 @@ await t('锁定的节点测不通时解锁', async () => {
   assert.equal(g.lockedNode, null, '不然 ensureNode 会一直粘着一个已知不通的节点');
 });
 
-await t('并发测速只跑一遍', async () => {
+await t('并发测延迟只跑一遍', async () => {
   let calls = 0;
   const g = fakeGateway({ A: 100, B: 200 });
   const inner = g.mihomoApi;
   g.mihomoApi = (...a) => { calls++; return inner(...a); };
   const [r1, r2] = await Promise.all([g.testNodes(), g.testNodes()]);
   assert.equal(r1, r2, '第二个调用应搭车,不是再测一轮');
-  assert.equal(calls, 3, '1 次取节点 + 2 次测延迟');
-  assert.equal(g.testing, null, '测完要把占位清掉,否则下次点测速直接返回旧结果');
+  assert.equal(calls, 2, '1 次取节点 + 1 次整组测延迟');
+  assert.equal(g.testing, null, '测完要把占位清掉,否则下次点测延迟直接返回旧结果');
 });
 
-await t('一个节点都没有时测速不抛', async () => {
+await t('一个节点都没有时测延迟不抛', async () => {
   const g = new Gateway(load(), () => {});
   g.mihomoApi = async () => ({ all: [] });
   const r = await g.testNodes();
@@ -539,7 +575,7 @@ await t('/api/nodes 给出排过序的表、剔除名单和延迟', async () => 
   assert.equal(j.current, 'B');
 });
 
-await t('POST /api/nodes/test 触发测速并回摘要', async () => {
+await t('POST /api/nodes/test 触发测延迟并回摘要', async () => {
   gateway.mihomoApi = async (p) => {
     const m = decodeURIComponent(p).match(/^\/proxies\/(.+?)\/delay/);
     if (!m) return { all: ['A', 'B'], now: 'A' };

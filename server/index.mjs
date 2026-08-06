@@ -139,9 +139,9 @@ function makeApiRoutes({ cfg, gateway }) {
   }
 
   /**
-   * 等一件事,但最多等这么久。测速是「测完 N 个节点」,17 个节点全超时要 15s,
-   * 上百个节点的订阅能到一分半 —— 那样一个 POST 会挂在前端上像卡死。
-   * 超了就先回,测速在后台继续跑完,面板下一次轮询 /api/nodes 就看到结果。
+   * 等一件事,但最多等这么久。测延迟是整组并发,慢在最慢的那个节点身上:
+   * 全超时就是探针超时那么久,再加上内核的开销 —— 那样一个 POST 挂在前端上
+   * 像卡死。超了就先回,测试在后台跑完,面板下一次轮询 /api/nodes 就看到。
    */
   function atMost(p, ms) {
     let t;
@@ -226,7 +226,7 @@ function makeApiRoutes({ cfg, gateway }) {
         // 都靠它。这一步不能失败到影响保存本身,所以 catch 掉只记日志。
         if (refreshed > 0) {
           speed = await atMost(
-            gateway.testNodes().catch((e) => { log('warn', `[speed] 测速失败: ${e.message}`); return null; }),
+            gateway.testNodes().catch((e) => { log('warn', `[delay] 测延迟失败: ${e.message}`); return null; }),
             20_000);
         }
       }
@@ -291,7 +291,7 @@ function makeApiRoutes({ cfg, gateway }) {
       log('ok', `[reset] 清空 ${cleared} 个冷却记录`);
       log('ok', '===== 手动重置完成 =====');
       // 内核刚重启,节点表可能变了。后台测一遍,别把重置这个请求拖上十几秒。
-      gateway.testNodes().catch((e) => log('warn', `[speed] 重置后测速失败: ${e.message}`));
+      gateway.testNodes().catch((e) => log('warn', `[delay] 重置后测延迟失败: ${e.message}`));
       return json(res, { ok: true, cleared });
     }
 
@@ -342,9 +342,9 @@ async function main() {
       const n = (await gateway.getAllNodes()).length;
       log('ok', `[mihomo] 就绪,${n} 个节点`);
       await gateway.restoreLastNode();
-      // 开机测一遍延迟。不 await:测完要十几秒,而这期间面板和 /v1 都该能用
+      // 开机测一遍延迟。不 await:测完要几秒,而这期间面板和 /v1 都该能用
       // —— 没有延迟数据时 rankNodes 原样返回订阅顺序,退化成旧行为而不是失败。
-      if (n > 0) gateway.testNodes().catch((e) => log('warn', `[speed] 开机测速失败: ${e.message}`));
+      if (n > 0) gateway.testNodes().catch((e) => log('warn', `[delay] 开机测延迟失败: ${e.message}`));
     } catch (e) {
       // 不退出:面板还能用,用户得进来改订阅地址。退了就只剩看 docker logs 猜。
       log('error', `[mihomo] 启动失败: ${e.message}`);

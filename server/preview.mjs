@@ -94,10 +94,10 @@ function excluded() {
   return NODES.filter((n) => state.delay.has(n) && state.delay.get(n) == null);
 }
 
-/** 模拟一遍测速:重新摇一次延迟,不通的那两个保持不通 */
+/** 模拟一遍延迟测试:重新摇一次延迟,不通的那两个保持不通 */
 async function speedTest() {
   const t0 = Date.now();
-  log('info', `[speed] 开始测速,${NODES.length} 个节点`);
+  log('info', `[delay] 开始测延迟,${NODES.length} 个节点`);
   await new Promise((r) => setTimeout(r, 1600));
   for (const n of NODES) {
     if (state.delay.get(n) == null) continue;
@@ -107,8 +107,8 @@ async function speedTest() {
   const alive = ranked();
   const dead = excluded();
   const ms = Date.now() - t0;
-  log('ok', `[speed] 测完 ${NODES.length} 个,可用 ${alive.length},最快 ${alive[0]} ${state.delay.get(alive[0])}ms(耗时 ${(ms / 1000).toFixed(1)}s)`);
-  if (dead.length) log('warn', `[speed] 剔除 ${dead.length} 个不可用: ${dead.join(', ')}`);
+  log('ok', `[delay] 测完 ${NODES.length} 个,可用 ${alive.length},最快 ${alive[0]} ${state.delay.get(alive[0])}ms(耗时 ${(ms / 1000).toFixed(1)}s)`);
+  if (dead.length) log('warn', `[delay] 剔除 ${dead.length} 个不可用: ${dead.join(', ')}`);
   return { tested: NODES.length, alive: alive.length, dead, fastest: { node: alive[0], delay: state.delay.get(alive[0]) }, ms };
 }
 

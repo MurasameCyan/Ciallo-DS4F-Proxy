@@ -116,7 +116,7 @@ proxy-providers:
     interval: 3600
     health-check:
       enable: true
-      # lazy:没请求走这个组时不测速。不然十几个节点每 5 分钟测一轮,
+      # lazy:没请求走这个组时不主动测延迟。不然十几个节点每 5 分钟测一轮,
       # 机场流量白烧,还可能因为高频探测被判异常。
       lazy: true
       url: 'http://www.gstatic.com/generate_204'

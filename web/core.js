@@ -144,7 +144,7 @@ export function delayGrade(ms) {
   return 'slow';
 }
 
-/** 「上次测速」显示成相对时间;测速是手动/事件触发的,绝对时刻没意义 */
+/** 「上次测延迟」显示成相对时间;它是手动/事件触发的,绝对时刻没意义 */
 export function fmtAgo(ts, now = Date.now()) {
   const t = Number(ts);
   if (!t) return '还没测过';

@@ -287,7 +287,7 @@ main {
 .badge.cool { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 40%, transparent); }
 .badge.dead { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 40%, transparent); }
 
-/* 卡头右侧的「N 秒前测 + 测速」。baseline 对齐会让按钮比文字低半行 */
+/* 卡头右侧的「N 秒前测 + 测延迟」。baseline 对齐会让按钮比文字低半行 */
 .node-tools { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .node-tools .hint { margin-left: 0; }
 

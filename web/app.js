@@ -86,7 +86,7 @@ function renderNodes() {
   const rows = nodeRows({ ...S, now: Date.now() });
   const ul = $('nodes');
   $('nodes-empty').hidden = rows.length > 0;
-  $('nodes-tested').textContent = S.testing ? '测速中…' : fmtAgo(S.testedAt);
+  $('nodes-tested').textContent = S.testing ? '测延迟中…' : fmtAgo(S.testedAt);
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
@@ -258,7 +258,7 @@ function wire() {
   $('btn-reset').onclick = (e) => run(e.target, '手动重置', () => api('/reset', { method: 'POST' }));
   $('btn-regen').onclick = (e) => run(e.target, '生成新 Key', () => api('/regen-key', { method: 'POST' }));
 
-  $('btn-speed').onclick = (e) => run(e.target, '测速', async () => {
+  $('btn-speed').onclick = (e) => run(e.target, '测延迟', async () => {
     const r = await api('/nodes/test', { method: 'POST' });
     if (!r?.tested) return '';
     const f = r.fastest ? `最快 ${r.fastest.node} ${fmtDelay(r.fastest.delay)}` : '没有可用节点';

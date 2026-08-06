@@ -51,11 +51,20 @@ const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开�
  */
 const SHOW_THINKING = process.env.SHOW_THINKING !== '0';
 
-/** 节点健康检查:测延迟用的 URL 和超时。不用 opencode.ai 是不想让探测
- *  去碰配额端点 —— 这里要量的是节点通不通、快不快。 */
-const HEALTH_URL = process.env.NODE_TEST_URL || 'http://www.gstatic.com/generate_204';
-const HEALTH_TIMEOUT_MS = Number(process.env.NODE_TEST_TIMEOUT_MS) || 5_000;
-const HEALTH_CONCURRENCY = 6;
+/**
+ * 延迟探针地址。默认就是上游本身 —— 「这个节点可用」在这儿只有一个意思:
+ * 能把请求送到 opencode.ai。HEAD 一下站点根路径,不碰 /zen/v1,不花额度,
+ * 任何状态码都算通(要的只是「TLS 能握上、有回应」)。
+ *
+ * 原来默认 http://www.gstatic.com/generate_204,实测一份 17 节点的订阅全测
+ * 不通,而同一批节点跑上游是好的:机场封 80 端口、劫持 Google 域名都很常见。
+ * 探针本身到不了,就会把能用的节点全判死 —— 那比不测更糟。
+ */
+const HEALTH_URL = process.env.NODE_TEST_URL || `https://${OPENCODE_HOST}/`;
+
+/** 单次探测超时。内核那边 timeout 按 int16 解析(超过 32767 直接 400),整组
+ *  测完还得在 mihomoApi 的 10 秒里回来 —— 夹到 1..8 秒,两头都不越界。 */
+const HEALTH_TIMEOUT_MS = Math.min(Math.max(Number(process.env.NODE_TEST_TIMEOUT_MS) || 5_000, 1_000), 8_000);
 
 export const FREE_MODELS = [
   'deepseek-v4-flash-free',
@@ -238,8 +247,8 @@ export class Gateway {
     this.nodeCache = null;
     this.nodeCacheTime = 0;
     this.delay = new Map();     // 节点 -> 实测延迟 ms;null = 测过但不通
-    this.testedAt = 0;          // 上次测速时刻,0 = 还没测过
-    this.testing = null;        // 进行中的测速 Promise,防并发重复测
+    this.testedAt = 0;          // 上次测延迟的时刻,0 = 还没测过
+    this.testing = null;        // 进行中的延迟测试 Promise,防并发重复测
     this.lockedNode = null;     // 成功后锁定,后续请求直接用,直到 429
     this.switching = false;
     this.paused = false;        // 重启/重置期间置位,请求收 503 而不是打到坏代理上
@@ -678,45 +687,47 @@ export class Gateway {
     this.nodeCacheTime = 0;
   }
 
-  // ── 测速与排序 ────────────────────────────────────────
+  // ── 延迟测试与排序 ────────────────────────────────────
 
   /**
-   * 逐个节点测延迟。mihomo 的 /proxies/{name}/delay 会真的经由那个节点发一次
-   * HTTP,通了返回 {delay},不通返回非 2xx —— 所以「不可用」是它告诉我们的,
-   * 不用自己判。
+   * 测一遍全组延迟。用内核自带的 GET /group/{组名}/delay —— 它把组里每个节点
+   * 并发 HEAD 一次探针地址,回一张 {节点名: 延迟ms} 的表,没测通的不在表里。
+   * 就是各家面板上「延迟测试」那个按钮打的接口,不是跑流量的测速。
    *
-   * 配置里 health-check 是 lazy 的(没人用这个组时不测速,省机场流量),
+   * 为什么不逐个打 /proxies/{名字}/delay:节点名里带斜杠(机场爱在名字里写
+   * 「1.4MB/s」),塞进 URL 路径就得指望内核那边把 %2F 正确反转义回来;
+   * 而组名是我们自己起的,名字只出现在响应体里,少一整类问题。顺带 17 次
+   * 往返变 1 次,并发也交给内核,不用自己控。
+   *
+   * 配置里 health-check 是 lazy 的(没请求走这个组时不测,省机场流量),
    * 所以内核自己不会给出这份数据,必须显式点一遍。
-   *
-   * 并发上限 6:17 个节点一次全打出去容易被机场当异常探测,而串行要 85s。
    */
-  async testNodes(nodes = null) {
+  async testNodes() {
     if (this.testing) return this.testing;        // 已经在测了就搭车,别测两遍
-    this.testing = this._testNodes(nodes).finally(() => { this.testing = null; });
+    this.testing = this._testNodes().finally(() => { this.testing = null; });
     return this.testing;
   }
 
-  async _testNodes(nodes) {
-    const list = nodes || (await this.getAllNodes());
+  async _testNodes() {
+    const list = await this.getAllNodes();
     if (!list.length) return { tested: 0, alive: 0, dead: [], fastest: null, ms: 0 };
 
     const t0 = Date.now();
-    const next = (() => { let i = 0; return () => (i < list.length ? list[i++] : null); })();
-    const found = new Map();
-
-    const worker = async () => {
-      for (let n = next(); n !== null; n = next()) {
-        const q = `timeout=${HEALTH_TIMEOUT_MS}&url=${encodeURIComponent(HEALTH_URL)}`;
-        try {
-          const r = await this.mihomoApi(`/proxies/${encodeURIComponent(n)}/delay?${q}`);
-          const d = Number(r?.delay);
-          found.set(n, Number.isFinite(d) && d > 0 ? d : null);
-        } catch {
-          found.set(n, null);      // 超时/拒绝/内核报错,一律算不通
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(HEALTH_CONCURRENCY, list.length) }, worker));
+    const q = `timeout=${HEALTH_TIMEOUT_MS}&url=${encodeURIComponent(HEALTH_URL)}`;
+    let mp = {};
+    let why = '';
+    try {
+      mp = await this.mihomoApi(`/group/${encodeURIComponent(POOL_NAME)}/delay?${q}`);
+    } catch (e) {
+      // 全灭时内核回 500 all proxies timeout;参数不对会回 400。两种都得能看见,
+      // 不然「全都测不通」到底是节点的问题还是我们请求的问题根本分不出来。
+      why = e.message;
+    }
+    // 以订阅里的节点表为准建这张图:内核只回测通的,没回的就是不通
+    const found = new Map(list.map((n) => {
+      const d = Number(mp?.[n]);
+      return [n, Number.isFinite(d) && d > 0 ? d : null];
+    }));
 
     // 整表替换而不是合并:节点可能已经被机场下掉了,留着旧数据会让
     // rankNodes 以为它还在
@@ -730,19 +741,25 @@ export class Gateway {
     // 锁定的那个节点测不通就解锁,否则 ensureNode 会一直粘着它,直到某次请求
     // 真的失败才换 —— 已经知道它不通了,没必要拿真实请求去验
     if (this.lockedNode && found.get(this.lockedNode) === null && alive.length) {
-      this.logger('warn', `[speed] 锁定节点 ${this.lockedNode} 已不可用,解锁`);
+      this.logger('warn', `[delay] 锁定节点 ${this.lockedNode} 已不可用,解锁`);
       this.lockedNode = null;
     }
 
     const ms = Date.now() - t0;
-    const summary = {
+    const secs = (ms / 1000).toFixed(1);
+    if (alive.length) {
+      this.logger('ok', `[delay] 测完 ${found.size} 个,可用 ${alive.length},最快 ${alive[0][0]} ${alive[0][1]}ms(耗时 ${secs}s)`);
+      if (dead.length) this.logger('warn', `[delay] 剔除 ${dead.length} 个不可用: ${dead.join(', ')}`);
+    } else {
+      // 全灭基本不是 17 个节点同时死,而是探针地址这些节点到不了。
+      // 把原因和探针地址一起打出来,不然只能猜。
+      this.logger('warn', `[delay] ${found.size} 个节点全都测不通(耗时 ${secs}s)${why ? `,内核回:${why}` : ''}`);
+      this.logger('warn', `[delay] 探针是 ${HEALTH_URL},这次不剔除任何节点;换个地址试试 NODE_TEST_URL=`);
+    }
+    return {
       tested: found.size, alive: alive.length, dead,
       fastest: alive[0] ? { node: alive[0][0], delay: alive[0][1] } : null, ms,
     };
-    this.logger(alive.length ? 'ok' : 'warn',
-      `[speed] 测完 ${found.size} 个,可用 ${alive.length},最快 ${alive[0] ? `${alive[0][0]} ${alive[0][1]}ms` : '无'}(耗时 ${(ms / 1000).toFixed(1)}s)`);
-    if (dead.length) this.logger('warn', `[speed] 剔除 ${dead.length} 个不可用: ${dead.join(', ')}`);
-    return summary;
   }
 
   /**
@@ -750,18 +767,18 @@ export class Gateway {
    * 所以「排序」和「优先级」在这里是同一件事。
    *
    * 两条兜底:
-   *  - 没测过的节点(测速之后机场新加的)保留,排在测过的后面而不是当死的扔掉;
-   *  - 全灭时原样返回。测速 URL 被墙、DNS 挂了都会让所有节点报不通,
+   *  - 没测过的节点(测完之后机场新加的)保留,排在测过的后面而不是当死的扔掉;
+   *  - 全灭时原样返回。探针地址被封、DNS 挂了都会让所有节点报不通,
    *    这时候剔除等于把整个网关关掉,而实际上打 opencode 可能是通的。
+   *
+   * 不在这儿打日志:面板每 2 秒轮一次 /api/nodes,而 excludedNodes 还会再调
+   * 一遍,一次全灭能刷出一屏。原因由 _testNodes 那两条负责说清楚。
    */
   rankNodes(nodes) {
     if (!this.delay.size) return nodes;
     const untested = nodes.filter((n) => !this.delay.has(n));
     const alive = nodes.filter((n) => this.delay.get(n) != null);
-    if (!alive.length && !untested.length) {
-      this.logger('warn', '[speed] 所有节点都测不通,这次不剔除(可能是测速地址不可达)');
-      return nodes;
-    }
+    if (!alive.length && !untested.length) return nodes;
     alive.sort((a, b) => this.delay.get(a) - this.delay.get(b));
     return [...alive, ...untested];
   }
@@ -786,7 +803,13 @@ export class Gateway {
         let data = '';
         resp.on('data', (c) => (data += c));
         resp.on('end', () => {
-          if (resp.statusCode < 200 || resp.statusCode >= 300) return reject(new Error(`HTTP ${resp.statusCode}`));
+          if (resp.statusCode < 200 || resp.statusCode >= 300) {
+            // 带上内核的错误体({"message":"..."})。只报「HTTP 500」的话,
+            // 「节点全超时」和「我们参数写错了」在日志里长得一模一样
+            let msg = '';
+            try { msg = JSON.parse(data)?.message || ''; } catch { msg = data.trim().slice(0, 120); }
+            return reject(new Error(`HTTP ${resp.statusCode}${msg ? `: ${msg}` : ''}`));
+          }
           if (method !== 'GET') return resolve({});
           try { resolve(JSON.parse(data)); } catch { resolve({}); }
         });
