@@ -341,11 +341,6 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: block; margin-bottom: 6px;
   font-size: 12px; color: var(--fg-2);
 }
-.lbl small {
-  font-family: var(--mono); font-size: 10px;
-  padding: 1px 6px; margin-left: 6px;
-  border: 1px solid var(--line-2); border-radius: 999px;
-}
 
 /* 标签和一个状态灯同行:标签左、灯靠右。灯比独立成排时矮一点(11px + 更薄的
    padding),否则这一行会比别的 .lbl 高出 7px,输入框跟着往下掉。 */
