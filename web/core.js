@@ -124,9 +124,22 @@ export function maskKey(k) {
   return s.slice(0, 4) + '•'.repeat(Math.min(12, s.length - 8)) + s.slice(-4);
 }
 
-/** 客户端要填的 base URL */
-export function endpointBase(port, host = 'localhost') {
-  return `http://${host}:${Number(port) || 9527}/v1`;
+/**
+ * 客户端要填的 base URL。
+ *
+ * 直接取当前访问地址,不拼进程自己的监听端口 —— 面板和 /v1 是同一个 server,
+ * 所以「你现在能打开这个面板的地址」必然也是「客户端能打到 /v1 的地址」。
+ * 而进程端口在反代或端口映射后面往往和外部地址无关:容器里听 9527、
+ * compose 映射成别的、再套一层 Caddy 走 80/443,拼出来的
+ * http://host:9527/v1 就是个连不上的地址。
+ *
+ * origin 已经带了协议和「非默认才出现」的端口(https://h/ 不带 443、
+ * http://h:8080/ 带 8080),正是需要的行为,不用自己判断。
+ */
+export function endpointBase(origin) {
+  const s = String(origin ?? '').replace(/\/+$/, '');
+  // 没有 origin 可用(比如 file:// 打开)时退回本机默认,总比给个空串好
+  return `${s || 'http://localhost:9527'}/v1`;
 }
 
 /** byModel / byDay 这种 { key: {requests,...} } 映射 -> 按请求数降序的数组 */

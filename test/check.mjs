@@ -134,9 +134,14 @@ t('掩码保留头尾 4 位,中段不泄漏长度', () => {
 
 // ── 其他 ────────────────────────────────────────────────
 
-t('endpointBase 端口缺失时回落默认', () => {
-  assert.equal(endpointBase(9527, 'localhost'), 'http://localhost:9527/v1');
-  assert.equal(endpointBase(null, '1.2.3.4'), 'http://1.2.3.4:9527/v1');
+t('endpointBase 原样沿用当前地址,不拼进程端口', () => {
+  assert.equal(endpointBase('http://ds4f.example.com'), 'http://ds4f.example.com/v1',
+    '反代在 80 上时不能凭空补 :9527,那个地址外面连不上');
+  assert.equal(endpointBase('http://localhost:9527'), 'http://localhost:9527/v1');
+  assert.equal(endpointBase('https://a.b'), 'https://a.b/v1');
+  assert.equal(endpointBase('http://h:8080/'), 'http://h:8080/v1', '末尾斜杠不能变成 //v1');
+  assert.equal(endpointBase(''), 'http://localhost:9527/v1', '没 origin 时给个能用的默认');
+  assert.equal(endpointBase(null), 'http://localhost:9527/v1');
 });
 
 t('rankBreakdown 按请求数降序并截断', () => {

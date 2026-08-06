@@ -15,7 +15,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
-import { Gateway, FIXED_MODEL, json } from './gateway.mjs';
+import { Gateway, FIXED_MODEL, OPENAI, ANTHROPIC, json } from './gateway.mjs';
 import { checkBasic, resolveCredentials } from './auth.mjs';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
@@ -90,19 +90,27 @@ export function createApp({ cfg, creds, gateway }) {
       res.setHeader('Access-Control-Allow-Methods', '*');
       if (req.method === 'OPTIONS') return void res.writeHead(204).end();
 
-      if (!gateway.checkKey(req)) return json(res, { error: { message: 'Invalid API key', type: 'auth_error' } }, 401);
+      // 连错误体都得说对方言:Anthropic SDK 读不懂 {error:{message}},
+      // 它会把畸形响应当成别的问题,把人往错方向带(实测就是这么被坑的)
+      const D = path.startsWith('/v1/messages') ? ANTHROPIC : OPENAI;
+
+      if (!gateway.checkKey(req)) return D.fail(res, 401, 'Invalid API key', 'authentication_error');
       if (gateway.paused) {
         res.setHeader('Retry-After', '10');
-        return json(res, { error: { message: 'Gateway is restarting, retry shortly', type: 'gateway_paused' } }, 503);
+        return D.fail(res, 503, 'Gateway is restarting, retry shortly', 'gateway_paused');
       }
       if (path === '/v1/models' && req.method === 'GET') return gateway.handleModels(res);
-      if (path === '/v1/chat/completions' && req.method === 'POST') {
-        return void gateway.handleChat(req, res).catch((e) => {
-          log('error', `[chat] 未捕获: ${e.message}`);
-          try { json(res, { error: { message: 'Internal: ' + e.message } }, 500); } catch {}
-        });
-      }
-      return json(res, { error: { message: `Not found: ${req.method} ${path}` } }, 404);
+
+      const run = (p) => void p.catch((e) => {
+        log('error', `[${D.name}] 未捕获: ${e.message}`);
+        try { D.fail(res, 500, 'Internal: ' + e.message, 'api_error'); } catch {}
+      });
+      if (path === '/v1/chat/completions' && req.method === 'POST') return run(gateway.handleChat(req, res));
+      if (path === '/v1/messages' && req.method === 'POST') return run(gateway.handleMessages(req, res));
+      // Claude Code 等客户端开工前会先问一次 token 数,没有这个路由它直接报错退出
+      if (path === '/v1/messages/count_tokens' && req.method === 'POST') return run(gateway.handleCountTokens(req, res));
+
+      return D.fail(res, 404, `Not found: ${req.method} ${path}`, 'not_found_error');
     }
 
     // 面板和 /api/* 都要 Basic —— 前端会明文显示 Key 和订阅地址
@@ -165,18 +173,46 @@ function makeApiRoutes({ cfg, gateway }) {
       cfgMod.save(cfg);
       log('info', '[config] 已保存');
 
-      if (subChanged && nextSub) {
-        cfgMod.writeMihomoConfig(nextSub);
-        log('info', '[sub] 订阅已更新,重启内核');
-        await withPause(async () => {
-          gateway.resetCooldowns();
-          gateway.forgetLastNode();
-          await mihomo.restart(log);
-        });
-        const n = (await gateway.getAllNodes()).length;
-        log('ok', `[sub] 刷新成功,${n} 个节点`);
+      // 「保存」必须真的刷新节点,哪怕地址一个字都没改 —— 机场加减节点、
+      // 订阅内容变了但 URL 不变是常态,而按 interval 等下一轮要一小时。
+      // 用户点保存的意图就是「现在去拉」,所以两条路都得走到:
+      //   地址变了  → 配置文件里的 provider url 变了,必须重启内核才生效
+      //   地址没变  → 只需让内核重拉一次,PUT /providers 就够,几百毫秒,
+      //               不重启内核也就不会有那几秒 503
+      let refreshed = null;
+      if (nextSub) {
+        if (subChanged) {
+          cfgMod.writeMihomoConfig(nextSub);
+          log('info', '[sub] 订阅地址已变,重启内核');
+          await withPause(async () => {
+            gateway.resetCooldowns();
+            gateway.forgetLastNode();
+            await mihomo.restart(log);
+          });
+        } else {
+          log('info', '[sub] 地址未变,强制重拉订阅');
+          try {
+            await gateway.updateProvider();
+            gateway.resetCooldowns();
+          } catch (e) {
+            // 内核没起来时 PUT 会失败(比如首次填订阅前内核就没跑)。
+            // 那就退回重启这条路,而不是让用户点了保存什么也没发生。
+            log('warn', `[sub] 重拉失败(${e.message}),改为重启内核`);
+            cfgMod.writeMihomoConfig(nextSub);
+            await withPause(async () => {
+              gateway.resetCooldowns();
+              gateway.forgetLastNode();
+              await mihomo.restart(log);
+            });
+          }
+        }
+        refreshed = (await gateway.getAllNodes()).length;
+        log(refreshed > 0 ? 'ok' : 'warn', `[sub] 刷新完成,${refreshed} 个节点`);
       }
-      return json(res, { subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port });
+      return json(res, {
+        subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
+        nodes: refreshed,   // 前端据此提示「刷到了几个节点」,null=没订阅地址
+      });
     }
 
     if (path === '/api/nodes' && m === 'GET') {

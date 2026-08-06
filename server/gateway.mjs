@@ -13,11 +13,33 @@ import https from 'node:https';
 import fs from 'node:fs';
 import { MihomoAgent } from './proxy.mjs';
 import { LAST_NODE_FILE, USAGE_FILE, MIXED_PORT, CTRL_PORT, POOL_NAME } from './config.mjs';
+import {
+  anthropicToOpenAI, openAIToAnthropic, anthropicError, errTypeFor, AnthropicStream, flattenText,
+} from './anthropic.mjs';
+import { safeEqual } from './auth.mjs';
 
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
 export const FIXED_MODEL = 'deepseek-v4-flash-free';
 export const COOLDOWN_MS = 90 * 1000;
+
+/**
+ * 时间预算。这几个数一起决定「最坏多久给客户端一个答复」。
+ *
+ * 之前没有总预算,只有 for (i <= nodes.length + 5) 这个次数上限:48 个节点
+ * 就是 53 轮,每轮还能网络重试 3 次 × 60s,最坏 2.6 小时。客户端 90 秒就断了,
+ * 于是显示的是它自己的兜底文案(「模型不存在」),真实原因完全看不见。
+ *
+ * 所以改成时间驱动:超预算立刻回一个真错误。宁可让客户端看到 504,
+ * 也不能让它挂到超时 —— 挂着连日志都对不上号。
+ */
+export const REQUEST_DEADLINE_MS = 75_000;   // 一个请求从进来到回复的上限
+const UPSTREAM_TIMEOUT_MS = 45_000;          // 单次非流式请求的静默上限
+const STREAM_TTFB_MS = 45_000;               // 流式:等第一个字节
+const STREAM_IDLE_MS = 120_000;              // 流式:开始吐了以后允许的静默
+const MAX_NODE_TRIES = 6;                    // 最多换几个节点。48 个全试一遍没意义:
+                                             // 连续 6 个都 429 基本就是整体被限了
+const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开新的尝试了
 
 export const FREE_MODELS = [
   'deepseek-v4-flash-free',
@@ -28,6 +50,63 @@ export const FREE_MODELS = [
   'north-mini-code-free',
   'nemotron-3-ultra-free',
 ];
+
+/**
+ * 方言。/v1/chat/completions 和 /v1/messages 共用同一套节点轮换、冷却、重试,
+ * 差别只有三件事:请求怎么进来、成功体怎么写回去、错误体和 SSE 事件长什么样。
+ * 把这三件事收进一个对象,轮换逻辑就完全不用知道自己在服务哪个 API ——
+ * 否则每个 return 点都要 if (isAnthropic),漏一个就是形状错乱的响应。
+ */
+export const OPENAI = {
+  name: 'openai',
+  /** 客户端传什么模型都忽略:上游免费端点只认 FIXED_MODEL */
+  toUpstream: (body) => ({ ...body, model: FIXED_MODEL }),
+  validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages required'),
+  fail: (res, status, message, type, extra) => json(res, { error: { message, type, ...extra } }, status),
+  respond: (res, oai) => json(res, oai),
+  sink: (res) => rawSink(res),
+};
+
+export const ANTHROPIC = {
+  name: 'anthropic',
+  toUpstream: (body) => ({ ...anthropicToOpenAI(body), model: FIXED_MODEL }),
+  validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages: at least one message required'),
+  // Anthropic 的错误体没有放附加字段的地方,所以把冷却剩余秒数并进 message,
+  // 而不是塞个上游 SDK 会忽略掉的字段 —— 信息宁可在文字里也别丢
+  fail: (res, status, message, type, extra) => {
+    const s = extra?.cooldown?.[0]?.remain;
+    return json(res, anthropicError(s ? `${message}(约 ${s}s 后恢复)` : message, errTypeFor(status)), status);
+  },
+  respond: (res, oai) => json(res, openAIToAnthropic(oai, FIXED_MODEL)),
+  sink: (res) => anthropicSink(res, FIXED_MODEL),
+};
+
+/** OpenAI 流:上游字节原样透传,不解析不重排 */
+function rawSink(res) {
+  const safe = (fn) => { try { fn(); } catch {} };
+  return {
+    write: (chunk) => safe(() => res.write(chunk)),
+    end: () => safe(() => res.end()),
+    // 已经开始吐了才失败,补不了合法结尾,只能断开让客户端自己发现
+    fail: () => safe(() => res.end()),
+  };
+}
+
+/** Anthropic 流:把上游的 chat.completion.chunk 翻译成 Messages 事件流 */
+function anthropicSink(res, model) {
+  const safe = (fn) => { try { fn(); } catch {} };
+  const st = new AnthropicStream({
+    model,
+    emit: (event, data) => safe(() => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)),
+  });
+  return {
+    write: (chunk) => st.feed(chunk),
+    end: () => { st.end(); safe(() => res.end()); },
+    // 和 rawSink 不同:这里能补一个合法收尾(error + message_stop),
+    // 客户端的状态机于是能正常结束,而不是等到超时
+    fail: (msg) => { st.fail(msg); safe(() => res.end()); },
+  };
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const blankTotals = () => ({
@@ -161,9 +240,21 @@ export class Gateway {
 
   // ── /v1/* 路由 ────────────────────────────────────────
 
+  /**
+   * 两种鉴权头都认。
+   *
+   * OpenAI 客户端发 `Authorization: Bearer <key>`,Anthropic 客户端发
+   * `x-api-key: <key>` —— 只认前者的话 /v1/messages 对每个真实 Anthropic
+   * 客户端都是 401,而客户端往往把 401 翻译成「模型不存在或你没有权限」,
+   * 于是排查方向被带跑偏。这是实测踩过的坑,别再收窄。
+   */
   checkKey(req) {
+    const want = this.config.apiKey;
+    if (!want) return false;
+    const xk = req.headers['x-api-key'];
+    if (typeof xk === 'string' && xk && safeEqual(xk, want)) return true;
     const m = /^Bearer\s+(.+)$/i.exec(req.headers['authorization'] || '');
-    return !!m && m[1] === this.config.apiKey;
+    return !!m && safeEqual(m[1], want);
   }
 
   handleModels(res) {
@@ -173,32 +264,72 @@ export class Gateway {
     });
   }
 
-  async handleChat(req, res) {
+  /**
+   * POST /v1/messages/count_tokens。
+   *
+   * Claude Code / Cline 在正式请求前会先问一次「这些消息多少 token」。上游没有
+   * 这个能力,而缺这个路由客户端会直接报错退出 —— 所以本地估一个:按字符数
+   * 除以 3.5(混合中英文时比英文经验值 4 更接近)。
+   *
+   * 这个数只用于客户端自己决定要不要压缩上下文,不参与计费、不影响转发结果,
+   * 估偏一点没有后果;拿不到数导致客户端起不来才是真问题。
+   */
+  async handleCountTokens(req, res) {
     let raw = '';
     for await (const chunk of req) {
       raw += chunk;
-      if (raw.length > 8e6) return json(res, { error: { message: 'Request too large' } }, 413);
+      if (raw.length > 8e6) return ANTHROPIC.fail(res, 413, 'Request too large', 'request_too_large');
     }
     let body;
-    try { body = JSON.parse(raw); } catch { return json(res, { error: { message: 'Invalid JSON' } }, 400); }
+    try { body = JSON.parse(raw); } catch { return ANTHROPIC.fail(res, 400, 'Invalid JSON', 'invalid_request_error'); }
 
-    if (!Array.isArray(body.messages) || body.messages.length === 0) {
-      return json(res, { error: { message: 'messages required' } }, 400);
+    let chars = flattenText(body.system).length;
+    for (const m of Array.isArray(body.messages) ? body.messages : []) {
+      chars += flattenText(m?.content).length;
+      // 工具调用的参数也是 token,不算会低估很多
+      for (const b of Array.isArray(m?.content) ? m.content : []) {
+        if (b?.type === 'tool_use') chars += JSON.stringify(b.input ?? {}).length;
+      }
     }
-    body.model = FIXED_MODEL;    // 固定模型,忽略客户端传的
-    const wantStream = body.stream === true;
+    for (const t of Array.isArray(body.tools) ? body.tools : []) {
+      chars += JSON.stringify(t?.input_schema ?? {}).length + String(t?.description ?? '').length;
+    }
+    return json(res, { input_tokens: Math.max(1, Math.ceil(chars / 3.5)) });
+  }
+
+  async handleChat(req, res, dialect = OPENAI) {
+    const deadline = Date.now() + REQUEST_DEADLINE_MS;
+    let raw = '';
+    for await (const chunk of req) {
+      raw += chunk;
+      if (raw.length > 8e6) return dialect.fail(res, 413, 'Request too large', 'request_too_large');
+    }
+    let inbound;
+    try { inbound = JSON.parse(raw); } catch { return dialect.fail(res, 400, 'Invalid JSON', 'invalid_request_error'); }
+
+    const bad = dialect.validate(inbound);
+    if (bad) return dialect.fail(res, 400, bad, 'invalid_request_error');
+
+    // 流式意图在两种方言里都是顶层 stream:true,转换后依然如此
+    const wantStream = inbound.stream === true;
+    const body = dialect.toUpstream(inbound);
 
     const nodes = await this.getAllNodes();
     if (nodes.length === 0) {
-      return json(res, { error: { message: '没有可用节点 —— 检查订阅地址和 mihomo 状态', type: 'no_nodes' } }, 503);
+      return dialect.fail(res, 503, '没有可用节点 —— 检查订阅地址和 mihomo 状态', 'no_nodes');
     }
-    const cur = await this.ensureNode(nodes, res);
+    const cur = await this.ensureNode(nodes, res, dialect, deadline);
     if (!cur) return;   // ensureNode 已经回过错误了
-    return this.attempt(res, body, nodes, cur, wantStream);
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline);
+  }
+
+  /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
+  async handleMessages(req, res) {
+    return this.handleChat(req, res, ANTHROPIC);
   }
 
   /** 选定本次要用的节点并让 mihomo 切过去;返回节点名,失败返回 null(已响应) */
-  async ensureNode(nodes, res) {
+  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity) {
     let cur = this.lockedNode;
     if (cur && !this.cooldown.isCooling(cur) && nodes.includes(cur)) return cur;
 
@@ -207,6 +338,14 @@ export class Gateway {
       // 全员冷却:等剩余最短的那个恢复,而不是直接失败
       const s = this.cooldown.soonest(nodes);
       if (s && s.remain > 0) {
+        // 但不能等过预算。挂到客户端自己超时的话,它显示的是自己的兜底文案
+        // (「模型不存在」那种),真实原因一个字都传不到 —— 宁可立刻回 429,
+        // 把「还要等多久」明确写给它。
+        if (Date.now() + s.remain + 1000 > deadline) {
+          this.logger('warn', `[cooldown] 全员冷却且等不到预算内,直接回 429(剩 ${Math.ceil(s.remain / 1000)}s)`);
+          dialect.fail(res, 429, 'All nodes rate-limited', 'all_nodes_429', { cooldown: this.cooldown.summary() });
+          return null;
+        }
         this.logger('warn', `[cooldown] 所有节点冷却中,等 ${s.node} 恢复(剩 ${Math.ceil(s.remain / 1000)}s)`);
         await sleep(s.remain + 1000);
         cur = s.node;
@@ -217,21 +356,32 @@ export class Gateway {
     }
     if ((await this.getCurrentNode()) !== cur && !(await this.switchNode(cur))) {
       this.cooldown.mark429(cur);
-      json(res, { error: { message: 'Switch node failed' } }, 503);
+      dialect.fail(res, 503, 'Switch node failed', 'api_error');
       return null;
     }
     return cur;
   }
   /** 重试循环:429 换节点,网络错误只重试当前节点(换了也是白换,避免振荡) */
-  async attempt(res, body, nodes, cur, wantStream) {
+  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity) {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
+    let switches = 0;
+    const left = () => deadline - Date.now();
 
-    for (let i = 0; i <= nodes.length + 5; i++) {
+    // 次数和时间两个上限,谁先到都停。次数防「48 个节点挨个试」,
+    // 时间防「每次都慢但都没超时」—— 只有次数上限的话后者能拖到几十分钟。
+    while (switches <= MAX_NODE_TRIES) {
+      if (left() < MIN_TRY_MS) {
+        this.usage.record(FIXED_MODEL, null, false);
+        this.logger('error', `[chat] 超出 ${REQUEST_DEADLINE_MS / 1000}s 预算,放弃(换过 ${switches} 个节点)`);
+        return dialect.fail(res, 504, `Upstream did not respond within ${REQUEST_DEADLINE_MS / 1000}s`, 'timeout');
+      }
       const t0 = Date.now();
       try {
-        const result = wantStream ? await this.forwardStream(res, body) : await this.forward(body);
+        const result = wantStream
+          ? await this.forwardStream(res, body, dialect, left())
+          : await this.forward(body, left());
 
         const dt = Date.now() - t0;
         this.lockedNode = cur;
@@ -244,11 +394,12 @@ export class Gateway {
         }
         this.usage.record(FIXED_MODEL, result.usage, true);
         this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`);
-        return json(res, result);
+        return dialect.respond(res, result);
       } catch (e) {
         const status = e.status || 0;
 
-        // 流已经开始吐了就不能重试:头都发出去了,换节点等于给客户端拼接两半响应
+        // 流已经开始吐了就不能重试:头都发出去了,换节点等于给客户端拼接两半响应。
+        // 收尾由 forwardStream 里的 sink 负责(它才拿得到那个 sink),这里只记账。
         if (e.notStarted === false) {
           this.logger('error', `[stream-mid] node="${cur}" 中断: ${e.body || e.message}`);
           try { res.end(); } catch {}
@@ -266,16 +417,13 @@ export class Gateway {
           if (!next) {
             const s = this.cooldown.summary();
             this.logger('error', `[chat] 全部节点冷却中: ${s.length} 个`);
-            return json(res, {
-              error: {
-                message: `All nodes rate-limited, retry in ~${s[0]?.remain || 90}s`,
-                type: 'all_nodes_429', cooldown: s,
-              },
-            }, 429);
+            return dialect.fail(res, 429,
+              `All nodes rate-limited, retry in ~${s[0]?.remain || 90}s`, 'all_nodes_429', { cooldown: s });
           }
           // 换之前喘 2 秒:重置后一口气把所有节点扫成 429 就是这么来的,
           // 上游限流是按窗口算的,给它一点恢复时间
           await sleep(2000);
+          switches++;
           if (await this.switchNode(next)) cur = next;
           else tried.add(next);
           continue;
@@ -293,8 +441,9 @@ export class Gateway {
           const next = this.cooldown.pickAvailable(nodes, tried);
           if (!next) {
             this.usage.record(FIXED_MODEL, null, false);
-            return json(res, { error: { message: 'All nodes timeout' } }, 504);
+            return dialect.fail(res, 504, 'All nodes timeout', 'timeout');
           }
+          switches++;
           if (await this.switchNode(next)) cur = next;
           else tried.add(next);
           continue;
@@ -303,14 +452,22 @@ export class Gateway {
         // 400/500 之类:换节点也是同样结果,直接把上游的话原样带回去
         this.usage.record(FIXED_MODEL, null, false);
         this.logger('error', `[chat] HTTP ${status}: ${String(e.body).slice(0, 300)}`);
-        let payload;
-        try { payload = JSON.parse(e.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
-        return json(res, payload, status);
+        if (dialect === OPENAI) {
+          let payload;
+          try { payload = JSON.parse(e.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
+          return json(res, payload, status);
+        }
+        // Anthropic 客户端只认自己那套错误体,上游的原样转过去它读不懂,
+        // 于是把上游的话摘成 message 塞进正确的壳里
+        let msg = `HTTP ${status}`;
+        try { msg = JSON.parse(e.body)?.error?.message || msg; } catch {}
+        return dialect.fail(res, status, msg, errTypeFor(status));
       }
     }
     this.usage.record(FIXED_MODEL, null, false);
-    this.logger('error', '[chat] 重试次数耗尽');
-    return json(res, { error: { message: 'All nodes unavailable after retries', type: 'all_nodes_unavailable' } }, 503);
+    this.logger('error', `[chat] 换过 ${MAX_NODE_TRIES} 个节点仍未成功`);
+    return dialect.fail(res, 503,
+      `Tried ${MAX_NODE_TRIES} nodes, all unavailable`, 'all_nodes_unavailable');
   }
   // ── 出站 ──────────────────────────────────────────────
 
@@ -337,10 +494,12 @@ export class Gateway {
     };
   }
 
-  forward(body) {
+  forward(body, budget = Infinity) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: false });
-      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout: 60_000 }), (resp) => {
+      // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
+      const timeout = Math.max(1_000, Math.min(UPSTREAM_TIMEOUT_MS, budget));
+      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout }), (resp) => {
         let data = '';
         resp.on('data', (c) => (data += c));
         resp.on('end', () => {
@@ -349,21 +508,40 @@ export class Gateway {
         });
       });
       r.on('error', (e) => reject({ status: 0, body: e.message }));
-      r.on('timeout', () => { r.destroy(); reject({ status: 0, body: 'timeout' }); });
+      r.on('timeout', () => { r.destroy(); reject({ status: 0, body: `timeout after ${timeout}ms` }); });
       r.end(bodyStr);
     });
   }
 
-  /** SSE 原样透传,顺路把最后那帧的 usage 抄下来记账 */
-  forwardStream(res, body) {
+  /**
+   * 流式转发。上游的 SSE 交给 dialect.sink 决定怎么落地:
+   * OpenAI 原样透传,Anthropic 翻译成 Messages 事件。
+   *
+   * 两段超时刻意分开:等第一个字节要短(还能重试),开始吐了以后要长
+   * (推理模型思考几十秒很正常,这时候掐掉等于毁掉一个已经成功的请求)。
+   */
+  forwardStream(res, body, dialect = OPENAI, budget = Infinity) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
-      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: 120_000 }), (resp) => {
+      const ttfb = Math.max(1_000, Math.min(STREAM_TTFB_MS, budget));
+
+      // 头一旦发出去,这个请求就不能重试了 —— 换节点重发等于把两半响应拼给
+      // 客户端。所以所有失败路径都得先看这个标志:started 之前 reject 让上层
+      // 换节点,started 之后只能就地收尾。
+      //
+      // 特别是空闲超时:它触发的是 socket 的 timeout,ClientRequest 也会跟着
+      // emit 一次 'timeout'。不区分状态的话那条路会带着 notStarted:true 回到
+      // 重试循环里,而此时头早就发出去了。
+      let started = false;
+      let settled = false;
+      const finish = (fn) => { if (!settled) { settled = true; fn(); } };
+
+      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb }), (resp) => {
         if (resp.statusCode !== 200) {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
           resp.on('data', (c) => (data += c));
-          resp.on('end', () => reject({ status: resp.statusCode, body: data, notStarted: true }));
+          resp.on('end', () => finish(() => reject({ status: resp.statusCode, body: data, notStarted: true })));
           return;
         }
         res.writeHead(200, {
@@ -372,11 +550,21 @@ export class Gateway {
           Connection: 'keep-alive',
           'X-Accel-Buffering': 'no',
         });
+        started = true;
+        const sink = dialect.sink(res);
+
+        // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
+        // 推理模型思考几十秒很正常,拿 TTFB 那个尺度掐会毁掉已经成功的请求
+        r.setTimeout(0);
+        resp.setTimeout(STREAM_IDLE_MS, () => {
+          this.logger('error', `[stream] 空闲超过 ${STREAM_IDLE_MS / 1000}s,断开`);
+          r.destroy();
+        });
 
         let buf = '';
         let usage = null;
         resp.on('data', (chunk) => {
-          res.write(chunk);           // 先转发,统计是副产品,别让它拖慢流
+          sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
           buf += chunk.toString();
           const lines = buf.split('\n');
           buf = lines.pop();          // 末行可能被截断,留着等下一个 chunk
@@ -388,19 +576,35 @@ export class Gateway {
             } catch {}
           }
         });
-        resp.on('end', () => {
-          res.end();
+        resp.on('end', () => finish(() => {
+          sink.end();
           if (usage) this.usage.record(FIXED_MODEL, usage, true);
           resolve();
-        });
-        resp.on('error', (e) => {
+        }));
+        resp.on('error', (e) => finish(() => {
           this.logger('error', `[stream] 中断: ${e.message}`);
-          try { res.end(); } catch {}
-          resolve();     // 已经发出去一部分了,不算失败
-        });
+          // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
+          // 客户端的状态机于是能正常结束,而不是等到自己超时
+          sink.fail(e.message);
+          this.usage.record(FIXED_MODEL, usage, false);
+          resolve();     // 已经发出去一部分了,重试不了,不算可重试失败
+        }));
       });
-      r.on('error', (e) => reject({ status: 0, body: e.message, notStarted: true }));
-      r.on('timeout', () => { r.destroy(); reject({ status: 0, body: 'stream timeout', notStarted: true }); });
+
+      r.on('error', (e) => finish(() => {
+        if (started) {
+          // 头已经发了,只能就地收尾。这里不能 reject 回重试循环。
+          this.logger('error', `[stream] 传输中断: ${e.message}`);
+          try { res.end(); } catch {}
+          return resolve();
+        }
+        reject({ status: 0, body: e.message, notStarted: true });
+      }));
+      r.on('timeout', () => {
+        if (started) return;    // 空闲超时归 resp.setTimeout 管,这里不插手
+        r.destroy();
+        finish(() => reject({ status: 0, body: `stream ttfb timeout after ${ttfb}ms`, notStarted: true }));
+      });
       r.end(bodyStr);
     });
   }

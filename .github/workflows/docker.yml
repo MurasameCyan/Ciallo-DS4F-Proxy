@@ -97,7 +97,37 @@ jobs:
           # 面板必须挡住匿名访问
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9527/api/config)
           [ "$code" = 401 ] || { echo "面板没鉴权! 返回 $code"; docker logs verify; exit 1; }
-          curl -fsS -u admin:ci-test http://127.0.0.1:9527/api/status | grep -q deepseek
+          key=$(curl -fsS -u admin:ci-test http://127.0.0.1:9527/api/status | grep -o deepseek | head -1)
+          [ -n "$key" ] || { echo "/api/status 不对"; docker logs verify; exit 1; }
+
+          # 两种鉴权头都得认。只认 Bearer 的话 /v1/messages 对每个 Anthropic
+          # 客户端都是 401,而客户端会把 401 显示成「模型不存在」—— 实测踩过,
+          # 排查方向被带偏很久,所以钉死在 CI 里。
+          K=$(docker exec verify node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            process.stdout.write(JSON.parse(readFileSync('/data/config.json','utf8')).apiKey);
+          ")
+          [ -n "$K" ] || { echo "取不到 apiKey"; docker logs verify; exit 1; }
+          for h in "authorization: Bearer $K" "x-api-key: $K"; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "$h" http://127.0.0.1:9527/v1/models)
+            [ "$code" = 200 ] || { echo "鉴权头 '${h%%:*}' 被拒(返回 $code)"; docker logs verify; exit 1; }
+          done
+          # 错的 key 必须挡住
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: nope" http://127.0.0.1:9527/v1/models)
+          [ "$code" = 401 ] || { echo "错 key 竟然返回 $code"; exit 1; }
+
+          # /v1/messages 的错误体必须是 Anthropic 形状(SDK 读的是 error.type)。
+          # 没订阅所以拿不到节点,这里验的就是 503 那条路的形状。
+          body=$(curl -s -H "x-api-key: $K" -H 'content-type: application/json' \
+            -d '{"model":"x","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' \
+            http://127.0.0.1:9527/v1/messages)
+          echo "$body" | grep -q '"type":"error"' || { echo "messages 错误体不是 Anthropic 形状: $body"; exit 1; }
+
+          # count_tokens:缺这个路由 Claude Code 开工前就退出了
+          curl -fsS -H "x-api-key: $K" -H 'content-type: application/json' \
+            -d '{"model":"x","messages":[{"role":"user","content":"hello"}]}' \
+            http://127.0.0.1:9527/v1/messages/count_tokens | grep -q input_tokens \
+            || { echo "count_tokens 不可用"; exit 1; }
 
           # 生成的 mihomo 配置,让镜像里那个真内核过一遍。
           # 光看退出码不够:mihomo 遇到已废弃的配置项会照常退 0,只往 stderr

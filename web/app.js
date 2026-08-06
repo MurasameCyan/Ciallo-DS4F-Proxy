@@ -124,7 +124,7 @@ function tag(cls, text) {
 }
 
 function renderConn() {
-  $('f-base').value = endpointBase(S.status.gatewayPort, location.hostname);
+  $('f-base').value = endpointBase(location.origin);
   const key = S.cfg.apiKey || '';
   $('f-key').value = S.showKey ? key : maskKey(key);
 }
@@ -217,8 +217,10 @@ async function run(btn, label, fn) {
   btn.disabled = true;
   btn.textContent = '处理中…';
   try {
-    await fn();
-    toast(`${label}完成`, 'ok');
+    // fn 可以返回一句话补在 toast 后面(比如「刷到 48 个节点」),
+    // 让「保存」这种看不出效果的操作有个可见的结果
+    const extra = await fn();
+    toast(extra ? `${label}完成,${extra}` : `${label}完成`, 'ok');
   } catch (e) {
     toast(`${label}失败:${e.message}`, 'err');
   } finally {
@@ -278,8 +280,10 @@ function wire() {
     }
     err.hidden = true;
 
-    run($('btn-save'), '保存', () =>
-      api('/config', { method: 'POST', body: JSON.stringify({ subscriptionUrl: url, port }) }));
+    run($('btn-save'), '保存', async () => {
+      const r = await api('/config', { method: 'POST', body: JSON.stringify({ subscriptionUrl: url, port }) });
+      return r?.nodes == null ? '' : `刷到 ${r.nodes} 个节点`;
+    });
   };
 
   for (const seg of document.querySelectorAll('.seg')) {

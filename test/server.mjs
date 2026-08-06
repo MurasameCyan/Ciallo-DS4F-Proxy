@@ -341,6 +341,87 @@ await t('静态目录穿越拿不到 web 之外的文件', async () => {
   await r.text();
 });
 
+// ── 两种方言的鉴权和错误体 ──────────────────────────────
+
+await t('x-api-key 也认(Anthropic 客户端不发 Bearer)', async () => {
+  // 这是实测踩到的坑:只认 Bearer 时 /v1/messages 对每个 Anthropic 客户端
+  // 都是 401,而客户端把 401 显示成"模型不存在或你没有权限",排查方向全歪
+  const r = await fetch(`${base}/v1/models`, { headers: { 'x-api-key': cfg.apiKey } });
+  assert.equal(r.status, 200, 'x-api-key 必须能过');
+  await r.text();
+});
+
+await t('x-api-key 错了照样 401', async () => {
+  const r = await fetch(`${base}/v1/models`, { headers: { 'x-api-key': 'wrong' } });
+  assert.equal(r.status, 401);
+  await r.text();
+});
+
+await t('/v1/messages 的错误体是 Anthropic 形状,不是 OpenAI 的', async () => {
+  const r = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 401);
+  const b = await r.json();
+  // SDK 读的是 body.error.type,给它 OpenAI 那套它认不出来
+  assert.equal(b.type, 'error');
+  assert.equal(b.error.type, 'authentication_error');
+  assert.ok(!('message' in b), 'Anthropic 错误体没有顶层 message');
+});
+
+await t('/v1/chat/completions 的错误体仍是 OpenAI 形状', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [] }),
+  });
+  assert.equal(r.status, 401);
+  const b = await r.json();
+  assert.equal(typeof b.error.message, 'string');
+  assert.ok(!b.type, '不能把 Anthropic 的壳套到 OpenAI 客户端上');
+});
+
+await t('没节点时 /v1/messages 回 503 且形状正确', async () => {
+  const r = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': cfg.apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'x', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 503);
+  const b = await r.json();
+  assert.equal(b.type, 'error');
+  assert.equal(b.error.type, 'overloaded_error');
+});
+
+await t('messages 为空时 400,而不是打到上游', async () => {
+  const r = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': cfg.apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'x', max_tokens: 10, messages: [] }),
+  });
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error.type, 'invalid_request_error');
+});
+
+await t('count_tokens 给得出数(缺这个路由 Claude Code 起不来)', async () => {
+  const r = await fetch(`${base}/v1/messages/count_tokens`, {
+    method: 'POST',
+    headers: { 'x-api-key': cfg.apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hello world' }] }),
+  });
+  assert.equal(r.status, 200);
+  const b = await r.json();
+  assert.ok(Number.isInteger(b.input_tokens) && b.input_tokens > 0, `要一个正整数,得到 ${b.input_tokens}`);
+});
+
+await t('未知的 /v1/ 路径按方言回 404', async () => {
+  const r = await fetch(`${base}/v1/nope`, { headers: { 'x-api-key': cfg.apiKey } });
+  assert.equal(r.status, 404);
+  assert.ok((await r.json()).error.message.includes('/v1/nope'));
+});
+
 await new Promise((r) => app.close(r));
 fs.rmSync(TMP, { recursive: true, force: true });
 
