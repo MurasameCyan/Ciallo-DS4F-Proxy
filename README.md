@@ -10,6 +10,9 @@
    Anthropic                       429 就换一个
 ```
 
+> **代码在 [`beta`](https://github.com/MurasameCyan/Ciallo-DS4F-Proxy/tree/beta) 分支。**
+> `main` 只放这份说明。镜像由 `beta` 的推送构建,标签仍然是 `:latest`,所以 compose 不用改。
+
 ---
 
 ## 拉起来
@@ -17,8 +20,8 @@
 不需要自己 build,镜像 GitHub Actions 已经推到 GHCR(amd64 + arm64)。
 
 ```bash
-curl -O https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/main/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/main/.env.example
+curl -O https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/beta/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/beta/.env.example
 
 # 编辑 .env,至少把 PANEL_PASS 填上
 docker compose up -d
@@ -112,9 +115,12 @@ claude
 
 ## 开发
 
-零 npm 依赖,Node ≥ 20。
+零 npm 依赖,Node ≥ 20。代码全在 `beta` 分支:
 
 ```bash
+git clone -b beta https://github.com/MurasameCyan/Ciallo-DS4F-Proxy.git
+cd Ciallo-DS4F-Proxy
+
 npm test              # check(前端纯函数)+ anthropic(转换层)+ server(路由鉴权)+ e2e(整条链路)
 npm run preview       # 不起内核,只看 UI
 npm start             # 完整跑,需要 /data 可写

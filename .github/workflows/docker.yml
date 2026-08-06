@@ -1,14 +1,15 @@
 name: 构建并推送镜像
 
-# push 到 main 出 latest;打 v* 标签出版本号;PR 只构建不推(验证 Dockerfile 没写坏)。
+# 代码在 beta 分支,main 只放 README。所以构建盯的是 beta。
+# push 到 beta 出 latest;打 v* 标签出版本号;PR 只构建不推(验证 Dockerfile 没写坏)。
 on:
   push:
-    branches: [main]
+    branches: [beta]
     tags: ['v*']
     # 只动文档不重建镜像,省 Actions 额度
     paths-ignore: ['**.md', '.gitignore', '.shots/**']
   pull_request:
-    branches: [main]
+    branches: [beta]
   workflow_dispatch:
 
 env:
@@ -62,12 +63,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.name.outputs.image }}
+          # latest 这条钉死在 beta 上,不能用 {{is_default_branch}}:默认分支是
+          # main(只有 README),而构建来自 beta,用那个变量的话 latest 永远不会
+          # 更新 —— 用户 docker compose pull 拿到的一直是旧镜像,还看不出哪错了。
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/beta' }}
 
       - name: 构建并推送
         uses: docker/build-push-action@v6
