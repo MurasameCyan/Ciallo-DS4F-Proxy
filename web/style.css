@@ -453,7 +453,6 @@ body.login { display: grid; place-items: center; padding: 24px; }
 .login-card { width: 100%; max-width: 344px; padding: 22px; }
 .login-card .brand { margin-bottom: 18px; }
 .login-card h2 { font-size: 15px; }
-.login-card .hint { margin: 6px 0 16px; }
 .login-card code { font-family: var(--mono); font-size: 11px; color: var(--fg); }
 
 /* ── Toast ────────────────────────────────────────────── */
