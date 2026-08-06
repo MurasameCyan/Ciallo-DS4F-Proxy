@@ -101,8 +101,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   font-family: var(--mono); font-size: 12px;
 }
 
-/* 状态灯。搬进「配置」卡之后要能折行:那一列只有 340px,三个灯挤不进一行 */
-.pills { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 13px; }
+/* 状态灯。只剩一个,贴在「订阅地址」标签行的右端(规则见下面的 .lbl.row) */
 .pill {
   display: inline-flex; align-items: center; gap: 7px;
   padding: 5px 11px 5px 9px;
@@ -347,6 +346,11 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   padding: 1px 6px; margin-left: 6px;
   border: 1px solid var(--line-2); border-radius: 999px;
 }
+
+/* 标签和一个状态灯同行:标签左、灯靠右。灯比独立成排时矮一点(11px + 更薄的
+   padding),否则这一行会比别的 .lbl 高出 7px,输入框跟着往下掉。 */
+.lbl.row { display: flex; align-items: center; gap: 10px; }
+.lbl.row .pill { margin-left: auto; padding: 2px 9px 2px 7px; font-size: 11px; }
 
 input[type=text], input[type=url], input[type=number], input[type=password] {
   width: 100%; padding: 9px 11px;

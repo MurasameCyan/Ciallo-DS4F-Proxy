@@ -115,19 +115,21 @@
   <section class="card" aria-labelledby="h-cfg">
     <div class="card-head"><h2 id="h-cfg">配置</h2></div>
 
-    <!-- 状态灯从页头搬到这儿:它和下面这几个按钮是一回事 —— 看一眼状态、
-         然后动手。分在两个地方要来回扫视。 -->
-    <div class="pills" role="status" aria-live="polite" aria-label="运行状态">
-      <span class="pill" id="pill-gw"><i class="dot" aria-hidden="true"></i><span data-t>网关</span></span>
-      <span class="pill" id="pill-mh"><i class="dot" aria-hidden="true"></i><span data-t>内核</span></span>
-      <span class="pill" id="pill-node"><i class="dot" aria-hidden="true"></i><span data-t>节点</span></span>
-    </div>
-
     <form id="cfg-form" novalidate>
-      <label class="field">
-        <span class="lbl">订阅地址 <small>Clash / YAML</small></span>
+      <!-- 状态灯收成一个,贴在「订阅地址」右端。原来三个(网关/内核/节点)里
+           网关的端口在接入卡的 Base URL 上已经有了,内核版本看一眼就够,
+           真会动的只有节点数 —— 内核挂了的时候借这个灯报出来(见 app.js)。
+           这里不用 <label> 包一圈:灯在 label 里会被读进输入框的名字,
+           变成「订阅地址 节点 8/12 可用」。所以 div + <label for>。 -->
+      <div class="field">
+        <span class="lbl row">
+          <label for="f-sub">订阅地址</label>
+          <span class="pill" id="pill-node" role="status" aria-live="polite">
+            <i class="dot" aria-hidden="true"></i><span data-t>节点</span>
+          </span>
+        </span>
         <input type="url" id="f-sub" placeholder="https://…/subscribe?token=…" autocomplete="off" spellcheck="false">
-      </label>
+      </div>
       <p class="err" id="cfg-err" role="alert" hidden></p>
       <button type="submit" class="btn primary wide" id="btn-save">保存并应用</button>
     </form>

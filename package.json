@@ -10,7 +10,8 @@
     "test": "node test/check.mjs && node test/anthropic.mjs && node test/server.mjs && node test/e2e.mjs",
     "verify:tunnel": "node scripts/verify-tunnel.mjs",
     "verify:upstream": "node scripts/verify-upstream.mjs",
-    "verify:api": "node scripts/verify-api.mjs"
+    "verify:api": "node scripts/verify-api.mjs",
+    "verify:logout": "node scripts/verify-logout.mjs"
   },
   "engines": {
     "node": ">=20"

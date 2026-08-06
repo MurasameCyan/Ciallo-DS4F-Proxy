@@ -553,6 +553,16 @@ const base = `http://127.0.0.1:${app.address().port}`;
 const auth = 'Basic ' + Buffer.from('tester:test-pass').toString('base64');
 let cookie = '';                  // 登录那组测试里拿到的会话,后面几组接着用
 
+/** 现登一个会话。页面路径只认 cookie,而上面那个 `cookie` 会被退出登录那组作废 */
+async function login() {
+  const r = await fetch(`${base}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ user: 'tester', pass: 'test-pass' }),
+  });
+  await r.text();
+  return (r.headers.get('set-cookie') || '').split(';')[0];
+}
+
 await t('/health 不要凭据(docker healthcheck 得进得来)', async () => {
   const r = await fetch(`${base}/health`);
   assert.equal(r.status, 200);
@@ -634,6 +644,26 @@ await t('退出登录后那张 cookie 当场不认(不是等它自己过期)', a
   const after = await fetch(`${base}/api/status`, { headers: { cookie } });
   assert.equal(after.status, 401, '服务端没作废的话,cookie 被复制走就一直能用');
   await after.text();
+});
+
+// 用过老版本的浏览器还缓存着弹框那次收到的 Basic 凭据,并且会一直主动带上。
+// 页面也认 Basic 的话,退出登录后 location.replace('/login') 又被 302 回面板 ——
+// 点了像没反应。这一组就是那个 bug 的回归测试。
+await t('页面只认会话 cookie:浏览器缓存的 Basic 顶不开面板,也顶不掉退出登录', async () => {
+  for (const p of ['/', '/index.html']) {
+    const r = await fetch(base + p, { headers: { authorization: auth }, redirect: 'manual' });
+    assert.equal(r.status, 302, `${p} 带 Basic 也该跳登录页,不然「退出登录」退不掉`);
+    assert.equal(r.headers.get('location'), '/login');
+    await r.text();
+  }
+  const page = await fetch(`${base}/login`, { headers: { authorization: auth }, redirect: 'manual' });
+  assert.equal(page.status, 200, '/login 带 Basic 不能被弹回面板 —— 那就是「登出没反应」');
+  await page.text();
+
+  // 但脚本那条路不受影响:/api/* 照旧认 Basic
+  const api = await fetch(`${base}/api/status`, { headers: { authorization: auth } });
+  assert.equal(api.status, 200, 'README 里 /api/* 的 curl 用法不能被这条规则连带打死');
+  await api.text();
 });
 
 await t('密码错也是 401,不是 500', async () => {
@@ -726,7 +756,11 @@ await t('换 Key 立刻生效,旧 Key 立刻失效', async () => {
 });
 
 await t('静态目录穿越拿不到 web 之外的文件', async () => {
-  const r = await fetch(`${base}/../package.json`, { headers: { authorization: auth } });
+  // 得带真会话:页面路径不认 Basic 了,拿 Basic 打会被 302 到 /login,
+  // fetch 默认跟着跳转回 200 —— 那测的是重定向,不是穿越防护。
+  const r = await fetch(`${base}/../package.json`, {
+    headers: { cookie: await login() }, redirect: 'manual',
+  });
   assert.ok(r.status === 404 || r.status === 403, `应拒绝,得到 ${r.status}`);
   await r.text();
 });

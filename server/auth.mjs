@@ -9,6 +9,9 @@
  *   人   → /login 页面 POST 一次,拿一个 HttpOnly 会话 cookie
  *   脚本 → 照旧直接带 Authorization: Basic(README 里那些 /api/* 的用法)
  *
+ * Basic 只在 /api/* 上认,页面一律只认 cookie:浏览器会把弹框那次收到的凭据
+ * 缓存在 origin 上并一直主动带上,页面也认的话「退出登录」就退不掉(见 index.mjs)。
+ *
  * 原来只有 Basic 一条路,靠浏览器自己弹框收凭据。那个弹框是 401 响应里的
  * WWW-Authenticate 头带出来的 —— 样式不可控、错了给不出自己的提示、
  * 退出登录只能靠关浏览器。所以现在一律不发这个头,浏览器就不再弹框,

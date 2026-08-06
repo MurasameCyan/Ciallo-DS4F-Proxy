@@ -53,12 +53,16 @@ function setPill(el, cls, text) {
   el.querySelector('[data-t]').textContent = text;
 }
 
+/**
+ * 「订阅地址」右端那一个状态灯。原来是三个:网关的端口在接入卡的 Base URL 上
+ * 已经有了,内核版本看一眼就够、不会变,真会动的只有节点数,所以只留这一个。
+ *
+ * 内核挂了的时候借它报出来 —— 只显示「无节点」的话,看不出是订阅没填还是
+ * 内核死了,而这两件事要做的处置完全不同。
+ */
 function renderPills() {
   const st = S.status;
-  setPill($('pill-gw'), st.gatewayRunning ? 'up' : 'down',
-    st.gatewayRunning ? `网关 :${st.gatewayPort}` : '网关未运行');
-  setPill($('pill-mh'), st.mihomoRunning ? 'up' : 'down',
-    st.mihomoRunning ? `内核 ${st.mihomoVersion || ''}`.trim() : '内核未运行');
+  if (!st.mihomoRunning) return setPill($('pill-node'), 'down', '内核未运行');
 
   // 只数还在轮换表里的冷却:已经被剔除的节点显示的是「不可用」,
   // 再从可用数里扣一次就成了双重扣减(分子会比实际少)
@@ -240,7 +244,7 @@ async function refresh() {
     // 表单不在用户编辑时才回填,否则打字会被覆盖
     if (document.activeElement !== $('f-sub')) $('f-sub').value = S.cfg.subscriptionUrl || '';
   } catch (e) {
-    setPill($('pill-gw'), 'down', '连接不上后端');
+    setPill($('pill-node'), 'down', '连接不上后端');
   }
 }
 

@@ -177,8 +177,14 @@ export function createApp({ cfg, creds, gateway }) {
     // ── 面板和 /api/*:登录页给的会话 cookie,或脚本自己带的 Basic ──
     // 前端会明文显示 Key 和订阅地址,所以这两样都得挡住。
     // 认不过时刻意不发 WWW-Authenticate —— 那个头就是浏览器弹框的来源(见 auth.mjs)
+    //
+    // Basic 只认在 /api/* 上,页面一律只认会话 cookie。因为浏览器会把老版本
+    // 弹框收到的凭据缓存在 origin 上并一直主动带上:页面也认 Basic 的话,
+    // 退出登录之后 /login 又把人 302 回面板,点了像没反应。那份缓存在浏览器
+    // 手里,服务端删不掉,只能不让它开门 —— 脚本打 /api/* 不受影响。
+    const isApi = path.startsWith('/api/');
     const sid = readCookie(req.headers.cookie, SESSION_COOKIE);
-    const authed = sessions.valid(sid) || basicOk(req);
+    const authed = sessions.valid(sid) || (isApi && basicOk(req));
 
     if (path === '/api/login' && req.method === 'POST') {
       return void handleLogin(req, res).catch((e) => {
@@ -202,11 +208,11 @@ export function createApp({ cfg, creds, gateway }) {
       if (PUBLIC_FILES.has(path)) return send(path);
       // 页面请求跳登录页;/api/* 给 401 JSON —— fetch 跟着 302 拿回一坨 HTML,
       // 前端只会报个解析失败,不如让它自己决定跳转(app.js 里就是这么做的)
-      if (path.startsWith('/api/')) return json(res, { error: '未登录' }, 401);
+      if (isApi) return json(res, { error: '未登录' }, 401);
       return redirect(res, '/login');
     }
 
-    if (path.startsWith('/api/')) {
+    if (isApi) {
       api(req, res, path).catch((e) => {
         log('error', `[api] ${path}: ${e.message}`);
         try { json(res, { error: e.message }, 500); } catch {}
