@@ -20,6 +20,7 @@ import { safeEqual } from './auth.mjs';
 
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
+const MODELS_PATH = '/zen/v1/models';
 export const FIXED_MODEL = 'deepseek-v4-flash-free';
 export const COOLDOWN_MS = 90 * 1000;
 
@@ -66,6 +67,14 @@ const HEALTH_URL = process.env.NODE_TEST_URL || `https://${OPENCODE_HOST}/`;
  *  测完还得在 mihomoApi 的 10 秒里回来 —— 夹到 1..8 秒,两头都不越界。 */
 const HEALTH_TIMEOUT_MS = Math.min(Math.max(Number(process.env.NODE_TEST_TIMEOUT_MS) || 5_000, 1_000), 8_000);
 
+/**
+ * 免费模型清单的兜底值。真值从上游 /zen/v1/models 现拉(见 pickFreeModels /
+ * freeModels),这里只是冷启动和拉不到时用的常量 —— 面板上那一列宁可旧一点,
+ * 也不能因为一次网络抖动变空。
+ *
+ * 写死过一次的代价:上游后来加了 longcat-2.0-free,而这份列表没人记得改,
+ * 面板于是少列一个能用的模型。所以现在它只是 fallback。
+ */
 export const FREE_MODELS = [
   'deepseek-v4-flash-free',
   'big-pickle',
@@ -75,6 +84,32 @@ export const FREE_MODELS = [
   'north-mini-code-free',
   'nemotron-3-ultra-free',
 ];
+
+/** 免费清单的 TTL。上游几周才动一次,拉太勤没意义(还多一次经节点的出站) */
+const MODELS_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * 从上游那份「全部模型」里挑出免费的。
+ *
+ * /zen/v1/models 会列 60+ 个,绝大多数是付费的(claude-* / gpt-* / gemini-*),
+ * 而本网关不带 Authorization 出站,付费模型必然 401 —— 列出来就是骗人。
+ * 判据只能靠 id:`-free` 后缀,外加 big-pickle 这个没后缀但确实在免费清单里的
+ * 例外(上游没给任何价格字段,只能这么认)。
+ *
+ * ponytail: 上游哪天给免费模型换个命名法,这里会漏掉它们,那时靠调用方的
+ * fallback 顶着(不会变空),改的话就是往 EXTRA_FREE 里加一条。
+ */
+const EXTRA_FREE = new Set(['big-pickle']);
+
+export function pickFreeModels(ids) {
+  const seen = new Set();
+  for (const raw of ids || []) {
+    const id = String(raw ?? '').trim();
+    if (!id) continue;
+    if (id.endsWith('-free') || EXTRA_FREE.has(id)) seen.add(id);
+  }
+  return [...seen];
+}
 
 /**
  * 方言。/v1/chat/completions 和 /v1/messages 共用同一套节点轮换、冷却、重试,
@@ -252,6 +287,9 @@ export class Gateway {
     this.lockedNode = null;     // 成功后锁定,后续请求直接用,直到 429
     this.switching = false;
     this.paused = false;        // 重启/重置期间置位,请求收 503 而不是打到坏代理上
+    this.models = FREE_MODELS;  // 上游那份免费清单,先用兜底常量顶着
+    this.modelsAt = 0;          // 上次拉成功的时刻,0 = 还没拉过
+    this.modelsFetch = null;    // 进行中的拉取,防并发(面板 2 秒轮一次)
   }
 
   pause() { this.paused = true; }
@@ -289,7 +327,70 @@ export class Gateway {
   handleModels(res) {
     json(res, {
       object: 'list',
-      data: FREE_MODELS.map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'opencode-zen' })),
+      data: this.freeModels().map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'opencode-zen' })),
+    });
+  }
+
+  /**
+   * 当前的免费模型清单。**同步返回缓存**,过期了顺手在后台拉一次。
+   *
+   * 面板每 2 秒轮一次 /api/status,清单搭这趟车走 —— 所以这里绝不能 await
+   * 一个出站请求:那会让整个面板的刷新跟着上游的 RTT 走,节点慢的时候一眼
+   * 就看出来卡。第一次调用返回的是兜底常量,拉到了下一次轮询就换成真的。
+   */
+  freeModels() {
+    if (Date.now() - this.modelsAt > MODELS_TTL_MS) {
+      this.refreshModels().catch(() => {});   // 失败不影响调用方,详情在 refreshModels 里记日志
+    }
+    return this.models;
+  }
+
+  /** 去上游拉一次免费清单。并发调用共用同一个 Promise */
+  refreshModels() {
+    if (this.modelsFetch) return this.modelsFetch;
+    this.modelsFetch = this.upstreamGet(MODELS_PATH)
+      .then((d) => {
+        const free = pickFreeModels((d?.data || []).map((m) => m?.id));
+        // 空结果不接受:上游改了形状或返回了个错误页时,旧清单比空列表有用
+        if (!free.length) throw new Error('返回里没有免费模型');
+        const added = free.filter((m) => !this.models.includes(m));
+        this.models = free;
+        this.modelsAt = Date.now();
+        if (added.length) this.logger('info', `[models] 免费清单 ${free.length} 个,新增 ${added.join(', ')}`);
+        return free;
+      })
+      .catch((e) => {
+        // 只记一次(TTL 内不会重试),继续用上一次的清单
+        this.modelsAt = Date.now();
+        this.logger('warn', `[models] 拉免费清单失败(${e.message}),继续用上一份 ${this.models.length} 个`);
+        return this.models;
+      })
+      .finally(() => { this.modelsFetch = null; });
+    return this.modelsFetch;
+  }
+
+  /**
+   * GET 上游的公开端点(经 mihomo 出站)。目前只有模型清单用它,所以不做成
+   * 通用客户端 —— 和 forward 一样不带 Authorization,那个端点不要鉴权。
+   */
+  upstreamGet(path, timeout = 8_000) {
+    return new Promise((resolve, reject) => {
+      const r = https.request({
+        host: OPENCODE_HOST, port: 443, path, method: 'GET',
+        headers: { Accept: 'application/json', 'User-Agent': 'node' },
+        agent: this.agent,
+        timeout,
+      }, (resp) => {
+        let data = '';
+        resp.on('data', (c) => (data += c));
+        resp.on('end', () => {
+          if (resp.statusCode !== 200) return reject(new Error(`HTTP ${resp.statusCode}`));
+          try { resolve(JSON.parse(data)); } catch { reject(new Error('返回不是 JSON')); }
+        });
+      });
+      r.on('error', (e) => reject(e));
+      r.on('timeout', () => { r.destroy(); reject(new Error(`timeout after ${timeout}ms`)); });
+      r.end();
     });
   }
 

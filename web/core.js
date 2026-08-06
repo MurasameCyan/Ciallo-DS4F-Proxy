@@ -11,17 +11,6 @@ export const COOLDOWN_MS = 90_000;
 /** 日志环形缓冲上限,与网关侧 MAX_LOG 一致 */
 export const MAX_LOG = 500;
 
-/** 免费端点可用模型 */
-export const FREE_MODELS = [
-  'deepseek-v4-flash-free',
-  'big-pickle',
-  'mimo-v2.5-free',
-  'laguna-s-2.1-free',
-  'ling-3.0-flash-free',
-  'north-mini-code-free',
-  'nemotron-3-ultra-free',
-];
-
 export const LOG_LEVELS = { info: '信息', ok: '成功', warn: '警告', error: '错误' };
 
 const grouped = new Intl.NumberFormat('en-US');

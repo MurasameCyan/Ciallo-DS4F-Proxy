@@ -101,7 +101,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   font-family: var(--mono); font-size: 12px;
 }
 
-.pills { display: flex; gap: 7px; margin-left: auto; flex-wrap: wrap; }
+/* 状态灯。搬进「配置」卡之后要能折行:那一列只有 340px,三个灯挤不进一行 */
+.pills { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 13px; }
 .pill {
   display: inline-flex; align-items: center; gap: 7px;
   padding: 5px 11px 5px 9px;
@@ -118,8 +119,14 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.down .dot { background: var(--rose); }
 .pill.cool .dot { background: var(--amber); }
 
-/* 三个按钮在窄屏上放不进一行,允许折行 —— 不折的话会把 header 撑出横向滚动 */
-.top-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+/* 页头右端只剩构建标识那一组。margin-left:auto 顶到最右 —— 以前是靠状态灯
+   的 auto 把它挤过去的,状态灯搬走了就得自己写 */
+.top-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
+
+/* 卡片里的一排操作按钮。flex:1 让它们等宽铺满卡宽,不写固定值;
+   窄了就折行 —— 不折的话卡片会被撑出横向滚动 */
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 13px; }
+.row-actions .btn { flex: 1 1 auto; }
 
 /* ── 构建标识 ─────────────────────────────────────────── */
 
@@ -189,9 +196,8 @@ main {
   .stats { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 660px) {
+  /* 页头只剩品牌 + 构建标识那一组,窄到放不下时让它整组折到第二行 */
   .top { flex-wrap: wrap; }
-  .pills { order: 3; width: 100%; margin-left: 0; }
-  .top-actions { margin-left: auto; }
   .stats { grid-template-columns: 1fr; }
   main { padding: 16px 14px 40px; }
   .card-head .hint { margin-left: 0; text-align: left; }

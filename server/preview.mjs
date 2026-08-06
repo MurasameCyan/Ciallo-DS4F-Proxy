@@ -187,6 +187,12 @@ async function handleApi(req, res, path) {
       mihomoRunning: true, mihomoVersion: 'v1.19.13',
       fixedModel: 'deepseek-v4-flash-free',
       paused: false, demo: true,
+      // 真网关这一份是从上游 /zen/v1/models 现拉的(缓存 30 分钟)。
+      // 这里写死一份形状一样的,longcat 那个就是「实时」才会出现的
+      models: [
+        'deepseek-v4-flash-free', 'big-pickle', 'mimo-v2.5-free', 'laguna-s-2.1-free',
+        'ling-3.0-flash-free', 'north-mini-code-free', 'nemotron-3-ultra-free', 'longcat-2.0-free',
+      ],
       build: state.build,
       buildUrl: `${REPO_URL}/commit/${state.build}`,
       repoUrl: REPO_URL,

@@ -6,7 +6,7 @@
  */
 
 import {
-  FREE_MODELS, LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
+  LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
   fmtDelay, delayGrade, fmtAgo, hasNewer,
@@ -20,7 +20,7 @@ const S = {
   cfg: {}, status: {}, usage: null,
   nodes: [], cooldowns: [], current: '', locked: '',
   delay: {}, excluded: [], testedAt: null, testing: false,
-  logs: [], filter: 'all', follow: true, showKey: false,
+  logs: [], filter: 'all', follow: true,
   // 检查更新查到的远端 hash。记 hash 而不是布尔:更新完镜像重启后 status 里的
   // build 就变成它,「有新版本」标记自己消失,不用再点一次才知道好了
   latest: '',
@@ -141,8 +141,24 @@ function tag(cls, text) {
 
 function renderConn() {
   $('f-base').value = endpointBase(location.origin);
-  const key = S.cfg.apiKey || '';
-  $('f-key').value = S.showKey ? key : maskKey(key);
+  // 屏幕上永远是掩码;要用就点「复制」,那条路复制的是真值
+  $('f-key').value = maskKey(S.cfg.apiKey || '');
+}
+
+/**
+ * 可用模型。服务端从上游 /zen/v1/models 现拉(缓存 30 分钟),这里只负责贴。
+ * 写死在前端的那份漏过一个新上线的免费模型,所以不再留本地常量做兜底 ——
+ * 兜底在服务端,前端拿到什么就显示什么。
+ */
+function renderModels() {
+  const list = Array.isArray(S.status.models) ? S.status.models : [];
+  const ul = $('models');
+  // 列表几周才变一次,但重建 8 个 <li> 的代价比比对差异还小
+  ul.replaceChildren(...list.map((m) => {
+    const li = document.createElement('li');
+    li.textContent = m;
+    return li;
+  }));
 }
 
 function renderBuild() {
@@ -213,11 +229,10 @@ async function refresh() {
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ node: c.node, deadline: cooldownDeadline(c.remain) }));
 
-    renderPills(); renderStats(); renderNodes(); renderConn(); renderBuild();
+    renderPills(); renderStats(); renderNodes(); renderConn(); renderModels(); renderBuild();
 
     // 表单不在用户编辑时才回填,否则打字会被覆盖
     if (document.activeElement !== $('f-sub')) $('f-sub').value = S.cfg.subscriptionUrl || '';
-    if (document.activeElement !== $('f-port')) $('f-port').value = S.cfg.port ?? '';
   } catch (e) {
     setPill($('pill-gw'), 'down', '连接不上后端');
   }
@@ -267,15 +282,14 @@ async function run(btn, label, fn) {
 }
 
 function wire() {
-  $('models').replaceChildren(...FREE_MODELS.map((m) => {
-    const li = document.createElement('li');
-    li.textContent = m;
-    return li;
-  }));
-
   $('btn-restart').onclick = (e) => run(e.target, '内核重启', () => api('/restart', { method: 'POST' }));
   $('btn-reset').onclick = (e) => run(e.target, '手动重置', () => api('/reset', { method: 'POST' }));
-  $('btn-regen').onclick = (e) => run(e.target, '生成新 Key', () => api('/regen-key', { method: 'POST' }));
+
+  // 重置 Key 要二次确认:它就在「复制」旁边,点错的话所有在用的客户端立刻 401
+  $('btn-regen').onclick = (e) => {
+    if (!confirm('重置 API Key?正在用旧 Key 的客户端会全部收到 401,需要重新填。')) return;
+    run(e.target, '重置 Key', () => api('/regen-key', { method: 'POST' }));
+  };
 
   $('btn-speed').onclick = (e) => run(e.target, '测延迟', async () => {
     const r = await api('/nodes/test', { method: 'POST' });
@@ -288,13 +302,6 @@ function wire() {
   $('btn-zero').onclick = (e) => {
     if (!confirm('清零所有统计数据?请求数、Token 用量、运行时长都会从零开始,不可恢复。')) return;
     run(e.target, '统计清零', () => api('/usage/reset', { method: 'POST' }));
-  };
-
-  $('btn-eye').onclick = (e) => {
-    S.showKey = !S.showKey;
-    e.target.textContent = S.showKey ? '隐藏' : '显示';
-    e.target.setAttribute('aria-pressed', String(S.showKey));
-    renderConn();
   };
 
   // 检查更新走自己的 handler 而不是 run():run 会把按钮文字换成「处理中…」,
@@ -335,7 +342,6 @@ function wire() {
     e.preventDefault();
     const err = $('cfg-err');
     const url = $('f-sub').value.trim();
-    const port = Number($('f-port').value);
 
     // 提交前挡一道:订阅地址错了会让内核重启后拿不到节点
     if (url && !/^https?:\/\/.+/i.test(url)) {
@@ -343,15 +349,12 @@ function wire() {
       err.hidden = false;
       return;
     }
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      err.textContent = '端口要是 1-65535 的整数';
-      err.hidden = false;
-      return;
-    }
     err.hidden = true;
 
+    // 只发订阅地址。端口不在这张表里了 —— 服务端本来也不接受改端口
+    // (容器对外端口由 compose 的 ports 定),发过去只会被忽略
     run($('btn-save'), '保存', async () => {
-      const r = await api('/config', { method: 'POST', body: JSON.stringify({ subscriptionUrl: url, port }) });
+      const r = await api('/config', { method: 'POST', body: JSON.stringify({ subscriptionUrl: url }) });
       if (r?.nodes == null) return '';
       // 保存会顺带测一遍延迟。测完了就把可用数一起说了,没测完(节点多、超了
       // 20 秒)只报节点数,结果稍后自己出现在节点池里

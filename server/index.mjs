@@ -164,6 +164,9 @@ function makeApiRoutes({ cfg, gateway }) {
         mihomoVersion: version,
         fixedModel: FIXED_MODEL,
         paused: gateway.paused,
+        // 免费模型清单。从上游现拉、缓存 30 分钟,拉不到就是兜底常量 ——
+        // 写死在前端的那份已经漏过一个新上线的免费模型
+        models: gateway.freeModels(),
         // build / buildUrl / repoUrl / trackRef:面板右上角那个 hash 徽标。
         // 搭轮询的车带过去,不另开一个路由 —— 它是个常量,不值得再来一次请求
         ...buildInfo(),

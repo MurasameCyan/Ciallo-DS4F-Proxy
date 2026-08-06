@@ -28,7 +28,7 @@ process.env.GIT_COMMIT = 'a'.repeat(40);
 delete process.env.SUBSCRIPTION_URL;
 delete process.env.API_KEY;
 
-const { NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS } = await import('../server/gateway.mjs');
+const { NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
@@ -243,6 +243,51 @@ await t('一个节点都没有时测延迟不抛', async () => {
   assert.equal(r.fastest, null);
 });
 
+// ── 免费模型清单 ────────────────────────────────────────
+
+await t('pickFreeModels 只认 -free 后缀和 big-pickle,顺带去重', () => {
+  assert.deepEqual(
+    pickFreeModels(['claude-sonnet-4', 'mimo-v2.5-free', 'big-pickle', 'gpt-5', 'mimo-v2.5-free']),
+    ['mimo-v2.5-free', 'big-pickle'],
+    '付费模型不能列出来 —— 网关不带 Authorization 出站,它们必然 401');
+  assert.deepEqual(pickFreeModels([null, '', '   ', undefined, 42]), [], '坏值全丢掉,不抛');
+  assert.deepEqual(pickFreeModels(), []);
+  assert.deepEqual(pickFreeModels(['  x-free  ']), ['x-free'], '两头空白得修掉,不然面板上那个胶囊里带空格');
+});
+
+await t('拉到清单就换成上游那份,新增了什么记一行日志', async () => {
+  const lines = [];
+  const g = new Gateway(load(), (lv, m) => lines.push(m));
+  g.upstreamGet = async () => ({ data: [{ id: 'a-free' }, { id: 'big-pickle' }, { id: 'claude-x' }] });
+  assert.deepEqual(g.freeModels(), FREE_MODELS, '第一次调用不等出站,先给兜底那份');
+  assert.deepEqual(await g.refreshModels(), ['a-free', 'big-pickle']);
+  assert.deepEqual(g.freeModels(), ['a-free', 'big-pickle']);
+  assert.ok(lines.some((m) => m.includes('a-free')), '上游新上线一个免费模型,日志里得看得见');
+});
+
+await t('拉失败或拉到空时继续用上一份,面板那一列不会变空', async () => {
+  const stubs = [
+    async () => { throw new Error('ECONNREFUSED'); },
+    async () => ({ data: [{ id: 'claude-x' }] }),   // 形状对但一个免费的都没有 -> 当失败
+  ];
+  for (const stub of stubs) {
+    const g = new Gateway(load(), () => {});
+    g.upstreamGet = stub;
+    await g.refreshModels();
+    assert.deepEqual(g.freeModels(), FREE_MODELS, '前端已经没有本地常量兜底了,这里空了面板就空');
+  }
+});
+
+await t('TTL 内不重复出站,并发调用共用一次', async () => {
+  let calls = 0;
+  const g = new Gateway(load(), () => {});
+  g.upstreamGet = async () => { calls++; return { data: [{ id: 'a-free' }] }; };
+  await Promise.all([g.refreshModels(), g.refreshModels()]);
+  assert.equal(calls, 1, '面板 2 秒轮一次,并发挤在一起是常态');
+  g.freeModels(); g.freeModels();
+  assert.equal(calls, 1, '拿到过就压住,别每次轮询都出一次站');
+});
+
 // ── mihomo 配置生成 ────────────────────────────────────
 
 /** 去掉注释行。生成的 yaml 里有成段注释解释取舍,别让它们混进断言。 */
@@ -448,6 +493,9 @@ await t('本地 hash 不明时不谎报「有新版本」', async () => {
 const cfg = load();
 const creds = { user: 'tester', pass: 'test-pass', generated: false };
 const gateway = new Gateway(cfg, () => {});
+// 别让测试真的出站去拉模型清单:/api/status 每次都会顺手起一次刷新,
+// 有没有内核、能不能连上游都不该影响断言
+gateway.upstreamGet = async () => { throw new Error('测试不出站'); };
 const app = createApp({ cfg, creds, gateway });
 await new Promise((r) => app.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${app.address().port}`;
@@ -487,6 +535,9 @@ await t('带对凭据能读到配置和状态', async () => {
   assert.equal(s.fixedModel, 'deepseek-v4-flash-free');
   assert.equal(s.mihomoRunning, false, '测试环境没有内核,应老实报 false');
   assert.equal(s.gatewayRunning, true);
+  // 免费模型清单也搭这趟车。这里出不了站,所以看到的必然是兜底那份 ——
+  // 要验的是这个字段一定在、一定非空:前端已经不留本地常量了
+  assert.deepEqual(s.models, FREE_MODELS);
   // 构建标识搭 /api/status 的车过去,面板右上角那个徽标全靠这几个字段
   assert.equal(s.build, 'a'.repeat(7));
   assert.match(s.buildUrl, /^https:\/\/github\.com\/.+\/commit\/a{7}$/);
