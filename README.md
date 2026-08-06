@@ -27,7 +27,7 @@ curl -o .env https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/be
 docker compose up -d
 ```
 
-打开 <http://127.0.0.1:9527>,用 `.env` 里的凭据登录,在「配置」页填机场订阅地址、保存。节点会当场刷新,不用重启容器。
+打开 <http://127.0.0.1:9527>,用 `.env` 里的凭据登录(HTTP Basic),在「配置」里填机场订阅地址、保存。节点会当场刷新,不用重启容器。
 
 面板上那个 Key 就是接口 Key,复制走给 agent 用。
 
@@ -99,13 +99,16 @@ claude
 
 ## 面板
 
-| 页 | 内容 |
+单页,不分标签,从上到下:
+
+| 区块 | 内容 |
 | --- | --- |
-| 概览 | Base URL、Key、当前节点、内核状态 |
-| 配置 | 订阅地址、换 Key、重启内核、重置 |
-| 节点 | 节点列表、延迟、冷却中的会标出来 |
-| 用量 | 按天/按模型的调用数和 token |
-| 日志 | 内核和网关的实时日志 |
+| 页头 | 网关 / 内核 / 节点三个状态灯,「重启内核」「手动重置」 |
+| 统计 | 请求总数(成功·失败)、成功率、Token 消耗(输入·输出·推理)、运行时长(最后请求·主用模型) |
+| 接入 | Base URL、API Key(显示 / 复制 / 重新生成)、可用模型 |
+| 配置 | 订阅地址 + 「保存并应用」。监听端口是只读的 —— 容器对外端口由 compose 的 `ports` 决定,在这儿改只会让面板显示一个连不上的地址 |
+| 运行日志 | 内核和网关的实时日志 |
+| 节点池 | 按序使用,当前节点标出来,冷却中的显示剩余秒数 |
 
 订阅地址改完点保存**当场生效**:地址变了就重写 mihomo 配置并重启内核,没变就只让内核重新拉一遍 provider。保存后的提示会告诉你刷到了几个节点。
 
@@ -146,11 +149,20 @@ server/
 
 ## 镜像
 
-`ghcr.io/murasamecyan/ciallo-ds4f-proxy:latest`,多架构。
+`ghcr.io/murasamecyan/ciallo-ds4f-proxy:latest`,多架构(`linux/amd64` + `linux/arm64`)。
+
+| 标签 | 来源 |
+| --- | --- |
+| `latest` | `beta` 的每次推送 |
+| `beta` | 同上,同一份 digest |
+| `sha-<短 sha>` | 每次构建都留一个,用来回滚 |
+| `1.2` / `1.2.3` | 打 `v*` 标签时出 |
 
 **`docker compose pull` 报 `unauthorized`?** 不是构建失败。GHCR 新建的包默认私有,而且**不跟随仓库可见性** —— 仓库公开了包照样是私有的。仓库 owner 打开
 `https://github.com/users/MurasameCyan/packages/container/ciallo-ds4f-proxy/settings`
 → Danger Zone → Change visibility → Public,点一次,之后每次推送都继承。这个没有 API,只能手点。
+
+**想手动重建?** 往 `beta` 推一个空提交(`git commit --allow-empty -m rebuild && git push`)。Actions 页面上没有「Run workflow」按钮 —— `workflow_dispatch` 要求 workflow 文件在**默认分支**上,而默认分支是只有 README 的 `main`。`push` 触发不受影响,它用的是被推分支上的那份文件。
 
 ---
 
