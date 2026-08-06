@@ -138,6 +138,19 @@ function makeApiRoutes({ cfg, gateway }) {
     try { return await fn(); } finally { gateway.resume(); }
   }
 
+  /**
+   * 等一件事,但最多等这么久。测速是「测完 N 个节点」,17 个节点全超时要 15s,
+   * 上百个节点的订阅能到一分半 —— 那样一个 POST 会挂在前端上像卡死。
+   * 超了就先回,测速在后台继续跑完,面板下一次轮询 /api/nodes 就看到结果。
+   */
+  function atMost(p, ms) {
+    let t;
+    return Promise.race([
+      p.finally(() => clearTimeout(t)),
+      new Promise((r) => { t = setTimeout(() => r(null), ms); t.unref?.(); }),
+    ]);
+  }
+
   return async function handleApi(req, res, path) {
     const m = req.method;
 
@@ -180,6 +193,7 @@ function makeApiRoutes({ cfg, gateway }) {
       //   地址没变  → 只需让内核重拉一次,PUT /providers 就够,几百毫秒,
       //               不重启内核也就不会有那几秒 503
       let refreshed = null;
+      let speed = null;
       if (nextSub) {
         if (subChanged) {
           cfgMod.writeMihomoConfig(nextSub);
@@ -208,24 +222,48 @@ function makeApiRoutes({ cfg, gateway }) {
         }
         refreshed = (await gateway.getAllNodes()).length;
         log(refreshed > 0 ? 'ok' : 'warn', `[sub] 刷新完成,${refreshed} 个节点`);
+        // 节点表刚换过,旧的延迟数据对不上号了,顺手测一遍:排序 + 剔除不通的
+        // 都靠它。这一步不能失败到影响保存本身,所以 catch 掉只记日志。
+        if (refreshed > 0) {
+          speed = await atMost(
+            gateway.testNodes().catch((e) => { log('warn', `[speed] 测速失败: ${e.message}`); return null; }),
+            20_000);
+        }
       }
       return json(res, {
         subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
         nodes: refreshed,   // 前端据此提示「刷到了几个节点」,null=没订阅地址
+        speed,              // {tested,alive,dead,fastest,ms};null=没测或还没测完
       });
     }
 
     if (path === '/api/nodes' && m === 'GET') {
-      const nodes = await gateway.getAllNodes();
+      const all = await gateway.getAllNodes();
       return json(res, {
-        nodes,
+        // 给前端的是排过序的表 —— 网关自己挑节点用的就是这个顺序,
+        // 面板显示另一种顺序的话「从上往下就是接下来会用的」这句话就不成立了
+        nodes: gateway.rankNodes(all),
+        excluded: gateway.excludedNodes(all),
+        delay: gateway.delayMap(),
+        testedAt: gateway.testedAt || null,
+        testing: gateway.testing != null,
         current: await gateway.getCurrentNode(),
         locked: gateway.lockedNode,
         cooldowns: gateway.cooldown.summary(),
       });
     }
 
+    if (path === '/api/nodes/test' && m === 'POST') {
+      const r = await gateway.testNodes();
+      return json(res, r);
+    }
+
     if (path === '/api/usage' && m === 'GET') return json(res, gateway.usage.getStats());
+
+    if (path === '/api/usage/reset' && m === 'POST') {
+      gateway.usage.reset();
+      return json(res, gateway.usage.getStats());
+    }
 
     if (path === '/api/regen-key' && m === 'POST') {
       cfg.apiKey = cfgMod.genApiKey();
@@ -252,6 +290,8 @@ function makeApiRoutes({ cfg, gateway }) {
       });
       log('ok', `[reset] 清空 ${cleared} 个冷却记录`);
       log('ok', '===== 手动重置完成 =====');
+      // 内核刚重启,节点表可能变了。后台测一遍,别把重置这个请求拖上十几秒。
+      gateway.testNodes().catch((e) => log('warn', `[speed] 重置后测速失败: ${e.message}`));
       return json(res, { ok: true, cleared });
     }
 
@@ -302,6 +342,9 @@ async function main() {
       const n = (await gateway.getAllNodes()).length;
       log('ok', `[mihomo] 就绪,${n} 个节点`);
       await gateway.restoreLastNode();
+      // 开机测一遍延迟。不 await:测完要十几秒,而这期间面板和 /v1 都该能用
+      // —— 没有延迟数据时 rankNodes 原样返回订阅顺序,退化成旧行为而不是失败。
+      if (n > 0) gateway.testNodes().catch((e) => log('warn', `[speed] 开机测速失败: ${e.message}`));
     } catch (e) {
       // 不退出:面板还能用,用户得进来改订阅地址。退了就只剩看 docker logs 猜。
       log('error', `[mihomo] 启动失败: ${e.message}`);

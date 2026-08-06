@@ -148,6 +148,9 @@ export const mapStop = (r) => STOP_MAP[r] ?? 'end_turn';
 
 export const msgId = () => `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
+/** 非空字符串才算有内容;上游会发 delta:{content:null} 这种占位帧 */
+const str = (v) => (typeof v === 'string' && v ? v : '');
+
 /** arguments 是 JSON 字符串,Anthropic 的 input 要对象;拼不出来就给空对象别抛 */
 function parseArgs(s) {
   if (s && typeof s === 'object') return s;
@@ -230,13 +233,15 @@ export const errTypeFor = (status) => HTTP_TO_ANTHROPIC_TYPE[status] ?? 'api_err
  * 不用起 HTTP server 也能测出事件顺序。
  */
 export class AnthropicStream {
-  constructor({ model = '', emit }) {
+  constructor({ model = '', emit, thinking = true }) {
     this.emit = emit;              // (event: string, data: object) => void
     this.model = model;
+    this.showThinking = thinking;  // false 时推理内容丢弃(见 line() 里的说明)
     this.buf = '';
     this.started = false;
     this.nextIndex = 0;
     this.textIndex = -1;           // -1 = 文本块还没开
+    this.thinkIndex = -1;          // 同上,思考块
     this.tools = new Map();        // OpenAI 的 tool_calls[].index -> {index,id,name}
     this.openBlocks = new Set();   // 已 start 未 stop 的 index
     this.stopReason = 'end_turn';
@@ -299,7 +304,27 @@ export class AnthropicStream {
     const delta = choice.delta ?? {};
     this.start();
 
-    if (typeof delta.content === 'string' && delta.content) {
+    // 推理内容。deepseek-v4-flash-free 这类模型在出正文之前会先吐几分钟
+    // reasoning_content(实测「写个 SVG 动画」的提问 200s 内 reasoning 68000 字、
+    // 正文 0 字)。之前这里不认这个字段,于是客户端收到 message_start 之后
+    // 整整几分钟一个事件都没有 —— 看起来就是卡死/超时,而其实上游一直在吐。
+    // 映射成 Anthropic 的 thinking 块,客户端就能显示「思考中」并看到进度。
+    const reasoning = str(delta.reasoning_content) || str(delta.reasoning);
+    if (reasoning && this.showThinking) {
+      if (this.thinkIndex < 0) {
+        this.thinkIndex = this.nextIndex++;
+        this.blockStart(this.thinkIndex, { type: 'thinking', thinking: '' });
+      }
+      this.emit('content_block_delta', {
+        type: 'content_block_delta', index: this.thinkIndex,
+        delta: { type: 'thinking_delta', thinking: reasoning },
+      });
+    }
+
+    if (str(delta.content)) {
+      // 正文开始 = 思考结束。Anthropic 不允许两个块同时开着,
+      // 而且 SDK 的 ThinkingBlock 类型里 signature 是必填,收尾前补上。
+      this.closeThinking();
       if (this.textIndex < 0) {
         this.textIndex = this.nextIndex++;
         this.blockStart(this.textIndex, { type: 'text', text: '' });
@@ -317,11 +342,27 @@ export class AnthropicStream {
     if (choice.finish_reason) this.stopReason = mapStop(choice.finish_reason);
   }
 
+  /**
+   * 关掉思考块。signature 是占位符,不是真签名 —— 上游没有给我们任何可签的
+   * 东西。客户端把它原样发回来时会走 anthropicToOpenAI,thinking 块在那边
+   * 本来就被忽略,所以不会有人去验它;而缺这个字段的话按 SDK 类型是非法块。
+   */
+  closeThinking() {
+    if (this.thinkIndex < 0) return;
+    this.emit('content_block_delta', {
+      type: 'content_block_delta', index: this.thinkIndex,
+      delta: { type: 'signature_delta', signature: 'ciallo-ds4f-proxy' },
+    });
+    this.blockStop(this.thinkIndex);
+    this.thinkIndex = -1;
+  }
+
   toolDelta(tc) {
     const key = Number.isFinite(tc?.index) ? tc.index : 0;
     let acc = this.tools.get(key);
     if (!acc) {
-      // 文本块先收掉:Anthropic 不允许两个块同时开着
+      // 文本/思考块先收掉:Anthropic 不允许两个块同时开着
+      this.closeThinking();
       if (this.textIndex >= 0) { this.blockStop(this.textIndex); this.textIndex = -1; }
       acc = { index: this.nextIndex++, id: tc?.id || `toolu_${Math.random().toString(36).slice(2, 10)}`, name: tc?.function?.name || '' };
       this.tools.set(key, acc);
@@ -343,6 +384,7 @@ export class AnthropicStream {
     if (this.done) return;
     this.done = true;
     this.start();                  // 一个 chunk 都没收到也得有个合法的空回复
+    this.closeThinking();          // 走这条才带得上 signature_delta
     for (const i of [...this.openBlocks]) this.blockStop(i);
     this.emit('message_delta', {
       type: 'message_delta',

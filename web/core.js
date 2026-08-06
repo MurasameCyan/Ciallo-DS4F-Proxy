@@ -85,12 +85,15 @@ export function remainMs(deadline, now = Date.now()) {
 /**
  * 合并节点列表 + 冷却表 + 当前/锁定节点,产出可直接渲染的行。
  *
- * 排序刻意对齐网关的挑选顺序:可用的在前(且保持订阅原序,因为
- * pickAvailable 取列表里第一个不冷却的),冷却中的排最后、剩余时间短的靠前
- * (对应「全部冷却时选剩余最短的」)。所以这个列表从上往下读
- * 就是网关接下来会用的顺序。
+ * 排序刻意对齐网关的挑选顺序:可用的在前(且保持后端给的顺序 —— 后端已经按
+ * 实测延迟排过,pickAvailable 取的就是列表里第一个不冷却的),冷却中的排最后、
+ * 剩余时间短的靠前(对应「全部冷却时选剩余最短的」),测不通的(excluded)
+ * 垫在最底下。所以这个列表从上往下读就是网关接下来会用的顺序。
+ *
+ * delay: { 节点名: 毫秒 | null }。null / 缺失 = 没有实测数据,显示成 '—'
+ * 而不是 0ms —— 0ms 是个具体的谎。
  */
-export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = '', now = Date.now() } = {}) {
+export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = '', delay = {}, excluded = [], now = Date.now() } = {}) {
   const cooling = new Map();
   for (const c of cooldowns) {
     if (!c?.node) continue;
@@ -98,15 +101,57 @@ export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = ''
     if (ms > 0) cooling.set(c.node, ms);
   }
 
-  const rows = (nodes || []).map((name, i) => {
+  const mk = (name, i, dead) => {
     const remain = cooling.get(name) || 0;
+    const d = Number(delay?.[name]);
     // 冷却优先于 active:当前节点正被限流时它其实不可用,标成 active 是骗人
-    const state = remain > 0 ? 'cooling' : name === current ? 'active' : 'idle';
-    return { name, i, remain, state, locked: name === locked, ratio: remain / COOLDOWN_MS };
-  });
+    const state = dead ? 'dead' : remain > 0 ? 'cooling' : name === current ? 'active' : 'idle';
+    return {
+      name, i, remain, state,
+      latency: dead ? null : Number.isFinite(d) && d > 0 ? d : null,
+      locked: name === locked, ratio: remain / COOLDOWN_MS,
+    };
+  };
 
+  const rows = (nodes || []).map((name, i) => mk(name, i, false));
   const rank = { active: 0, idle: 1, cooling: 2 };
-  return rows.sort((a, b) => rank[a.state] - rank[b.state] || a.remain - b.remain || a.i - b.i);
+  rows.sort((a, b) => rank[a.state] - rank[b.state] || a.remain - b.remain || a.i - b.i);
+
+  // 被剔除的接在后面,自己按名字排;它们不参与轮换,顺序没有语义
+  const dead = (excluded || []).filter((n) => !(nodes || []).includes(n))
+    .map((name, i) => mk(name, rows.length + i, true))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return [...rows, ...dead];
+}
+
+/** 延迟 -> 显示文本。没测过是 '—',不是 0 */
+export function fmtDelay(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${Math.round(n)}ms`;
+}
+
+/**
+ * 延迟分档,给徽章上色。阈值按「能不能用」而不是好看:
+ * 300ms 以内是直连级,1s 以上光握手就要等一下,算差。
+ */
+export function delayGrade(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 300) return 'fast';
+  if (n < 1000) return 'mid';
+  return 'slow';
+}
+
+/** 「上次测速」显示成相对时间;测速是手动/事件触发的,绝对时刻没意义 */
+export function fmtAgo(ts, now = Date.now()) {
+  const t = Number(ts);
+  if (!t) return '还没测过';
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  if (s < 60) return `${s} 秒前测`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前测`;
+  return `${Math.floor(s / 3600)} 小时前测`;
 }
 
 /** 追加日志并裁到上限。用 splice 而非 shift:一次灌入多条也能裁干净 */

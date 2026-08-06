@@ -105,6 +105,104 @@ await t('用量文件坏了不抛,当空账开始', () => {
   assert.equal(u.getStats().total.requests, 0);
 });
 
+await t('reset 把三个维度一起清空,并且落盘', () => {
+  const f = path.join(TMP, 'u3.json');
+  const u = new UsageTracker(f, () => {});
+  u.record('m1', { prompt_tokens: 9, completion_tokens: 1, total_tokens: 10 }, true);
+  const t0 = u.getStats().startTime;
+  u.reset();
+  const d = u.getStats();
+  assert.equal(d.total.requests, 0);
+  assert.equal(d.total.totalTokens, 0);
+  assert.deepEqual(d.byModel, {}, '按模型的明细也要清,不然成功率算不回来');
+  assert.deepEqual(d.byDay, {});
+  assert.equal(d.lastRequest, null);
+  assert.ok(d.startTime >= t0, '运行时长从清零那一刻重算');
+  // 重新读一遍文件:清零必须落盘,否则重启一次数字又回来了
+  assert.equal(new UsageTracker(f, () => {}).getStats().total.requests, 0);
+});
+
+// ── 节点测速与排序 ──────────────────────────────────────
+
+/** 造一个不需要内核的 Gateway:mihomoApi 换成假的 */
+function fakeGateway(delays) {
+  const g = new Gateway(load(), () => {});
+  const names = Object.keys(delays);
+  g.mihomoApi = async (p) => {
+    const m = decodeURIComponent(p).match(/^\/proxies\/(.+?)\/delay/);
+    if (!m) return { all: names, now: names[0] };
+    const d = delays[m[1]];
+    if (d == null) throw new Error('HTTP 503');   // mihomo 对不通的节点回非 2xx
+    return { delay: d };
+  };
+  return g;
+}
+
+await t('测速:不通的记 null,通的记毫秒', async () => {
+  const g = fakeGateway({ A: 300, B: null, C: 80 });
+  const r = await g.testNodes();
+  assert.equal(r.tested, 3);
+  assert.equal(r.alive, 2);
+  assert.deepEqual(r.dead, ['B']);
+  assert.deepEqual(r.fastest, { node: 'C', delay: 80 });
+  assert.deepEqual(g.delayMap(), { A: 300, B: null, C: 80 });
+  assert.ok(g.testedAt > 0);
+});
+
+await t('rankNodes 按延迟排序并剔除不通的', async () => {
+  const g = fakeGateway({ A: 300, B: null, C: 80 });
+  await g.testNodes();
+  assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['C', 'A'], '快的在前,B 直接不在表里');
+  assert.deepEqual(g.excludedNodes(['A', 'B', 'C']), ['B']);
+});
+
+await t('没测过时 rankNodes 原样返回(退化成订阅顺序,不是空表)', () => {
+  const g = new Gateway(load(), () => {});
+  assert.deepEqual(g.rankNodes(['A', 'B']), ['A', 'B']);
+  assert.deepEqual(g.excludedNodes(['A', 'B']), [], '没数据就别声称谁不可用');
+});
+
+await t('全灭时不剔除 —— 测速地址不可达不等于节点不可用', async () => {
+  const g = fakeGateway({ A: null, B: null });
+  const r = await g.testNodes();
+  assert.equal(r.alive, 0);
+  assert.deepEqual(g.rankNodes(['A', 'B']), ['A', 'B'], '全剔掉等于把整个网关关掉');
+  assert.deepEqual(g.excludedNodes(['A', 'B']), []);
+});
+
+await t('测速之后才出现的节点保留在表尾,不当成死的', async () => {
+  const g = fakeGateway({ A: 300, B: 80 });
+  await g.testNodes();
+  assert.deepEqual(g.rankNodes(['A', 'B', 'NEW']), ['B', 'A', 'NEW']);
+  assert.deepEqual(g.excludedNodes(['A', 'B', 'NEW']), [], '没测过的不算不可用');
+});
+
+await t('锁定的节点测不通时解锁', async () => {
+  const g = fakeGateway({ A: 300, B: null });
+  g.lockedNode = 'B';
+  await g.testNodes();
+  assert.equal(g.lockedNode, null, '不然 ensureNode 会一直粘着一个已知不通的节点');
+});
+
+await t('并发测速只跑一遍', async () => {
+  let calls = 0;
+  const g = fakeGateway({ A: 100, B: 200 });
+  const inner = g.mihomoApi;
+  g.mihomoApi = (...a) => { calls++; return inner(...a); };
+  const [r1, r2] = await Promise.all([g.testNodes(), g.testNodes()]);
+  assert.equal(r1, r2, '第二个调用应搭车,不是再测一轮');
+  assert.equal(calls, 3, '1 次取节点 + 2 次测延迟');
+  assert.equal(g.testing, null, '测完要把占位清掉,否则下次点测速直接返回旧结果');
+});
+
+await t('一个节点都没有时测速不抛', async () => {
+  const g = new Gateway(load(), () => {});
+  g.mihomoApi = async () => ({ all: [] });
+  const r = await g.testNodes();
+  assert.equal(r.tested, 0);
+  assert.equal(r.fastest, null);
+});
+
 // ── mihomo 配置生成 ────────────────────────────────────
 
 /** 去掉注释行。生成的 yaml 里有成段注释解释取舍,别让它们混进断言。 */
@@ -420,6 +518,60 @@ await t('未知的 /v1/ 路径按方言回 404', async () => {
   const r = await fetch(`${base}/v1/nope`, { headers: { 'x-api-key': cfg.apiKey } });
   assert.equal(r.status, 404);
   assert.ok((await r.json()).error.message.includes('/v1/nope'));
+});
+
+// ── 节点池与统计的面板接口 ──────────────────────────────
+// 放在最后:这里会替掉 gateway 上的取节点方法,前面那些「没节点」的断言
+// 必须在替换之前跑完
+
+await t('/api/nodes 给出排过序的表、剔除名单和延迟', async () => {
+  gateway.getAllNodes = async () => ['A', 'B', 'C'];
+  gateway.getCurrentNode = async () => 'B';
+  gateway.delay = new Map([['A', 300], ['B', 80], ['C', null]]);
+  gateway.testedAt = 1_700_000_000_000;
+
+  const j = await (await fetch(`${base}/api/nodes`, { headers: { authorization: auth } })).json();
+  assert.deepEqual(j.nodes, ['B', 'A'], '面板显示的顺序必须就是网关取用的顺序');
+  assert.deepEqual(j.excluded, ['C'], '剔掉的也要报出来,静默消失像是订阅少了节点');
+  assert.deepEqual(j.delay, { A: 300, B: 80, C: null });
+  assert.equal(j.testedAt, 1_700_000_000_000);
+  assert.equal(j.testing, false);
+  assert.equal(j.current, 'B');
+});
+
+await t('POST /api/nodes/test 触发测速并回摘要', async () => {
+  gateway.mihomoApi = async (p) => {
+    const m = decodeURIComponent(p).match(/^\/proxies\/(.+?)\/delay/);
+    if (!m) return { all: ['A', 'B'], now: 'A' };
+    if (m[1] === 'B') throw new Error('HTTP 503');
+    return { delay: 120 };
+  };
+  const r = await fetch(`${base}/api/nodes/test`, { method: 'POST', headers: { authorization: auth } });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.tested, 3, 'getAllNodes 被前面的测试替过,这里测的是它给的 3 个');
+  assert.equal(typeof j.ms, 'number');
+});
+
+await t('POST /api/usage/reset 清零并落盘', async () => {
+  gateway.usage.record('m', { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 }, true);
+  assert.ok(gateway.usage.getStats().total.requests > 0, '先得有数才测得出清零');
+
+  const r = await fetch(`${base}/api/usage/reset`, { method: 'POST', headers: { authorization: auth } });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.total.requests, 0);
+  assert.deepEqual(j.byModel, {});
+  assert.equal(j.lastRequest, null);
+
+  const after = await (await fetch(`${base}/api/usage`, { headers: { authorization: auth } })).json();
+  assert.equal(after.total.totalTokens, 0);
+});
+
+await t('GET /api/usage/reset 不算数(清零只能是 POST)', async () => {
+  const r = await fetch(`${base}/api/usage/reset`, { headers: { authorization: auth } });
+  assert.equal(r.status, 404, '误点一个链接不该把统计清了');
+  await r.text();
 });
 
 await new Promise((r) => app.close(r));

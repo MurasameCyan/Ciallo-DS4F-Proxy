@@ -134,6 +134,48 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   body.includes('"output_tokens":2') ? ok('流式:usage 一路带到 message_delta') : no('流式 usage 丢了');
 }
 
+// ── Anthropic 流式:推理内容(回归「十分钟没动静」)──────
+// deepseek-v4-flash-free 在出正文之前会先吐几分钟 reasoning_content。
+// 这个字段以前被丢掉,客户端于是在 message_start 之后长时间收不到任何事件,
+// 表现成卡死/超时 —— 而上游一直在吐。这里让假上游只发推理,验它变成
+// 合法的 thinking 块并带上 signature。
+{
+  const saved = gw.forwardStream;
+  gw.forwardStream = async (res, body, dialect) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    const sink = dialect.sink(res);
+    for (const s of ['让我', '想想']) {
+      sink.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: s } }] })}\n\n`);
+    }
+    sink.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '答案' } }], usage: { completion_tokens: 7 } })}\n\n`);
+    sink.write('data: [DONE]\n\n');
+    sink.end();
+  };
+
+  const r = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
+    body: JSON.stringify({ stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const body = await r.text();
+  const events = [...body.matchAll(/^event: (.+)$/gm)].map((m) => m[1].trim());
+  const think = [...body.matchAll(/"thinking_delta","thinking":"([^"]*)"/g)].map((m) => m[1]).join('');
+  const text = [...body.matchAll(/"text_delta","text":"([^"]*)"/g)].map((m) => m[1]).join('');
+
+  think === '让我想想' ? ok('流式:推理内容变成 thinking 块') : no(`推理内容对不上:「${think}」`);
+  body.includes('"thinking":""') ? ok('流式:thinking 块的 start 形状合法') : no('thinking 块没有合法的 content_block_start');
+  body.includes('signature_delta') ? ok('流式:thinking 块补了 signature') : no('thinking 块缺 signature,SDK 会当非法块');
+  text === '答案' ? ok('流式:推理之后正文照常') : no(`正文对不上:「${text}」`);
+
+  const opens = events.filter((e) => e === 'content_block_start').length;
+  const stops = events.filter((e) => e === 'content_block_stop').length;
+  opens === 2 && stops === 2
+    ? ok('流式:thinking 和 text 各占一块且都关掉')
+    : no(`推理流块数不对:${opens} 开 / ${stops} 关`);
+
+  gw.forwardStream = saved;
+}
+
 // ── 断连不该让进程崩 ────────────────────────────────────
 // sink 的 write 全都包了 try/catch,这里验它真的兜住了
 {

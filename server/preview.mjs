@@ -42,6 +42,10 @@ const state = {
   cfg: { subscriptionUrl: 'https://demo.example.com/subscribe?token=preview', apiKey: 'zen-a1b2c3d4', port: 9527 },
   current: NODES[2],
   cooldowns: new Map(),          // name -> 进入冷却的时间戳
+  // 假的实测延迟。故意留两个 null:那是「测过但不通」,面板要把它们
+  // 单独标出来而不是静默消失 —— 不然看起来像订阅少了节点。
+  delay: new Map(NODES.map((n, i) => [n, i === 4 || i === 9 ? null : 90 + i * 37 + (i % 3) * 24])),
+  testedAt: Date.now() - 42_000,
   usage: {
     total: { requests: 1284, success: 1197, fail: 87, promptTokens: 2_841_302, completionTokens: 986_441, reasoningTokens: 412_887, totalTokens: 3_827_743 },
     byDay: {}, byModel: {},
@@ -77,7 +81,35 @@ function coolingList() {
 }
 
 function available() {
-  return NODES.filter((n) => !state.cooldowns.has(n));
+  return NODES.filter((n) => !state.cooldowns.has(n) && state.delay.get(n) != null);
+}
+
+/** 真网关的 rankNodes:延迟低的在前,测不通的不在表里 */
+function ranked() {
+  return NODES.filter((n) => state.delay.get(n) != null)
+    .sort((a, b) => state.delay.get(a) - state.delay.get(b));
+}
+
+function excluded() {
+  return NODES.filter((n) => state.delay.has(n) && state.delay.get(n) == null);
+}
+
+/** 模拟一遍测速:重新摇一次延迟,不通的那两个保持不通 */
+async function speedTest() {
+  const t0 = Date.now();
+  log('info', `[speed] 开始测速,${NODES.length} 个节点`);
+  await new Promise((r) => setTimeout(r, 1600));
+  for (const n of NODES) {
+    if (state.delay.get(n) == null) continue;
+    state.delay.set(n, 80 + Math.floor(Math.random() * 700));
+  }
+  state.testedAt = Date.now();
+  const alive = ranked();
+  const dead = excluded();
+  const ms = Date.now() - t0;
+  log('ok', `[speed] 测完 ${NODES.length} 个,可用 ${alive.length},最快 ${alive[0]} ${state.delay.get(alive[0])}ms(耗时 ${(ms / 1000).toFixed(1)}s)`);
+  if (dead.length) log('warn', `[speed] 剔除 ${dead.length} 个不可用: ${dead.join(', ')}`);
+  return { tested: NODES.length, alive: alive.length, dead, fastest: { node: alive[0], delay: state.delay.get(alive[0]) }, ms };
 }
 
 /**
@@ -163,14 +195,40 @@ async function handleApi(req, res, path) {
     if (b.port !== undefined) state.cfg.port = Number(b.port) || state.cfg.port;
     log('info', '[config] 已保存');
     log('ok', `[sub] 刷新成功,${NODES.length} 个节点`);
-    return json(res, state.cfg);
+    // 真网关刷完订阅会顺手测一遍延迟,预览也照做,不然「保存后节点重排」看不到
+    const speed = await speedTest();
+    return json(res, { ...state.cfg, nodes: NODES.length, speed });
   }
 
   if (path === '/api/nodes' && m === 'GET') {
-    return json(res, { nodes: NODES, current: state.current, locked: state.current, cooldowns: coolingList() });
+    return json(res, {
+      nodes: ranked(),
+      excluded: excluded(),
+      delay: Object.fromEntries(state.delay),
+      testedAt: state.testedAt,
+      testing: false,
+      current: state.current,
+      locked: state.current,
+      cooldowns: coolingList(),
+    });
   }
 
+  if (path === '/api/nodes/test' && m === 'POST') return json(res, await speedTest());
+
   if (path === '/api/usage' && m === 'GET') return json(res, state.usage);
+
+  if (path === '/api/usage/reset' && m === 'POST') {
+    state.usage.total = {
+      requests: 0, success: 0, fail: 0,
+      promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
+    };
+    state.usage.byDay = {};
+    state.usage.byModel = {};
+    state.usage.lastRequest = null;
+    state.usage.startTime = Date.now();
+    log('ok', '[usage] 用量已清零');
+    return json(res, state.usage);
+  }
 
   if (path === '/api/regen-key' && m === 'POST') {
     state.cfg.apiKey = 'zen-' + Math.random().toString(16).slice(2, 10);
@@ -193,6 +251,7 @@ async function handleApi(req, res, path) {
     await new Promise((r) => setTimeout(r, 700));
     log('ok', `[reset] 清空 ${n} 个冷却记录`);
     log('ok', '===== 手动重置完成 =====');
+    speedTest();      // 真网关重置后也会后台测一遍
     return json(res, { ok: true, cleared: n });
   }
 

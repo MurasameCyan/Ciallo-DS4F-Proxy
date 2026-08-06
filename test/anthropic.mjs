@@ -321,6 +321,98 @@ t('usage 从上游帧里抄进 message_delta', () => {
   assert.equal(events.find((e) => e.event === 'message_delta').data.usage.output_tokens, 42);
 });
 
+// ── 推理内容 ────────────────────────────────────────────
+//
+// deepseek-v4-flash-free 这类模型会先吐几分钟 reasoning_content 再出正文
+// (实测「写个 SVG 动画」的提问 200 秒内推理 68000 字、正文 0 字)。
+// 这个字段以前被丢掉,于是客户端在 message_start 之后几分钟收不到任何事件,
+// 看起来就是卡死/超时 —— 而上游其实一直在吐。
+
+t('reasoning_content 变成 thinking 块', () => {
+  const { st, events, names } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '先想想' } }] });
+  st.end();
+  const start = events.find((e) => e.event === 'content_block_start');
+  assert.equal(start.data.content_block.type, 'thinking');
+  assert.equal(start.data.index, 0);
+  const d = events.find((e) => e.data.delta?.type === 'thinking_delta');
+  assert.equal(d.data.delta.thinking, '先想想');
+  assert.ok(names().indexOf('content_block_start') < names().indexOf('content_block_delta'),
+    '先 start 后 delta,反了 SDK 直接抛');
+});
+
+t('reasoning 这个字段名也认(不同上游叫法不一样)', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning: 'r' } }] });
+  st.end();
+  assert.equal(events.find((e) => e.data.delta?.type === 'thinking_delta').data.delta.thinking, 'r');
+});
+
+t('推理分片累积在同一个 thinking 块里,不是一片一块', () => {
+  const { st, events } = collect();
+  for (const s of ['一', '二', '三']) feedJSON(st, { choices: [{ delta: { reasoning_content: s } }] });
+  st.end();
+  assert.equal(events.filter((e) => e.event === 'content_block_start').length, 1);
+  const text = events.filter((e) => e.data.delta?.type === 'thinking_delta').map((e) => e.data.delta.thinking).join('');
+  assert.equal(text, '一二三');
+});
+
+t('正文开始时思考块先补 signature 再关掉', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '想' } }] });
+  feedJSON(st, { choices: [{ delta: { content: '答' } }] });
+  st.end();
+  const seq = events.map((e) => `${e.event}:${e.data.index ?? ''}`);
+  const sig = events.findIndex((e) => e.data.delta?.type === 'signature_delta');
+  const stopThink = seq.indexOf('content_block_stop:0');
+  const startText = seq.indexOf('content_block_start:1');
+  assert.ok(sig >= 0, 'SDK 的 ThinkingBlock 要求 signature,缺了是非法块');
+  assert.ok(sig < stopThink, 'signature_delta 必须在 stop 之前');
+  assert.ok(stopThink < startText, '不能两个块同时开着');
+  assert.equal(events.find((e) => e.event === 'content_block_start' && e.data.index === 1).data.content_block.type, 'text');
+});
+
+t('只有推理没有正文时也补 signature 并关块', () => {
+  // 上游被掐断/到 max_tokens 就是这个形状:整段响应只有 thinking
+  const { st, events, names } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '想了很久' } }] });
+  st.end();
+  assert.ok(events.some((e) => e.data.delta?.type === 'signature_delta'));
+  assert.deepEqual(names(), [
+    'message_start', 'content_block_start', 'content_block_delta',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop',
+  ]);
+});
+
+t('推理后直接调工具:思考块先关,工具块才开', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '要查文件' } }] });
+  feedJSON(st, { choices: [{ delta: { tool_calls: [{ index: 0, id: 't', function: { name: 'read', arguments: '{}' } }] } }] });
+  st.end();
+  const seq = events.map((e) => `${e.event}:${e.data.index ?? ''}`);
+  assert.ok(seq.indexOf('content_block_stop:0') < seq.indexOf('content_block_start:1'));
+  assert.equal(events.find((e) => e.data.index === 1 && e.event === 'content_block_start').data.content_block.type, 'tool_use');
+});
+
+t('thinking:false 时推理内容整段丢掉,不占块序号', () => {
+  const events = [];
+  const st = new AnthropicStream({ model: 'm', thinking: false, emit: (event, data) => events.push({ event, data }) });
+  st.feed(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: '想' } }] })}\n\n`);
+  st.feed(`data: ${JSON.stringify({ choices: [{ delta: { content: '答' } }] })}\n\n`);
+  st.end();
+  assert.equal(events.filter((e) => e.event === 'content_block_start').length, 1);
+  assert.equal(events[1].data.index, 0, '正文块要占 index 0,不能给丢掉的思考块留号');
+  assert.ok(!events.some((e) => e.data.delta?.type === 'thinking_delta'));
+});
+
+t('推理中途上游报错也能关掉思考块', () => {
+  const { st, names } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '想' } }] });
+  st.fail('upstream died');
+  assert.ok(names().includes('content_block_stop'), '开着的思考块必须关,否则客户端等到超时');
+  assert.equal(names().at(-1), 'message_stop');
+});
+
 // ── flattenText 边界 ────────────────────────────────────
 
 t('flattenText 各种输入都不抛', () => {

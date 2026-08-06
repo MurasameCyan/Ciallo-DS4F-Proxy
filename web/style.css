@@ -118,7 +118,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .pill.down .dot { background: var(--rose); }
 .pill.cool .dot { background: var(--amber); }
 
-.top-actions { display: flex; gap: 8px; }
+/* 三个按钮在窄屏上放不进一行,允许折行 —— 不折的话会把 header 撑出横向滚动 */
+.top-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
 /* ── 布局 ─────────────────────────────────────────────── */
 
@@ -234,7 +235,9 @@ main {
 
 .node {
   display: grid;
-  grid-template-columns: 22px 1fr auto;
+  /* 延迟列固定 46px 而不是 auto:每行宽度不一样的话数字列参差不齐,
+     一列 tabular-nums 右对齐才扫得快。"1.2s" 和 "1840ms" 都塞得进去。 */
+  grid-template-columns: 22px minmax(0, 1fr) 46px auto;
   align-items: center; gap: 11px;
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -251,6 +254,15 @@ main {
   text-overflow: ellipsis; white-space: nowrap;
   font-size: 13px;
 }
+.node .ms {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--fg-2); text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* 延迟分档只给颜色,不加边框/底色 —— 一屏几十行,每行再多一个色块就吵了 */
+.node .ms.fast { color: var(--mint); }
+.node .ms.mid  { color: var(--fg-2); }
+.node .ms.slow { color: var(--amber); }
 .node .st { display: flex; align-items: center; gap: 8px; }
 
 /* 在用节点:唯一被强调的一行 */
@@ -260,6 +272,10 @@ main {
 }
 .node.active .nm { font-weight: 600; }
 .node.cooling { opacity: .62; }
+/* 测不通的:留在列表里但明显压暗 —— 静默消失会让人以为订阅少了节点,
+   而删掉线又没法解释「订阅 17 个这里只有 15 个」 */
+.node.dead { opacity: .5; }
+.node.dead .nm { text-decoration: line-through; text-decoration-color: var(--line-2); }
 
 .badge {
   font-family: var(--mono); font-size: 11px;
@@ -269,6 +285,11 @@ main {
 }
 .badge.on   { color: #04201c; background: var(--mint); border-color: transparent; font-weight: 600; }
 .badge.cool { color: var(--amber); border-color: color-mix(in oklab, var(--amber) 40%, transparent); }
+.badge.dead { color: var(--rose); border-color: color-mix(in oklab, var(--rose) 40%, transparent); }
+
+/* 卡头右侧的「N 秒前测 + 测速」。baseline 对齐会让按钮比文字低半行 */
+.node-tools { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.node-tools .hint { margin-left: 0; }
 
 .empty { color: var(--fg-2); font-size: 13px; padding: 14px 2px; }
 

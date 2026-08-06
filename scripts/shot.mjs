@@ -82,7 +82,11 @@ const AUDIT = `(() => {
     if (r.left < -1)       bad.push({ id, why: 'overflow-left',  left:  Math.round(r.left) });
     // 表单控件的值比框长是它们的正常工作方式(自己内部滚动),不是布局破了
     const formCtl = /^(input|textarea|select)$/.test(el.tagName.toLowerCase());
-    if (!formCtl && el.scrollWidth > el.clientWidth + 1
+    // 省略号截断同理:overflow:hidden + text-overflow:ellipsis 就是"故意裁掉"
+    // 的写法(节点名可以任意长,只能裁)。不排除的话每个长节点名都报一条,
+    // 真正的布局破损就被淹了。
+    const clipsOnPurpose = cs.textOverflow === 'ellipsis' && cs.overflowX === 'hidden';
+    if (!formCtl && !clipsOnPurpose && el.scrollWidth > el.clientWidth + 1
         && cs.overflowX !== 'auto' && cs.overflowX !== 'scroll') {
       bad.push({ id, why: 'content-wider-than-box', scrollW: el.scrollWidth, clientW: el.clientWidth });
     }

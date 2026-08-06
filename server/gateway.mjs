@@ -41,6 +41,22 @@ const MAX_NODE_TRIES = 6;                    // 最多换几个节点。48 个�
                                              // 连续 6 个都 429 基本就是整体被限了
 const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开新的尝试了
 
+/**
+ * 把上游的 reasoning_content 翻成 Anthropic 的 thinking 块。
+ *
+ * 默认开。deepseek-v4-flash-free 出正文之前会先推理好几分钟(实测「写个 SVG
+ * 动画」的提问 200s 内推理 68000 字、正文 0 字),不转发的话客户端收到
+ * message_start 之后几分钟一个事件都没有,看起来就是卡死。
+ * 极少数客户端不认 thinking 块,那就 SHOW_THINKING=0 关掉。
+ */
+const SHOW_THINKING = process.env.SHOW_THINKING !== '0';
+
+/** 节点健康检查:测延迟用的 URL 和超时。不用 opencode.ai 是不想让探测
+ *  去碰配额端点 —— 这里要量的是节点通不通、快不快。 */
+const HEALTH_URL = process.env.NODE_TEST_URL || 'http://www.gstatic.com/generate_204';
+const HEALTH_TIMEOUT_MS = Number(process.env.NODE_TEST_TIMEOUT_MS) || 5_000;
+const HEALTH_CONCURRENCY = 6;
+
 export const FREE_MODELS = [
   'deepseek-v4-flash-free',
   'big-pickle',
@@ -97,6 +113,7 @@ function anthropicSink(res, model) {
   const safe = (fn) => { try { fn(); } catch {} };
   const st = new AnthropicStream({
     model,
+    thinking: SHOW_THINKING,
     emit: (event, data) => safe(() => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)),
   });
   return {
@@ -220,6 +237,9 @@ export class Gateway {
     this.agent = new MihomoAgent(MIXED_PORT);
     this.nodeCache = null;
     this.nodeCacheTime = 0;
+    this.delay = new Map();     // 节点 -> 实测延迟 ms;null = 测过但不通
+    this.testedAt = 0;          // 上次测速时刻,0 = 还没测过
+    this.testing = null;        // 进行中的测速 Promise,防并发重复测
     this.lockedNode = null;     // 成功后锁定,后续请求直接用,直到 429
     this.switching = false;
     this.paused = false;        // 重启/重置期间置位,请求收 503 而不是打到坏代理上
@@ -314,7 +334,9 @@ export class Gateway {
     const wantStream = inbound.stream === true;
     const body = dialect.toUpstream(inbound);
 
-    const nodes = await this.getAllNodes();
+    // 排过序的表:延迟低的在前,测不通的直接不在表里。pickAvailable 取的是
+    // 「第一个不冷却的」,所以排序在这儿就等于优先级。
+    const nodes = this.rankNodes(await this.getAllNodes());
     if (nodes.length === 0) {
       return dialect.fail(res, 503, '没有可用节点 —— 检查订阅地址和 mihomo 状态', 'no_nodes');
     }
@@ -654,6 +676,105 @@ export class Gateway {
     await this.mihomoApi('/providers/proxies/airport', 'PUT');
     this.nodeCache = null;
     this.nodeCacheTime = 0;
+  }
+
+  // ── 测速与排序 ────────────────────────────────────────
+
+  /**
+   * 逐个节点测延迟。mihomo 的 /proxies/{name}/delay 会真的经由那个节点发一次
+   * HTTP,通了返回 {delay},不通返回非 2xx —— 所以「不可用」是它告诉我们的,
+   * 不用自己判。
+   *
+   * 配置里 health-check 是 lazy 的(没人用这个组时不测速,省机场流量),
+   * 所以内核自己不会给出这份数据,必须显式点一遍。
+   *
+   * 并发上限 6:17 个节点一次全打出去容易被机场当异常探测,而串行要 85s。
+   */
+  async testNodes(nodes = null) {
+    if (this.testing) return this.testing;        // 已经在测了就搭车,别测两遍
+    this.testing = this._testNodes(nodes).finally(() => { this.testing = null; });
+    return this.testing;
+  }
+
+  async _testNodes(nodes) {
+    const list = nodes || (await this.getAllNodes());
+    if (!list.length) return { tested: 0, alive: 0, dead: [], fastest: null, ms: 0 };
+
+    const t0 = Date.now();
+    const next = (() => { let i = 0; return () => (i < list.length ? list[i++] : null); })();
+    const found = new Map();
+
+    const worker = async () => {
+      for (let n = next(); n !== null; n = next()) {
+        const q = `timeout=${HEALTH_TIMEOUT_MS}&url=${encodeURIComponent(HEALTH_URL)}`;
+        try {
+          const r = await this.mihomoApi(`/proxies/${encodeURIComponent(n)}/delay?${q}`);
+          const d = Number(r?.delay);
+          found.set(n, Number.isFinite(d) && d > 0 ? d : null);
+        } catch {
+          found.set(n, null);      // 超时/拒绝/内核报错,一律算不通
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(HEALTH_CONCURRENCY, list.length) }, worker));
+
+    // 整表替换而不是合并:节点可能已经被机场下掉了,留着旧数据会让
+    // rankNodes 以为它还在
+    this.delay = found;
+    this.testedAt = Date.now();
+
+    const alive = [...found].filter(([, d]) => d != null);
+    const dead = [...found].filter(([, d]) => d == null).map(([n]) => n);
+    alive.sort((a, b) => a[1] - b[1]);
+
+    // 锁定的那个节点测不通就解锁,否则 ensureNode 会一直粘着它,直到某次请求
+    // 真的失败才换 —— 已经知道它不通了,没必要拿真实请求去验
+    if (this.lockedNode && found.get(this.lockedNode) === null && alive.length) {
+      this.logger('warn', `[speed] 锁定节点 ${this.lockedNode} 已不可用,解锁`);
+      this.lockedNode = null;
+    }
+
+    const ms = Date.now() - t0;
+    const summary = {
+      tested: found.size, alive: alive.length, dead,
+      fastest: alive[0] ? { node: alive[0][0], delay: alive[0][1] } : null, ms,
+    };
+    this.logger(alive.length ? 'ok' : 'warn',
+      `[speed] 测完 ${found.size} 个,可用 ${alive.length},最快 ${alive[0] ? `${alive[0][0]} ${alive[0][1]}ms` : '无'}(耗时 ${(ms / 1000).toFixed(1)}s)`);
+    if (dead.length) this.logger('warn', `[speed] 剔除 ${dead.length} 个不可用: ${dead.join(', ')}`);
+    return summary;
+  }
+
+  /**
+   * 按实测延迟排序、剔除不通的。网关挑节点就是取这个数组的第一个可用项,
+   * 所以「排序」和「优先级」在这里是同一件事。
+   *
+   * 两条兜底:
+   *  - 没测过的节点(测速之后机场新加的)保留,排在测过的后面而不是当死的扔掉;
+   *  - 全灭时原样返回。测速 URL 被墙、DNS 挂了都会让所有节点报不通,
+   *    这时候剔除等于把整个网关关掉,而实际上打 opencode 可能是通的。
+   */
+  rankNodes(nodes) {
+    if (!this.delay.size) return nodes;
+    const untested = nodes.filter((n) => !this.delay.has(n));
+    const alive = nodes.filter((n) => this.delay.get(n) != null);
+    if (!alive.length && !untested.length) {
+      this.logger('warn', '[speed] 所有节点都测不通,这次不剔除(可能是测速地址不可达)');
+      return nodes;
+    }
+    alive.sort((a, b) => this.delay.get(a) - this.delay.get(b));
+    return [...alive, ...untested];
+  }
+
+  /** 被剔除的节点,面板要显示出来 —— 静默消失会让人以为订阅少了节点 */
+  excludedNodes(nodes) {
+    if (!this.delay.size) return [];
+    const kept = new Set(this.rankNodes(nodes));
+    return nodes.filter((n) => !kept.has(n));
+  }
+
+  delayMap() {
+    return Object.fromEntries(this.delay);
   }
 
   mihomoApi(p, method = 'GET', body = null) {

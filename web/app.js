@@ -9,6 +9,7 @@ import {
   FREE_MODELS, LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
+  fmtDelay, delayGrade, fmtAgo,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +19,7 @@ const POLL_MS = 2000;
 const S = {
   cfg: {}, status: {}, usage: null,
   nodes: [], cooldowns: [], current: '', locked: '',
+  delay: {}, excluded: [], testedAt: null, testing: false,
   logs: [], filter: 'all', follow: true, showKey: false,
 };
 
@@ -49,10 +51,13 @@ function renderPills() {
   setPill($('pill-mh'), st.mihomoRunning ? 'up' : 'down',
     st.mihomoRunning ? `内核 ${st.mihomoVersion || ''}`.trim() : '内核未运行');
 
-  const cooling = S.cooldowns.filter((c) => remainMs(c.deadline) > 0).length;
-  const total = S.nodes.length;
+  // 只数还在轮换表里的冷却:已经被剔除的节点显示的是「不可用」,
+  // 再从可用数里扣一次就成了双重扣减(分子会比实际少)
+  const cooling = S.cooldowns.filter((c) => remainMs(c.deadline) > 0 && S.nodes.includes(c.node)).length;
+  // 分母算上被剔除的:订阅里有 17 个就该显示 /17,少掉的那几个正是要看见的信息
+  const total = S.nodes.length + S.excluded.length;
   setPill($('pill-node'), cooling ? 'cool' : total ? 'up' : '',
-    total ? `节点 ${total - cooling}/${total} 可用` : '无节点');
+    total ? `节点 ${S.nodes.length - cooling}/${total} 可用` : '无节点');
 }
 
 function renderStats() {
@@ -81,6 +86,7 @@ function renderNodes() {
   const rows = nodeRows({ ...S, now: Date.now() });
   const ul = $('nodes');
   $('nodes-empty').hidden = rows.length > 0;
+  $('nodes-tested').textContent = S.testing ? '测速中…' : fmtAgo(S.testedAt);
 
   // 全量重建。节点数是几十条量级,重建比 diff 简单且看不出差别。
   // ponytail: 上限约几百条;再多要改成按 name 复用 <li>。
@@ -94,16 +100,23 @@ function renderNodes() {
     // 读着像丢了两行。要回查订阅位置的话节点名本来就是唯一的。
     const idx = document.createElement('span');
     idx.className = 'idx';
-    idx.textContent = k + 1;
+    // 被剔除的不给编号:它们不在轮换序列里,给了会让人以为还排着队
+    idx.textContent = n.state === 'dead' ? '×' : k + 1;
 
     const nm = document.createElement('span');
     nm.className = 'nm';
     nm.textContent = n.name;
     nm.title = n.name;
 
+    const ms = document.createElement('span');
+    ms.className = `ms ${delayGrade(n.latency)}`;
+    ms.textContent = fmtDelay(n.latency);
+
     const st = document.createElement('span');
     st.className = 'st';
-    if (n.state === 'active') {
+    if (n.state === 'dead') {
+      st.append(tag('badge dead', '不可用'));
+    } else if (n.state === 'active') {
       st.append(tag('badge on', '在用'));
     } else if (n.state === 'cooling') {
       st.append(tag('badge cool', `冷却 ${Math.ceil(n.remain / 1000)}s`));
@@ -111,7 +124,7 @@ function renderNodes() {
       st.append(tag('badge', '待用'));
     }
 
-    li.append(idx, nm, st);
+    li.append(idx, nm, ms, st);
     return li;
   }));
 }
@@ -174,6 +187,10 @@ async function refresh() {
     S.nodes = pool?.nodes || [];
     S.current = pool?.current || '';
     S.locked = pool?.locked || '';
+    S.delay = pool?.delay || {};
+    S.excluded = pool?.excluded || [];
+    S.testedAt = pool?.testedAt || null;
+    S.testing = pool?.testing === true;
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ node: c.node, deadline: cooldownDeadline(c.remain) }));
 
@@ -241,6 +258,19 @@ function wire() {
   $('btn-reset').onclick = (e) => run(e.target, '手动重置', () => api('/reset', { method: 'POST' }));
   $('btn-regen').onclick = (e) => run(e.target, '生成新 Key', () => api('/regen-key', { method: 'POST' }));
 
+  $('btn-speed').onclick = (e) => run(e.target, '测速', async () => {
+    const r = await api('/nodes/test', { method: 'POST' });
+    if (!r?.tested) return '';
+    const f = r.fastest ? `最快 ${r.fastest.node} ${fmtDelay(r.fastest.delay)}` : '没有可用节点';
+    return `${r.alive}/${r.tested} 可用,${f}`;
+  });
+
+  // 清零要二次确认:统计是累计值,清了拿不回来(重启也不会回来,它落盘了)
+  $('btn-zero').onclick = (e) => {
+    if (!confirm('清零所有统计数据?请求数、Token 用量、运行时长都会从零开始,不可恢复。')) return;
+    run(e.target, '统计清零', () => api('/usage/reset', { method: 'POST' }));
+  };
+
   $('btn-eye').onclick = (e) => {
     S.showKey = !S.showKey;
     e.target.textContent = S.showKey ? '隐藏' : '显示';
@@ -282,7 +312,11 @@ function wire() {
 
     run($('btn-save'), '保存', async () => {
       const r = await api('/config', { method: 'POST', body: JSON.stringify({ subscriptionUrl: url, port }) });
-      return r?.nodes == null ? '' : `刷到 ${r.nodes} 个节点`;
+      if (r?.nodes == null) return '';
+      // 保存会顺带测一遍延迟。测完了就把可用数一起说了,没测完(节点多、超了
+      // 20 秒)只报节点数,结果稍后自己出现在节点池里
+      const s = r.speed;
+      return s ? `刷到 ${r.nodes} 个节点,${s.alive}/${s.tested} 可用` : `刷到 ${r.nodes} 个节点`;
     });
   };
 

@@ -25,6 +25,7 @@
 
   <div class="top-actions">
     <button type="button" class="btn ghost" id="btn-restart">重启内核</button>
+    <button type="button" class="btn ghost" id="btn-zero">清零统计</button>
     <button type="button" class="btn warn" id="btn-reset">手动重置</button>
   </div>
 </header>
@@ -131,10 +132,15 @@
   <section class="card fill" aria-labelledby="h-nodes">
     <div class="card-head">
       <h2 id="h-nodes">节点池</h2>
-      <!-- 这列只有 340px,长句会折行把卡头顶高、和日志卡的头对不齐 -->
-      <p class="hint">按序使用 · 429 冷却 90s</p>
+      <!-- 这列只有 340px,长句会折行把卡头顶高、和日志卡的头对不齐。
+           所以「按延迟排序」这类说明放进 ul 的 aria-label,不占一行。 -->
+      <div class="node-tools">
+        <span class="hint" id="nodes-tested">还没测过</span>
+        <button type="button" class="btn tiny" id="btn-speed">测速</button>
+      </div>
     </div>
-    <ul class="nodes" id="nodes" aria-live="polite"></ul>
+    <ul class="nodes" id="nodes" aria-live="polite"
+        aria-label="节点池,按实测延迟排序,从上往下就是网关接下来会用的顺序"></ul>
     <!-- 不写「上面/右边」:三列和单列下配置卡的相对位置不一样 -->
     <p class="empty" id="nodes-empty" hidden>还没有节点 —— 先在「配置」里填订阅地址。</p>
   </section>

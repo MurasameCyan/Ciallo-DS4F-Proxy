@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   COOLDOWN_MS, MAX_LOG, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
+  fmtDelay, delayGrade, fmtAgo,
 } from '../web/core.js';
 
 let n = 0;
@@ -101,6 +102,70 @@ t('空输入不抛,返回空数组', () => {
   assert.deepEqual(nodeRows(), []);
   assert.deepEqual(nodeRows({ nodes: [] }), []);
   assert.deepEqual(nodeRows({ nodes: ['A'], cooldowns: [null, {}] }).map((x) => x.state), ['idle']);
+});
+
+// ── 延迟 ────────────────────────────────────────────────
+
+t('延迟原样带出,没测过的是 null 而不是 0', () => {
+  const r = nodeRows({ nodes: NODES, delay: { A: 120, B: null, C: 0 }, now: 0 });
+  const by = Object.fromEntries(r.map((x) => [x.name, x.latency]));
+  assert.equal(by.A, 120);
+  assert.equal(by.B, null, '测过但不通 -> null');
+  assert.equal(by.C, null, '0ms 是不可能的实测值,当没测过');
+  assert.equal(by.D, null, '压根没在 delay 里');
+});
+
+t('测不通的节点垫在最底下并标 dead,不参与轮换', () => {
+  const r = nodeRows({
+    nodes: ['A', 'B'], excluded: ['Z', 'Y'],
+    current: 'A', delay: { A: 90, B: 300, Z: null, Y: null }, now: 0,
+  });
+  assert.deepEqual(r.map((x) => x.name), ['A', 'B', 'Y', 'Z']);
+  assert.equal(r[2].state, 'dead');
+  assert.equal(r[2].latency, null);
+  assert.equal(r.filter((x) => x.state === 'dead').length, 2);
+});
+
+t('excluded 里混进还在用的节点时不重复出现', () => {
+  // 两次轮询之间后端刚测完速,nodes 和 excluded 可能短暂重叠
+  const r = nodeRows({ nodes: ['A', 'B'], excluded: ['B'], now: 0 });
+  assert.deepEqual(r.map((x) => x.name), ['A', 'B']);
+  assert.equal(r.find((x) => x.name === 'B').state, 'idle');
+});
+
+t('后端给的顺序就是优先级,前端不再按延迟重排', () => {
+  // 后端排好序发过来(慢的在前是不可能的,但真发生了也得照显示 ——
+  // 否则面板顺序和网关实际取用顺序不一致,那一列编号就是错的)
+  const r = nodeRows({ nodes: ['slow', 'fast'], delay: { slow: 900, fast: 80 }, now: 0 });
+  assert.deepEqual(r.map((x) => x.name), ['slow', 'fast']);
+});
+
+t('fmtDelay:秒级换单位,没测过显示破折号', () => {
+  assert.equal(fmtDelay(87), '87ms');
+  assert.equal(fmtDelay(999), '999ms');
+  assert.equal(fmtDelay(1000), '1.0s');
+  assert.equal(fmtDelay(2480), '2.5s');
+  assert.equal(fmtDelay(null), '—');
+  assert.equal(fmtDelay(0), '—', '0ms 不是真实结果');
+  assert.equal(fmtDelay('x'), '—');
+});
+
+t('delayGrade 分三档,无数据不给档', () => {
+  assert.equal(delayGrade(120), 'fast');
+  assert.equal(delayGrade(299), 'fast');
+  assert.equal(delayGrade(300), 'mid');
+  assert.equal(delayGrade(999), 'mid');
+  assert.equal(delayGrade(1000), 'slow');
+  assert.equal(delayGrade(null), '');
+});
+
+t('fmtAgo:没测过时说出来,不显示「0 秒前」', () => {
+  const now = 1_000_000;
+  assert.equal(fmtAgo(null, now), '还没测过');
+  assert.equal(fmtAgo(0, now), '还没测过');
+  assert.equal(fmtAgo(now - 5_000, now), '5 秒前测');
+  assert.equal(fmtAgo(now - 125_000, now), '2 分钟前测');
+  assert.equal(fmtAgo(now - 7200_000, now), '2 小时前测');
 });
 
 // ── 日志缓冲 ────────────────────────────────────────────
