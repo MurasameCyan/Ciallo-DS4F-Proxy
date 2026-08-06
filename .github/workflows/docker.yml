@@ -127,11 +127,39 @@ jobs:
           docker logs verify
           docker rm -f verify
 
-      - name: 输出用法
+      # GHCR 首次推送的包一律是私有的,而且**不跟随仓库可见性** ——
+      # 仓库公开了包照样是私有,用户 docker compose pull 会收到
+      # "unauthorized",看起来像构建失败,其实镜像好好的。
+      # 改可见性没有 REST API(PATCH user/packages/... 返回 404),
+      # 只能在网页上点一次,所以这里只能检测 + 把修复步骤打出来。
+      # 检测手段:GHCR 的 token 端点对公开包会发匿名 token,私有包返回
+      # UNAUTHORIZED。不用 docker pull 是因为 runner 已经 login 过,
+      # 它拉得到不代表匿名用户拉得到。
+      - name: 验镜像能匿名拉取
         if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
         run: |
-          echo "### 镜像已推送" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "compose 里直接引用即可,不需要 build。" >> $GITHUB_STEP_SUMMARY
+          repo="${IMAGE#ghcr.io/}"
+          echo "### 镜像已推送" >> "$GITHUB_STEP_SUMMARY"
+          printf '```\n%s\n```\n' "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+
+          resp=$(curl -sS "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io")
+          if printf '%s' "$resp" | grep -q '"token"'; then
+            echo "匿名可拉取 —— compose 里直接引用即可,不需要 build,也不用 docker login。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo
+            echo "> [!WARNING]"
+            echo "> **这个包还是私有的,用户 \`docker compose pull\` 会收到 \`unauthorized\`。**"
+            echo "> 镜像本身没问题(上面几步都过了),只是 GHCR 新建的包默认私有,并且不跟随仓库可见性。"
+            echo ">"
+            echo "> 手动改一次,以后每次推送都继承这个设置:"
+            echo "> 1. 打开 https://github.com/users/${{ github.repository_owner }}/packages/container/${repo##*/}/settings"
+            echo "> 2. Danger Zone → Change visibility → Public"
+            echo ">"
+            echo "> 顺便在同一页 Manage Actions access 里确认本仓库有 Write 权限(自动加的,一般不用动)。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::包仍为私有,匿名拉取会失败。修复方式见本次运行的 Summary。"

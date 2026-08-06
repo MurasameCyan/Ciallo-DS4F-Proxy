@@ -6,6 +6,10 @@
 #
 #   docker compose pull && docker compose up -d     # 升级
 #
+# pull 报 unauthorized:不是构建失败,是 GHCR 的包默认私有(且不跟随仓库可见性)。
+# 仓库 owner 在 packages 设置页把 visibility 改成 Public 即可,只需一次。
+# 详见 README 的「镜像 → 包默认是私有的」。
+#
 # 面板: http://127.0.0.1:9527       (Basic 认证,用 PANEL_USER / PANEL_PASS)
 # 接口: http://127.0.0.1:9527/v1    (OpenAI 兼容,Bearer 用面板里那个 Key)
 
