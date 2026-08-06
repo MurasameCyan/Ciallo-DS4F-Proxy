@@ -44,6 +44,8 @@ docker compose up -d
 | `NODE_TEST_URL` | | 延迟探针地址,默认 `https://opencode.ai/`(HEAD 站点根路径,不碰 `/zen/v1`,不花额度)。这条请求是走节点发出去的,你本机连不上不影响 |
 | `NODE_TEST_TIMEOUT_MS` | | 单次探测超时,默认 `5000`,取值夹在 1000–8000 之间。超时算不可用 |
 | `SHOW_THINKING` | | 设成 `0` 关掉推理内容转发(见下文「推理内容」) |
+| `GITHUB_REPO` | | 「检查更新」跟哪个仓库比,默认 `MurasameCyan/Ciallo-DS4F-Proxy`。改成自己的 fork 就查自己的 |
+| `GITHUB_TRACK_REF` | | 跟哪个分支比,默认 `beta`(`latest` 镜像就是从它出的) |
 
 compose 默认只绑 `127.0.0.1:9527`。想让同网段其它机器连,把端口改成 `"9527:9527"` —— 那等于把面板一起暴露到局域网,`PANEL_PASS` 必须是强密码。
 
@@ -110,7 +112,7 @@ claude
 
 | 区块 | 内容 |
 | --- | --- |
-| 页头 | 网关 / 内核 / 节点三个状态灯,「重启内核」「清零统计」「手动重置」 |
+| 页头 | 网关 / 内核 / 节点三个状态灯,「重启内核」「清零统计」「手动重置」,右端是构建 hash + 「检查更新」+ 仓库入口 |
 | 统计 | 请求总数(成功·失败)、成功率、Token 消耗(输入·输出·推理)、运行时长(最后请求·主用模型) |
 | 接入 | Base URL、API Key(显示 / 复制 / 重新生成)、可用模型 |
 | 配置 | 订阅地址 + 「保存并应用」。监听端口是只读的 —— 容器对外端口由 compose 的 `ports` 决定,在这儿改只会让面板显示一个连不上的地址 |
@@ -120,6 +122,10 @@ claude
 订阅地址改完点保存**当场生效**:地址变了就重写 mihomo 配置并重启内核,没变就只让内核重新拉一遍 provider。刷完节点接着自动测一遍速,保存后的提示会告诉你刷到几个、其中几个可用。
 
 「清零统计」把请求数、Token 用量、按模型的分项全部归零并落盘,不可恢复,所以会先问一次。它不动订阅和 Key。
+
+**构建 hash 和检查更新。** 页头右端那个等宽小牌子是当前镜像的构建 commit(点它跳到那次提交),旁边 ⟳ 拿它和 GitHub 上 `beta` 的 HEAD 比一下。**只在你点的时候才出站** —— 匿名 GitHub API 每小时 60 次,自动轮询会烧光,而且它一小时也变不了几次。有新版本时牌子变琥珀色,`docker compose pull && docker compose up -d` 之后牌子自己恢复(比的是两个 hash,不是那次检查的结果)。
+
+牌子显示 `unknown` 说明这个镜像构建时没注入 `GIT_COMMIT` —— 自己 `docker build` 不带 `--build-arg GIT_COMMIT=$(git rev-parse HEAD)` 就会这样。此时不会报「有新版本」:本地 hash 不知道,新旧无从判断,报了只是让人白拉一次镜像。
 
 数据(订阅、Key、用量、内核缓存)都在命名卷 `ciallo-data` 里。用命名卷不用 `./data` 绑挂,是因为容器里以 uid 1000 运行,宿主目录属主对不上会 permission denied;真要绑挂先 `mkdir data && sudo chown 1000:1000 data`。
 
@@ -150,6 +156,7 @@ server/
   anthropic.mjs  Messages ⇄ Chat Completions 转换 + SSE 状态机
   mihomo.mjs     内核进程和控制端口
   config.mjs     配置读写、mihomo yaml 生成
+  build.mjs      构建 hash(环境变量 → git)、跟 GitHub 比新旧
 ```
 
 加协议就多写一个 dialect 对象(`toUpstream` / `validate` / `respond` / `sink` / `fail`),轮换和冷却那套逻辑不用动。
@@ -166,6 +173,8 @@ server/
 | `beta` | 同上,同一份 digest |
 | `sha-<短 sha>` | 每次构建都留一个,用来回滚 |
 | `1.2` / `1.2.3` | 打 `v*` 标签时出 |
+
+**自己构建**记得带 `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`,不然面板上的构建 hash 是 `unknown`(CI 里传的是 `github.sha`)。
 
 **`docker compose pull` 报 `unauthorized`?** 不是构建失败。GHCR 新建的包默认私有,而且**不跟随仓库可见性** —— 仓库公开了包照样是私有的。仓库 owner 打开
 `https://github.com/users/MurasameCyan/packages/container/ciallo-ds4f-proxy/settings`

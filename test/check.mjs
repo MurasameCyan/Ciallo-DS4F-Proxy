@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   COOLDOWN_MS, MAX_LOG, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
-  fmtDelay, delayGrade, fmtAgo,
+  fmtDelay, delayGrade, fmtAgo, hasNewer,
 } from '../web/core.js';
 
 let n = 0;
@@ -213,6 +213,13 @@ t('rankBreakdown 按请求数降序并截断', () => {
   const r = rankBreakdown({ a: { requests: 5 }, b: { requests: 90 }, c: { requests: 12 } }, 2);
   assert.deepEqual(r.map((x) => x.key), ['b', 'c']);
   assert.deepEqual(rankBreakdown(null), []);
+});
+
+t('hasNewer 只在两个 hash 都有且不同时才亮', () => {
+  assert.equal(hasNewer('c31f0a8', '9dfba56'), true);
+  assert.equal(hasNewer('9dfba56', '9dfba56'), false, '更新完重启后标记要自己消失');
+  assert.equal(hasNewer('', '9dfba56'), false, '还没查过就不该亮');
+  assert.equal(hasNewer('c31f0a8', ''), false, '本地 hash 未知时新旧无从判断');
 });
 
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);

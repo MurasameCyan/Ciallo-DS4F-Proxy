@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const PORT = Number(process.env.PORT) || 5173;
 const COOLDOWN_MS = 90_000;
+const REPO_URL = 'https://github.com/MurasameCyan/Ciallo-DS4F-Proxy';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -40,6 +41,8 @@ const NODES = [
 
 const state = {
   cfg: { subscriptionUrl: 'https://demo.example.com/subscribe?token=preview', apiKey: 'zen-a1b2c3d4', port: 9527 },
+  build: '9dfba56',
+  hasUpdate: false,
   current: NODES[2],
   cooldowns: new Map(),          // name -> 进入冷却的时间戳
   // 假的实测延迟。故意留两个 null:那是「测过但不通」,面板要把它们
@@ -184,6 +187,27 @@ async function handleApi(req, res, path) {
       mihomoRunning: true, mihomoVersion: 'v1.19.13',
       fixedModel: 'deepseek-v4-flash-free',
       paused: false, demo: true,
+      build: state.build,
+      buildUrl: `${REPO_URL}/commit/${state.build}`,
+      repoUrl: REPO_URL,
+      trackRef: 'beta',
+    });
+  }
+
+  // 检查更新。假数据每点一次翻面:第一次「有新版本」、第二次「已是最新」,
+  // 两条 toast 和 hash 徽标的高亮态都能看到
+  if (path === '/api/check-update' && m === 'POST') {
+    await new Promise((r) => setTimeout(r, 900));
+    state.hasUpdate = !state.hasUpdate;
+    const latest = state.hasUpdate ? 'c31f0a8' : state.build;
+    log('ok', state.hasUpdate
+      ? `[update] 有新版本 ${latest}(当前 ${state.build})`
+      : `[update] 已是最新 ${state.build}`);
+    return json(res, {
+      current: state.build, latest, hasUpdate: state.hasUpdate,
+      htmlUrl: `${REPO_URL}/commit/${latest}`,
+      publishedAt: new Date(Date.now() - 3600_000).toISOString(),
+      error: null,
     });
   }
 

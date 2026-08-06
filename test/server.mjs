@@ -22,6 +22,9 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ciallo-test-'));
 process.env.DATA_DIR = TMP;
 process.env.PANEL_PASS = 'test-pass';
 process.env.PANEL_USER = 'tester';
+// 钉死构建标识:不设的话 build.mjs 会去问 git(本机)或读 GITHUB_SHA(CI),
+// 两边算出来的 hash 不一样,断言就没法写死
+process.env.GIT_COMMIT = 'a'.repeat(40);
 delete process.env.SUBSCRIPTION_URL;
 delete process.env.API_KEY;
 
@@ -29,6 +32,7 @@ const { NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS } = await import('../se
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
+const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { createApp } = await import('../server/index.mjs');
 
 let n = 0;
@@ -361,6 +365,84 @@ await t('mihomo 没起来时报连不上,而不是静默直连', async () => {
   await assert.rejects(connectTunnel({ proxyPort: dead, host: 'x.com' }), /连不上 mihomo/);
 });
 
+// ── 构建标识与检查更新 ──────────────────────────────────
+
+/** 假的 fetch:只关心 checkUpdate 怎么解释响应,不真打 api.github.com
+ *  (会算进匿名限流,CI 上还会因为网络抽风变成假失败) */
+const fakeFetch = (status, body) => async () => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => {
+    if (typeof body === 'string') throw new Error('not json');
+    return body;
+  },
+});
+
+await t('shortSha 把 40 位截成 7 位,认不出的原样留着', () => {
+  assert.equal(shortSha('A'.repeat(40)), 'a'.repeat(7));
+  assert.equal(shortSha('  9dfba5612345 \n'), '9dfba56');
+  assert.equal(shortSha('unknown'), '', '「unknown」是没拿到,不是一个版本号');
+  assert.equal(shortSha(''), '');
+  assert.equal(shortSha(undefined), '');
+  assert.equal(shortSha('v1.2.3'), 'v1.2.3', '不像 hash 的照原样,截了反而认不出');
+});
+
+await t('buildId 优先取环境变量(容器里就靠它)', () => {
+  assert.equal(buildId(), 'a'.repeat(7), 'GIT_COMMIT 设了就不该再去问 git');
+  const info = buildInfo();
+  assert.equal(info.build, 'a'.repeat(7));
+  assert.match(info.buildUrl, /\/commit\/a{7}$/, 'hash 得链到那次 commit');
+  assert.match(info.repoUrl, /^https:\/\/github\.com\/[^/]+\/[^/]+$/);
+  assert.equal(info.trackRef, 'beta', '代码和 latest 镜像都出自 beta');
+});
+
+await t('checkUpdate:hash 一样就是最新', async () => {
+  const r = await checkUpdate(fakeFetch(200, { sha: 'a'.repeat(40), html_url: 'u', commit: {} }));
+  assert.equal(r.latest, 'a'.repeat(7));
+  assert.equal(r.hasUpdate, false);
+  assert.equal(r.error, null);
+});
+
+await t('checkUpdate:hash 不一样就是有新版本,并带上提交时间', async () => {
+  const r = await checkUpdate(fakeFetch(200, {
+    sha: 'b'.repeat(40),
+    html_url: 'https://github.com/x/y/commit/bbb',
+    commit: { committer: { date: '2026-08-06T10:00:00Z' } },
+  }));
+  assert.equal(r.hasUpdate, true);
+  assert.equal(r.latest, 'b'.repeat(7));
+  assert.equal(r.current, 'a'.repeat(7));
+  assert.equal(r.publishedAt, '2026-08-06T10:00:00Z');
+  assert.match(r.htmlUrl, /commit\/bbb$/);
+});
+
+await t('checkUpdate:限流、404、非 JSON、断网都回 error 而不是抛', async () => {
+  const rate = await checkUpdate(fakeFetch(403, {}));
+  assert.match(rate.error, /限流/, '403 几乎总是匿名配额用完,别让人去查代理');
+  assert.equal(rate.hasUpdate, false);
+
+  assert.match((await checkUpdate(fakeFetch(404, {}))).error, /不存在/);
+  assert.match((await checkUpdate(fakeFetch(500, {}))).error, /HTTP 500/);
+  assert.match((await checkUpdate(fakeFetch(200, 'not json'))).error, /不是 JSON/);
+  assert.match((await checkUpdate(fakeFetch(200, { sha: '' }))).error, /sha/);
+
+  const down = await checkUpdate(async () => { throw new Error('getaddrinfo ENOTFOUND'); });
+  assert.match(down.error, /ENOTFOUND/, '原始网络错误要能显示出来,不然没法判断是墙还是 DNS');
+  assert.equal(down.current, 'a'.repeat(7), '查不到远端也得把本地 hash 报出来');
+});
+
+await t('本地 hash 不明时不谎报「有新版本」', async () => {
+  // 带 query 重新 import 拿一个干净的模块实例(buildId 有模块级缓存)。
+  // 这是唯一能在同一个进程里试两种 GIT_COMMIT 的办法。
+  process.env.GIT_COMMIT = 'dev';
+  const mod = await import('../server/build.mjs?nonsha');
+  assert.equal(mod.buildId(), 'dev');
+  const r = await mod.checkUpdate(fakeFetch(200, { sha: 'c'.repeat(40), commit: {} }));
+  assert.equal(r.hasUpdate, false, '构建时没注入 hash,新旧无从判断,报了就是让人白拉一次镜像');
+  assert.equal(r.latest, 'c'.repeat(7), '但远端 hash 照样告诉前端');
+  process.env.GIT_COMMIT = 'a'.repeat(40);
+});
+
 // ── 把真 server 拉起来打一遍 ────────────────────────────
 
 const cfg = load();
@@ -405,6 +487,11 @@ await t('带对凭据能读到配置和状态', async () => {
   assert.equal(s.fixedModel, 'deepseek-v4-flash-free');
   assert.equal(s.mihomoRunning, false, '测试环境没有内核,应老实报 false');
   assert.equal(s.gatewayRunning, true);
+  // 构建标识搭 /api/status 的车过去,面板右上角那个徽标全靠这几个字段
+  assert.equal(s.build, 'a'.repeat(7));
+  assert.match(s.buildUrl, /^https:\/\/github\.com\/.+\/commit\/a{7}$/);
+  assert.match(s.repoUrl, /^https:\/\/github\.com\//);
+  assert.equal(s.trackRef, 'beta');
 });
 
 await t('/v1/* 认 Bearer 而不是 Basic', async () => {

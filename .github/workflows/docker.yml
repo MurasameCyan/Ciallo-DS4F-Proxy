@@ -81,6 +81,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 面板要显示自己是哪个 commit 构建的,「检查更新」拿它和 beta 的 HEAD 比。
+          # 不传的话面板显示 unknown,更新提示就永远不亮。
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -91,7 +95,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           set -eux
-          docker build --load -t verify:local .
+          docker build --load -t verify:local --build-arg GIT_COMMIT="$GITHUB_SHA" .
           docker run -d --name verify -e PANEL_PASS=ci-test -p 9527:9527 verify:local
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:9527/health | grep -q '"ok":true'; then break; fi
@@ -103,6 +107,13 @@ jobs:
           [ "$code" = 401 ] || { echo "面板没鉴权! 返回 $code"; docker logs verify; exit 1; }
           key=$(curl -fsS -u admin:ci-test http://127.0.0.1:9527/api/status | grep -o deepseek | head -1)
           [ -n "$key" ] || { echo "/api/status 不对"; docker logs verify; exit 1; }
+
+          # 构建标识必须真的进到镜像里。这条链是 ARG → ENV → /api/status,
+          # 断在哪一环面板都只显示 unknown,而那时「检查更新」永远说已是最新 ——
+          # 不报错、不好看出来,所以钉在 CI 里。
+          want=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
+          curl -fsS -u admin:ci-test http://127.0.0.1:9527/api/status | grep -q "\"build\":\"$want\"" \
+            || { echo "/api/status 里的 build 不是 $want"; docker logs verify; exit 1; }
 
           # 两种鉴权头都得认。只认 Bearer 的话 /v1/messages 对每个 Anthropic
           # 客户端都是 401,而客户端会把 401 显示成「模型不存在」—— 实测踩过,

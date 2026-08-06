@@ -194,3 +194,14 @@ export function rankBreakdown(map, limit = 5) {
     .sort((a, b) => b.requests - a.requests || a.key.localeCompare(b.key))
     .slice(0, limit);
 }
+
+/**
+ * 构建标识要不要亮「有新版本」。
+ *
+ * 比的是两个 hash,而不是直接用后端那次检查返回的 hasUpdate:更新完镜像重启后
+ * /api/status 里的 build 就变成 latest,这个函数自己返回 false,标记不用再点一次
+ * 「检查更新」才消失。两边缺一个就不亮 —— 本地是 unknown 时新旧无从判断。
+ */
+export function hasNewer(latest, build) {
+  return !!latest && !!build && latest !== build;
+}

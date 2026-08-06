@@ -9,7 +9,7 @@ import {
   FREE_MODELS, LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
-  fmtDelay, delayGrade, fmtAgo,
+  fmtDelay, delayGrade, fmtAgo, hasNewer,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -21,6 +21,9 @@ const S = {
   nodes: [], cooldowns: [], current: '', locked: '',
   delay: {}, excluded: [], testedAt: null, testing: false,
   logs: [], filter: 'all', follow: true, showKey: false,
+  // 检查更新查到的远端 hash。记 hash 而不是布尔:更新完镜像重启后 status 里的
+  // build 就变成它,「有新版本」标记自己消失,不用再点一次才知道好了
+  latest: '',
 };
 
 // ── HTTP ────────────────────────────────────────────────
@@ -142,6 +145,22 @@ function renderConn() {
   $('f-key').value = S.showKey ? key : maskKey(key);
 }
 
+function renderBuild() {
+  const { build = '', buildUrl = '', repoUrl = '', trackRef = '' } = S.status;
+  const el = $('build-id');
+  el.textContent = build || '—';
+  if (buildUrl || repoUrl) el.href = buildUrl || repoUrl;
+  if (repoUrl) $('repo-link').href = repoUrl;
+
+  const stale = hasNewer(S.latest, build);
+  el.classList.toggle('new', stale);
+  // 徽标只有 7 个字符,「跟谁比的」放 title 里 —— 不然「有新版本」这个状态
+  // 看不出是拿哪个分支比出来的
+  el.title = build
+    ? `当前构建 ${build}${trackRef ? ` · 跟随 ${trackRef} 分支` : ''}${stale ? ` · 有新版本 ${S.latest}` : ''}`
+    : '构建标识未知(构建时没注入 GIT_COMMIT)';
+}
+
 function renderLog() {
   const box = $('log');
   const shown = S.filter === 'all' ? S.logs : S.logs.filter((l) => l.level === S.filter);
@@ -194,7 +213,7 @@ async function refresh() {
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ node: c.node, deadline: cooldownDeadline(c.remain) }));
 
-    renderPills(); renderStats(); renderNodes(); renderConn();
+    renderPills(); renderStats(); renderNodes(); renderConn(); renderBuild();
 
     // 表单不在用户编辑时才回填,否则打字会被覆盖
     if (document.activeElement !== $('f-sub')) $('f-sub').value = S.cfg.subscriptionUrl || '';
@@ -276,6 +295,27 @@ function wire() {
     e.target.textContent = S.showKey ? '隐藏' : '显示';
     e.target.setAttribute('aria-pressed', String(S.showKey));
     renderConn();
+  };
+
+  // 检查更新走自己的 handler 而不是 run():run 会把按钮文字换成「处理中…」,
+  // 那会连带把里面的 svg 抹掉;而且它最后要 refresh() 一遍,这里没必要。
+  $('btn-update').onclick = async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.classList.add('spin');
+    try {
+      const r = await api('/check-update', { method: 'POST' });
+      S.latest = r?.latest || '';
+      if (r?.error) toast(`检查更新失败:${r.error}`, 'err');
+      else if (r?.hasUpdate) toast(`有新版本 ${r.latest} —— docker compose pull 后重启容器`, 'ok');
+      else toast(`已是最新${r?.current ? ` ${r.current}` : ''}`, 'ok');
+    } catch (err) {
+      toast(`检查更新失败:${err.message}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('spin');
+      renderBuild();
+    }
   };
 
   // 复制:key 那栏永远复制真值,不能把掩码复制出去

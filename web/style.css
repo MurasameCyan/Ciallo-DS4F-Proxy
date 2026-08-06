@@ -121,6 +121,40 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 /* 三个按钮在窄屏上放不进一行,允许折行 —— 不折的话会把 header 撑出横向滚动 */
 .top-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
+/* ── 构建标识 ─────────────────────────────────────────── */
+
+/* hash + 检查更新 + 仓库,当一组跟着 top-actions 折行。
+   刻意不写高度:stretch 让这三个跟旁边的按钮自然等高,免得为
+   「12px 等宽字 + 15px 图标 + 13px 无衬线」各算一次 padding。 */
+.build { display: inline-flex; align-items: stretch; gap: 6px; }
+
+.bid {
+  display: inline-flex; align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--card-2); color: var(--fg-2);
+  font: 12px var(--mono); letter-spacing: .02em;
+  text-decoration: none; white-space: nowrap;
+}
+.bid:hover { color: var(--fg); }
+/* 有新版本:整个页面里唯一需要「请注意」的地方,借冷却那套 amber */
+.bid.new {
+  color: var(--amber);
+  border-color: color-mix(in oklab, var(--amber) 45%, var(--line-2));
+}
+
+/* 图标按钮。<a> 也用 .btn,所以 line-height 得压掉,否则 svg 下面多一条空隙 */
+.btn.icon {
+  display: inline-grid; place-items: center;
+  padding: 0 9px; line-height: 0; color: var(--fg-2);
+}
+.btn.icon:hover:not(:disabled) { color: var(--fg); }
+/* 点在 svg 上时事件目标是按钮本身,省得每个 handler 都写 currentTarget */
+.btn.icon svg { pointer-events: none; }
+.btn.icon.spin svg { animation: spin .9s linear infinite; }
+
+@keyframes spin { to { transform: rotate(1turn); } }
+
 /* ── 布局 ─────────────────────────────────────────────── */
 
 /* 三列:上排 概览(2×2 一块) | 接入 | 配置,下排 日志(跨两列) | 节点池。

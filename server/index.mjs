@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
 import { Gateway, FIXED_MODEL, OPENAI, ANTHROPIC, json } from './gateway.mjs';
+import { buildInfo, checkUpdate } from './build.mjs';
 import { checkBasic, resolveCredentials } from './auth.mjs';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
@@ -163,7 +164,22 @@ function makeApiRoutes({ cfg, gateway }) {
         mihomoVersion: version,
         fixedModel: FIXED_MODEL,
         paused: gateway.paused,
+        // build / buildUrl / repoUrl / trackRef:面板右上角那个 hash 徽标。
+        // 搭轮询的车带过去,不另开一个路由 —— 它是个常量,不值得再来一次请求
+        ...buildInfo(),
       });
+    }
+
+    // 检查更新只在用户点的时候出站。放在 POST 上和 /api/nodes/test 一致:
+    // 它有副作用(会消耗 GitHub 匿名配额),不该被浏览器预取或缓存。
+    if (path === '/api/check-update' && m === 'POST') {
+      const r = await checkUpdate();
+      log(r.error ? 'warn' : 'ok', r.error
+        ? `[update] 检查更新失败: ${r.error}`
+        : r.hasUpdate
+          ? `[update] 有新版本 ${r.latest}(当前 ${r.current}),docker compose pull 后重启`
+          : `[update] 已是最新 ${r.current}`);
+      return json(res, r);
     }
 
     if (path === '/api/config' && m === 'GET') {
