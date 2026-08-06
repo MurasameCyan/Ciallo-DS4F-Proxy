@@ -167,8 +167,10 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 /* 三列:上排 概览(2×2 一块) | 接入 | 配置,下排 日志(跨两列) | 节点池。
    卡片直接当 grid item,DOM 顺序就是视觉顺序,不用显式定位。
    不做「一栏一个 div 各自叠」:那样两栏底边对不齐,而这里下排两张卡
-   要等高(grid 行默认 stretch,免费拿到)。 */
-main {
+   要等高(grid 行默认 stretch,免费拿到)。
+   挂在 #main 上而不是 main 元素上:登录页也有一个 <main>,那张卡不该被
+   这套三列布局接管(写成 main 时它的标题和输入框会被摊进三列里)。 */
+#main {
   max-width: 1240px;
   margin: 0 auto;
   padding: 22px 22px 56px;
@@ -188,7 +190,7 @@ main {
 
 @media (max-width: 1080px) {
   /* 单列。此时行高不再由邻居撑起,.nodes 自己的 basis 兜底 */
-  main { grid-template-columns: minmax(0, 1fr); }
+  #main { grid-template-columns: minmax(0, 1fr); }
   .span2 { grid-column: auto; }
   .stats { grid-template-columns: repeat(4, 1fr); }
 }
@@ -199,7 +201,7 @@ main {
   /* 页头只剩品牌 + 构建标识那一组,窄到放不下时让它整组折到第二行 */
   .top { flex-wrap: wrap; }
   .stats { grid-template-columns: 1fr; }
-  main { padding: 16px 14px 40px; }
+  #main { padding: 16px 14px 40px; }
   .card-head .hint { margin-left: 0; text-align: left; }
 }
 
@@ -346,7 +348,7 @@ main {
   border: 1px solid var(--line-2); border-radius: 999px;
 }
 
-input[type=text], input[type=url], input[type=number] {
+input[type=text], input[type=url], input[type=number], input[type=password] {
   width: 100%; padding: 9px 11px;
   border: 1px solid var(--line-2); border-radius: var(--r-sm);
   background: var(--bg); color: var(--fg);
@@ -443,6 +445,17 @@ input[readonly] { color: var(--fg-2); }
 .log li.warn  .m { color: var(--amber); }
 .log li.error .m { color: var(--rose); }
 .log li.info  .m { color: var(--fg); }
+
+/* ── 登录页 ───────────────────────────────────────────── */
+
+/* 独立页面,但卡片/表单/按钮全用面板那几个类,这里只负责把卡摆到正中。
+   body 已经有 min-height:100vh,place-items 就够了。 */
+body.login { display: grid; place-items: center; padding: 24px; }
+.login-card { width: 100%; max-width: 344px; padding: 22px; }
+.login-card .brand { margin-bottom: 18px; }
+.login-card h2 { font-size: 15px; }
+.login-card .hint { margin: 6px 0 16px; }
+.login-card code { font-family: var(--mono); font-size: 11px; color: var(--fg); }
 
 /* ── Toast ────────────────────────────────────────────── */
 

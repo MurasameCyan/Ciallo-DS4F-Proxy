@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · Ciallo DS4F Proxy</title>
+<!-- 和面板同一份样式表:变量、卡片、表单、按钮全是现成的,
+     这个页面只多用一个 .login 把卡摆到屏幕正中 -->
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="login">
+
+<main class="card login-card" aria-labelledby="h-login">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">✧</span>
+    <span class="name">Ciallo<em>DS4F</em></span>
+  </div>
+
+  <h2 id="h-login">登录</h2>
+  <!-- 只说要填什么。「为什么要有这道门」写在 README 里 —— 能看到这一页的人
+       密码早就设好了,在这儿讲已经晚了 -->
+  <p class="hint">凭据是 compose 里的 <code>PANEL_USER</code> / <code>PANEL_PASS</code>。</p>
+
+  <!-- 真表单 + autocomplete:密码管理器认这个形状,能存也能自动填 -->
+  <form id="login-form" novalidate>
+    <label class="field">
+      <span class="lbl">用户名</span>
+      <input type="text" id="f-user" name="username" autocomplete="username"
+             autocapitalize="off" spellcheck="false" required autofocus>
+    </label>
+
+    <label class="field">
+      <span class="lbl">密码</span>
+      <input type="password" id="f-pass" name="password" autocomplete="current-password" required>
+    </label>
+
+    <p class="err" id="login-err" role="alert" hidden></p>
+    <button type="submit" class="btn primary wide" id="btn-login">登录</button>
+  </form>
+</main>
+
+<script type="module" src="login.js"></script>
+</body>
+</html>

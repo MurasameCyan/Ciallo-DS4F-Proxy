@@ -2,8 +2,8 @@
  * server.mjs —— 后端自检。
  *
  * 本机没有 Docker,镜像跑不起来,所以这里尽量把"不靠容器就能验的"都验掉:
- * 冷却状态机、mihomo 配置生成、Basic 鉴权、CONNECT 隧道、以及把真 server
- * 拉到临时端口上打一遍路由和鉴权。
+ * 冷却状态机、mihomo 配置生成、登录/会话/Basic 鉴权、CONNECT 隧道、以及把真
+ * server 拉到临时端口上打一遍路由和鉴权。
  *
  * CONNECT 那组是重点 —— 它是原 desktop-app 那个"proxy 选项不存在"的 bug
  * 的回归测试:用一个假代理确认我们真的发了 CONNECT 并复用了返回的连接。
@@ -30,7 +30,7 @@ delete process.env.API_KEY;
 
 const { NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
-const { parseBasic, safeEqual, resolveCredentials } = await import('../server/auth.mjs');
+const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { createApp } = await import('../server/index.mjs');
@@ -366,6 +366,57 @@ await t('没设 PANEL_PASS 时随机生成而不是放行', () => {
   assert.equal(resolveCredentials({}).user, 'admin');
 });
 
+await t('matches:用户名或密码错一个都不算过', () => {
+  const c = { user: 'admin', pass: 'p' };
+  assert.equal(matches(c, 'admin', 'p'), true);
+  assert.equal(matches(c, 'admin', 'x'), false);
+  assert.equal(matches(c, 'root', 'p'), false);
+  assert.equal(matches(c, '', ''), false);
+  assert.equal(matches(undefined, '', ''), false, '凭据没解析出来时不能变成放行');
+});
+
+await t('readCookie 只认整名,前后空白不算内容', () => {
+  assert.equal(readCookie('a=1; ciallo_sid=abc; b=2', 'ciallo_sid'), 'abc');
+  assert.equal(readCookie('ciallo_sid=abc', 'ciallo_sid'), 'abc');
+  assert.equal(readCookie('ciallo_sid_x=abc', 'ciallo_sid'), '', '不能前缀匹配到别的 cookie');
+  assert.equal(readCookie('flag; ciallo_sid=v', 'ciallo_sid'), 'v', '没等号的段落跳过,不能崩');
+  assert.equal(readCookie('', 'ciallo_sid'), '');
+  assert.equal(readCookie(undefined, 'ciallo_sid'), '');
+});
+
+await t('会话:id 各不相同,过期和退出都当场失效', () => {
+  const s = new Sessions(1000);
+  const a = s.issue(0);
+  assert.notEqual(a, s.issue(0));
+  assert.ok(a.length >= 32, 'id 得够长 —— 它就是密码本身,能猜到就等于没鉴权');
+  assert.equal(s.valid(a, 999), true);
+  assert.equal(s.valid(a, 1000), false, '到点就失效');
+  assert.equal(s.valid('', 0), false);
+  assert.equal(s.valid('伪造的', 0), false);
+
+  const b = s.issue(0);
+  assert.equal(s.drop(b), true);
+  assert.equal(s.valid(b, 0), false, '退出登录后那张 cookie 不能还认');
+
+  s.issue(5000);   // 过期项在下一次签发时被扫掉,表不会一直长
+  assert.equal(s.live.size, 1);
+});
+
+await t('失败限速:连错到上限就挡住,校验成功立刻清零', () => {
+  const w = new FailWindow(3, 1000);
+  w.fail(0); w.fail(0);
+  assert.equal(w.retryIn(0), 0, '没到上限不挡');
+  w.fail(0);
+  assert.equal(w.retryIn(0), 1000, '到上限,等窗口过完');
+  assert.equal(w.retryIn(600), 400, '等待时间跟着时间走');
+  assert.equal(w.retryIn(1000), 0, '窗口滑过去就放开');
+
+  w.fail(2000); w.fail(2000); w.fail(2000);
+  assert.ok(w.retryIn(2000) > 0);
+  w.pass();
+  assert.equal(w.retryIn(2000), 0, '密码对了就清零 —— 不然有人在外面爆破会把自己也锁在门外');
+});
+
 // ── CONNECT 隧道(回归 proxy 选项那个 bug) ───────────────
 
 await t('connectTunnel 真的发 CONNECT,并把隧道后的字节还回来', async () => {
@@ -500,6 +551,7 @@ const app = createApp({ cfg, creds, gateway });
 await new Promise((r) => app.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${app.address().port}`;
 const auth = 'Basic ' + Buffer.from('tester:test-pass').toString('base64');
+let cookie = '';                  // 登录那组测试里拿到的会话,后面几组接着用
 
 await t('/health 不要凭据(docker healthcheck 得进得来)', async () => {
   const r = await fetch(`${base}/health`);
@@ -509,13 +561,79 @@ await t('/health 不要凭据(docker healthcheck 得进得来)', async () => {
   assert.equal(j.model, 'deepseek-v4-flash-free');
 });
 
-await t('面板和 /api/* 匿名访问一律 401', async () => {
-  for (const p of ['/', '/index.html', '/api/config', '/api/status', '/api/nodes', '/api/logs']) {
-    const r = await fetch(base + p);
-    assert.equal(r.status, 401, `${p} 应该 401 而不是 ${r.status} —— 这里会明文吐订阅凭据`);
-    assert.match(r.headers.get('www-authenticate') || '', /^Basic/, '得给 challenge,浏览器才会弹框');
+await t('匿名:页面跳登录页,/api/* 给 401,而且哪儿都不发 WWW-Authenticate', async () => {
+  for (const p of ['/', '/index.html', '/app.js']) {
+    const r = await fetch(base + p, { redirect: 'manual' });
+    assert.equal(r.status, 302, `${p} 该跳登录页而不是 ${r.status} —— 这里会明文吐订阅凭据`);
+    assert.equal(r.headers.get('location'), '/login');
+    assert.equal(r.headers.get('www-authenticate'), null, '有这个头浏览器就弹框,而弹框正是要去掉的东西');
     await r.text();
   }
+  for (const p of ['/api/config', '/api/status', '/api/nodes', '/api/logs']) {
+    const r = await fetch(base + p);
+    assert.equal(r.status, 401, `${p} 应该 401 而不是 ${r.status}`);
+    assert.equal(r.headers.get('www-authenticate'), null);
+    // 302 到一坨 HTML 的话 fetch 只会报解析失败,前端得拿到 401 才知道去跳登录页
+    assert.match((await r.json()).error, /未登录/);
+  }
+});
+
+await t('登录页和它引的两个文件不要凭据(不然只能看到一张白纸)', async () => {
+  for (const p of ['/login', '/style.css', '/login.js']) {
+    const r = await fetch(base + p);
+    assert.equal(r.status, 200, `${p} 得能匿名拿到`);
+    await r.text();
+  }
+});
+
+await t('登录:密码错不发 cookie,对了发一个 HttpOnly 的', async () => {
+  const bad = await fetch(`${base}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ user: 'tester', pass: 'wrong' }),
+  });
+  assert.equal(bad.status, 401);
+  assert.equal(bad.headers.get('set-cookie'), null, '密码错了绝不能发会话');
+  await bad.text();
+
+  const ok = await fetch(`${base}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ user: 'tester', pass: 'test-pass' }),
+  });
+  assert.equal(ok.status, 200);
+  const sc = ok.headers.get('set-cookie') || '';
+  assert.match(sc, /^ciallo_sid=[\w-]{20,}/);
+  assert.match(sc, /HttpOnly/i, '脚本读得到会话就等于 XSS 能把它偷走');
+  assert.match(sc, /SameSite=Lax/i, '跨站 POST 不能带上它 —— 有副作用的路由全是 POST');
+  assert.ok(!/Secure/i.test(sc), '本地是 http,加了 Secure 浏览器会直接把 cookie 丢掉');
+  await ok.text();
+  cookie = sc.split(';')[0];
+});
+
+await t('带会话 cookie 就能读面板,不用再带 Basic', async () => {
+  const r = await fetch(`${base}/api/status`, { headers: { cookie } });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).gatewayRunning, true);
+
+  const page = await fetch(base + '/', { headers: { cookie } });
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /<title>/);
+
+  // 已经登录了还去 /login 没意义,跳回面板
+  const back = await fetch(`${base}/login`, { headers: { cookie }, redirect: 'manual' });
+  assert.equal(back.status, 302);
+  assert.equal(back.headers.get('location'), '/');
+  await back.text();
+});
+
+await t('退出登录后那张 cookie 当场不认(不是等它自己过期)', async () => {
+  const out = await fetch(`${base}/api/logout`, { method: 'POST', headers: { cookie } });
+  assert.equal(out.status, 200);
+  assert.match(out.headers.get('set-cookie') || '', /Max-Age=0/, '还得让浏览器把它删掉');
+  await out.text();
+
+  const after = await fetch(`${base}/api/status`, { headers: { cookie } });
+  assert.equal(after.status, 401, '服务端没作废的话,cookie 被复制走就一直能用');
+  await after.text();
 });
 
 await t('密码错也是 401,不是 500', async () => {

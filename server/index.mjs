@@ -2,8 +2,8 @@
  * index.mjs —— 容器入口:面板 + 网关跑在同一个端口。
  *
  * 为什么合一个端口:compose 只用映射一条,用户也只用记一个地址。两套路径的
- * 鉴权本来就不同 —— /v1/* 认 Bearer(给 agent),/api/* 和面板认 Basic(给人),
- * /health 不认(给 healthcheck)。
+ * 鉴权本来就不同 —— /v1/* 认 Bearer(给 agent),面板和 /api/* 认会话 cookie
+ * 或 Basic(给人和脚本,见 auth.mjs),/health 不认(给 healthcheck)。
  *
  * 监听 0.0.0.0:容器里绑 127.0.0.1 的话端口映射到宿主是通不了的。
  * 这也是 auth.mjs 必须存在的原因。
@@ -17,10 +17,17 @@ import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
 import { Gateway, FIXED_MODEL, OPENAI, ANTHROPIC, json } from './gateway.mjs';
 import { buildInfo, checkUpdate } from './build.mjs';
-import { checkBasic, resolveCredentials } from './auth.mjs';
+import {
+  matches, parseBasic, readCookie, resolveCredentials,
+  Sessions, FailWindow, SESSION_COOKIE, sessionCookie, CLEAR_COOKIE,
+} from './auth.mjs';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const MAX_LOG = 500;
+
+// 登录页得在「还没登录」的时候就能显示,所以它自己和它引的两个文件要放行。
+// 只放这两条具体路径(/login 单独处理),不是整个 web/ —— 其余静态文件照旧要凭据。
+const PUBLIC_FILES = new Set(['/style.css', '/login.js']);
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -68,6 +75,21 @@ async function serveStatic(res, path) {
   }
 }
 
+function redirect(res, to) {
+  res.writeHead(302, { Location: to, 'Cache-Control': 'no-store' });
+  res.end();
+}
+
+/**
+ * 会话 cookie 该不该带 Secure。反代后面进程这一段是明文的,只看 socket
+ * 会漏判 https 部署;而伪造 X-Forwarded-Proto 只能让 cookie 变严,
+ * 所以这个头信它没有风险。
+ */
+function isHttps(req) {
+  const fwd = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return fwd === 'https' || req.socket.encrypted === true;
+}
+
 // ── 组装 ────────────────────────────────────────────────
 
 /**
@@ -76,9 +98,47 @@ async function serveStatic(res, path) {
  */
 export function createApp({ cfg, creds, gateway }) {
   const api = makeApiRoutes({ cfg, gateway });
+  const sessions = new Sessions();
+  // 登录页和 Basic 共用一个失败计数器 —— 分开的话锁住表单还能拿 Basic 慢慢试
+  const guard = new FailWindow();
+
+  /** 脚本那条路:带了 Basic 就验一次,验错记一笔 */
+  function basicOk(req) {
+    const got = parseBasic(req.headers['authorization']);
+    if (!got) return false;                       // 没带就不算一次失败尝试
+    if (guard.retryIn()) return false;            // 限速中,连验都不验
+    if (matches(creds, got.user, got.pass)) { guard.pass(); return true; }
+    log('warn', `[auth] Basic 凭据不对(窗口内第 ${guard.fail()} 次)`);
+    return false;
+  }
+
+  async function handleLogin(req, res) {
+    const wait = guard.retryIn();
+    if (wait) {
+      const sec = Math.ceil(wait / 1000);
+      res.setHeader('Retry-After', String(sec));
+      return json(res, { error: `失败次数太多,${sec} 秒后再试` }, 429);
+    }
+    const b = await readBody(req);
+    if (!matches(creds, String(b.user ?? ''), String(b.pass ?? ''))) {
+      // 不打提交上来的用户名:那是攻击者能控制的字符串,直接进日志会污染面板
+      log('warn', `[auth] 登录失败(窗口内第 ${guard.fail()} 次)`);
+      return json(res, { error: '用户名或密码不对' }, 401);
+    }
+    guard.pass();
+    res.setHeader('Set-Cookie', sessionCookie(sessions.issue(), {
+      secure: isHttps(req), maxAgeMs: sessions.ttl,
+    }));
+    log('ok', `[auth] ${creds.user} 已登录`);
+    return json(res, { ok: true });
+  }
 
   return createServer((req, res) => {
     const path = new URL(req.url, 'http://x').pathname;
+    const send = (p) => void serveStatic(res, p).catch((e) => {
+      log('error', `[static] ${p}: ${e.message}`);
+      try { res.writeHead(500).end('500'); } catch {}
+    });
 
     // healthcheck 不能要凭据:docker healthcheck 不方便带
     if (path === '/health') {
@@ -114,8 +174,37 @@ export function createApp({ cfg, creds, gateway }) {
       return D.fail(res, 404, `Not found: ${req.method} ${path}`, 'not_found_error');
     }
 
-    // 面板和 /api/* 都要 Basic —— 前端会明文显示 Key 和订阅地址
-    if (!checkBasic(req, res, creds)) return;
+    // ── 面板和 /api/*:登录页给的会话 cookie,或脚本自己带的 Basic ──
+    // 前端会明文显示 Key 和订阅地址,所以这两样都得挡住。
+    // 认不过时刻意不发 WWW-Authenticate —— 那个头就是浏览器弹框的来源(见 auth.mjs)
+    const sid = readCookie(req.headers.cookie, SESSION_COOKIE);
+    const authed = sessions.valid(sid) || basicOk(req);
+
+    if (path === '/api/login' && req.method === 'POST') {
+      return void handleLogin(req, res).catch((e) => {
+        log('error', `[auth] 登录处理失败: ${e.message}`);
+        try { json(res, { error: e.message }, 500); } catch {}
+      });
+    }
+
+    if (path === '/api/logout' && req.method === 'POST') {
+      if (sid) sessions.drop(sid);              // 服务端当场作废,不只是让浏览器删 cookie
+      res.setHeader('Set-Cookie', CLEAR_COOKIE);
+      return json(res, { ok: true });
+    }
+
+    if (path === '/login') {
+      if (authed) return redirect(res, '/');    // 已经登录了就没必要再看登录页
+      return send('/login.html');
+    }
+
+    if (!authed) {
+      if (PUBLIC_FILES.has(path)) return send(path);
+      // 页面请求跳登录页;/api/* 给 401 JSON —— fetch 跟着 302 拿回一坨 HTML,
+      // 前端只会报个解析失败,不如让它自己决定跳转(app.js 里就是这么做的)
+      if (path.startsWith('/api/')) return json(res, { error: '未登录' }, 401);
+      return redirect(res, '/login');
+    }
 
     if (path.startsWith('/api/')) {
       api(req, res, path).catch((e) => {
@@ -124,10 +213,7 @@ export function createApp({ cfg, creds, gateway }) {
       });
       return;
     }
-    serveStatic(res, path).catch((e) => {
-      log('error', `[static] ${path}: ${e.message}`);
-      try { res.writeHead(500).end('500'); } catch {}
-    });
+    send(path);
   });
 }
 

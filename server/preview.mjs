@@ -181,6 +181,17 @@ function readBody(req) {
 async function handleApi(req, res, path) {
   const m = req.method;
 
+  // 预览本身不鉴权(只绑 127.0.0.1),但登录页要能点通、错误提示也得看得见:
+  // 密码固定 preview,填别的就走 401 那条分支
+  if (path === '/api/login' && m === 'POST') {
+    const b = await readBody(req);
+    if (b.pass !== 'preview') return json(res, { error: '用户名或密码不对(预览里密码固定是 preview)' }, 401);
+    log('ok', '[auth] admin 已登录');
+    return json(res, { ok: true });
+  }
+
+  if (path === '/api/logout' && m === 'POST') return json(res, { ok: true });
+
   if (path === '/api/status' && m === 'GET') {
     return json(res, {
       gatewayRunning: true, gatewayPort: state.cfg.port,
@@ -319,7 +330,8 @@ async function serveStatic(res, path) {
 const server = createServer((req, res) => {
   const path = new URL(req.url, 'http://x').pathname;
   if (path.startsWith('/api/')) handleApi(req, res, path).catch(() => json(res, { error: 'internal' }, 500));
-  else serveStatic(res, path);
+  // /login 这条路径和真网关保持一致 —— 预览不鉴权,所以退出登录只是回到这一页
+  else serveStatic(res, path === '/login' ? '/login.html' : path);
 });
 
 server.listen(PORT, '127.0.0.1', () => {

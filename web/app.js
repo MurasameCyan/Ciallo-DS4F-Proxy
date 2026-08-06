@@ -36,6 +36,12 @@ async function api(path, opts) {
   const text = await r.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { /* 非 JSON 就当空 */ }
+  // 会话过期或被退出了。回登录页,而不是让轮询一直红着「连接不上后端」——
+  // 后端好得很,是这张 cookie 不认了
+  if (r.status === 401) {
+    location.replace('/login');
+    throw new Error('未登录');
+  }
   if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`);
   return data;
 }
@@ -284,6 +290,13 @@ async function run(btn, label, fn) {
 function wire() {
   $('btn-restart').onclick = (e) => run(e.target, '内核重启', () => api('/restart', { method: 'POST' }));
   $('btn-reset').onclick = (e) => run(e.target, '手动重置', () => api('/reset', { method: 'POST' }));
+
+  // 退出登录:不走 run()(它要改按钮文字,会把里面的 svg 抹掉)。
+  // 请求失败也照样回登录页 —— 用户的意图是「离开」,不该被一个失败的请求拦下
+  $('btn-logout').onclick = async () => {
+    try { await api('/logout', { method: 'POST' }); } catch { /* 下面照样跳 */ }
+    location.replace('/login');
+  };
 
   // 重置 Key 要二次确认:它就在「复制」旁边,点错的话所有在用的客户端立刻 401
   $('btn-regen').onclick = (e) => {
