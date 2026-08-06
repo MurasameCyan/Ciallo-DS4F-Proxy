@@ -55,6 +55,8 @@ compose 默认只绑 `127.0.0.1:9527`。想让同网段其它机器连,把端口
 
 Base URL 就是面板首页显示的那个(它取的是你当前的访问地址 + `/v1`,反代/端口映射后面也对)。
 
+**模型名随便填。** 上游那个免费端点只认 `deepseek-v4-flash-free`,所以网关转发前会把 `model` 一律改写成它。`/v1/models` 照样把 7 个免费模型都列出来(客户端要拿它填下拉框),但填哪个都是同一个模型在答,统计里也只会出现这一个。
+
 ### OpenAI 协议
 
 ```bash
@@ -119,7 +121,7 @@ claude
 | 运行日志 | 内核和网关的实时日志 |
 | 节点池 | 按实测延迟排序,从上往下就是网关接下来会用的顺序。每行带延迟数字,当前节点标出来,冷却中的显示剩余秒数,测不通的划掉垫在最底下 |
 
-订阅地址改完点保存**当场生效**:地址变了就重写 mihomo 配置并重启内核,没变就只让内核重新拉一遍 provider。刷完节点接着自动测一遍速,保存后的提示会告诉你刷到几个、其中几个可用。
+订阅地址改完点保存**当场生效**:地址变了就重写 mihomo 配置并重启内核,没变就只让内核重新拉一遍 provider。刷完节点接着自动测一遍延迟,保存后的提示会告诉你刷到几个、其中几个可用。
 
 「清零统计」把请求数、Token 用量、按模型的分项全部归零并落盘,不可恢复,所以会先问一次。它不动订阅和 Key。
 
@@ -127,7 +129,40 @@ claude
 
 牌子显示 `unknown` 说明这个镜像构建时没注入 `GIT_COMMIT` —— 自己 `docker build` 不带 `--build-arg GIT_COMMIT=$(git rev-parse HEAD)` 就会这样。此时不会报「有新版本」:本地 hash 不知道,新旧无从判断,报了只是让人白拉一次镜像。
 
-数据(订阅、Key、用量、内核缓存)都在命名卷 `ciallo-data` 里。用命名卷不用 `./data` 绑挂,是因为容器里以 uid 1000 运行,宿主目录属主对不上会 permission denied;真要绑挂先 `mkdir data && sudo chown 1000:1000 data`。
+**日志。** 分四级(信息 / 成功 / 警告 / 错误),面板上按级别筛。方括号里是发出这行的子系统,常见的:`[gateway]` `[mihomo]` `[chat]` `[stream]` `[429]`(限流换节点)`[delay]`(测延迟)`[update]`(检查更新)`[config]` `[reset]`。面板里只留最近 500 条,在内存里 —— 容器重启就空了。同样的内容也全写了 stdout,要翻更早的用 `docker compose logs -f`。
+
+### 数据
+
+都在命名卷 `ciallo-data`(容器内 `/data`):
+
+| 文件 | 内容 |
+| --- | --- |
+| `config.json` | 订阅地址、API Key、端口。**含机场 token**,别往外发 |
+| `usage.json` | 累计统计。「清零统计」写的就是它 |
+| `mihomo-zen.yaml` | 生成的内核配置,每次改订阅地址重写 |
+| `mihomo-data/` | 内核自己的缓存(provider 快照、GeoIP) |
+| `last-node.txt` | 上次用的节点,重启后接着用它,不用从头试 |
+
+用命名卷不用 `./data` 绑挂,是因为容器里以 uid 1000 运行,宿主目录属主对不上会 permission denied;真要绑挂先 `mkdir data && sudo chown 1000:1000 data`。
+
+### 面板 API
+
+面板自己就用这些,想脚本化(比如把状态接到自己的监控上)直接打:
+
+| 路由 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/status` | GET | 网关/内核状态、内核版本、固定模型、构建标识 |
+| `/api/config` | GET · POST | POST 保存订阅地址和端口,**当场应用**;地址变了会重启内核 |
+| `/api/nodes` | GET | 排过序的节点表、被剔除的、延迟、冷却、当前节点 |
+| `/api/nodes/test` | POST | 立刻测一遍延迟,回 `{tested, alive, fastest}` |
+| `/api/usage` | GET | 统计。`/api/usage/reset` (POST) 清零 |
+| `/api/regen-key` | POST | 换 API Key,不重启就生效 |
+| `/api/restart` | POST | 重启内核 |
+| `/api/reset` | POST | 清冷却 + 忘掉上次节点 + 重写配置 + 重启内核 |
+| `/api/check-update` | POST | 跟 GitHub 上的 `GITHUB_TRACK_REF` 比一次 |
+| `/api/logs` | GET | SSE。首帧是历史快照(数组),之后每条一帧 |
+
+**全都要 Basic 鉴权**,和面板同一套凭据 —— 有副作用的都是 POST,别指望 GET 能触发。探活用 `/health`,那个不要鉴权。
 
 ---
 
@@ -144,10 +179,11 @@ npm run preview       # 不起内核,只看 UI
 npm start             # 完整跑,需要 /data 可写
 
 npm run verify:tunnel     # TLS-over-CONNECT 出站(要 openssl)
+npm run verify:upstream   # 出站是否真经代理(比对出口 IP),PROXY_PORT=2080 驱动
 npm run verify:api        # 打真实部署,BASE=http://... KEY=... 两个环境变量驱动
 ```
 
-`server/anthropic.mjs` 是纯函数 + 一个可注入回调的 `AnthropicStream`,所以整个转换层不用起 HTTP 就能断言。
+`server/anthropic.mjs` 是纯函数 + 一个可注入回调的 `AnthropicStream`,所以整个转换层不用起 HTTP 就能断言。前端同一个思路:`web/core.js` 只放算出来的东西(节点排序、Key 掩码、时长格式化、新旧判断),`web/app.js` 只负责把结果贴到 DOM 上 —— 所以 `test/check.mjs` 不用浏览器就能把那些规则钉住。
 
 ```
 server/
