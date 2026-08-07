@@ -86,7 +86,9 @@ function renderStats() {
 
   $('s-tok').textContent = fmtTokens(t.totalTokens);
   $('s-tok-sub').textContent =
-    `输入 ${fmtTokens(t.promptTokens)} · 输出 ${fmtTokens(t.completionTokens)} · 推理 ${fmtTokens(t.reasoningTokens)}`;
+    `输入 ${fmtTokens(t.promptTokens)} · 输出 ${fmtTokens(t.completionTokens)}`
+    + ` · 推理 ${fmtTokens(t.reasoningTokens)} · 缓存读 ${fmtTokens(t.cacheReadTokens)}`
+    + ` · 缓存写 ${fmtTokens(t.cacheWriteTokens)}`;
 
   $('s-up').textContent = fmtUptime(Date.now() - (S.usage.startTime || Date.now()));
   const top = rankBreakdown(S.usage.byModel, 1)[0];

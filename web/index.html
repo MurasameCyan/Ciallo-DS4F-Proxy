@@ -70,7 +70,7 @@
     <article class="card stat">
       <h3>Token 消耗</h3>
       <p class="big" id="s-tok">—</p>
-      <p class="sub" id="s-tok-sub">输入 — · 输出 — · 推理 —</p>
+      <p class="sub" id="s-tok-sub">输入 — · 输出 — · 推理 — · 缓存读 — · 缓存写 —</p>
     </article>
     <article class="card stat">
       <h3>运行时长</h3>
@@ -193,15 +193,17 @@
   <!-- 和上面那张卡刻意分开:节点池讲「现在能不能用」(延迟、冷却、下一个用谁),
        这张讲「历史上表现如何」。混在一张表里的话每行要塞十来个数,
        340px 那一列根本放不下,而且实时状态会被历史数字淹掉。 -->
-  <section class="card span3" aria-labelledby="h-nstat">
-    <div class="card-head">
-      <h2 id="h-nstat">节点统计</h2>
-      <!-- 这句必须留着:两套口径的数对不上是最容易被当成 bug 的地方 -->
-      <p class="hint" id="nstat-sum">按每次真实上游尝试计 —— 一次客户端请求换了几个节点就在几个节点上各记一笔,所以合计通常大于顶部的请求总数。</p>
-    </div>
+  <details class="card span3" aria-labelledby="h-nstat">
+    <summary class="nstat-summary">
+      <span class="card-head">
+        <span class="nstat-title" id="h-nstat">节点统计</span>
+        <!-- 这句必须留着:两套口径的数对不上是最容易被当成 bug 的地方 -->
+        <span class="hint" id="nstat-sum">按每次真实上游尝试计 —— 一次客户端请求换了几个节点就在几个节点上各记一笔,所以合计通常大于顶部的请求总数。</span>
+      </span>
+    </summary>
     <ul class="nstats" id="nstats" aria-label="各节点的上游尝试统计,按尝试次数降序"></ul>
     <p class="empty" id="nstat-empty" hidden>还没有上游尝试记录 —— 发一次请求就会出现。</p>
-  </section>
+  </details>
 </main>
 
 <!-- 操作反馈。aria-live 让读屏也能听到 -->

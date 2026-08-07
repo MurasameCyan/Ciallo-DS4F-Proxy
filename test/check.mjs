@@ -300,6 +300,21 @@ t('nodeStats 保留缓存字段存在性,兼容旧桶里的非零缓存', () => 
   assert.equal(legacy.cache, 0.25, '旧桶的非零缓存读数本身足以证明上游报过数据');
 });
 
+t('Token 消耗显示缓存读写明细', () => {
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.ok(app.includes('缓存读 ${fmtTokens(t.cacheReadTokens)}'));
+  assert.ok(app.includes('缓存写 ${fmtTokens(t.cacheWriteTokens)}'));
+  assert.ok(html.includes('缓存读 — · 缓存写 —'));
+});
+
+t('节点统计使用默认关闭的原生折叠结构', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.match(html, /<details[^>]*class="card span3"[^>]*>/);
+  assert.match(html, /<summary[^>]*>[^]*节点统计[^]*<\/summary>/);
+  assert.doesNotMatch(html.match(/<details[^>]*class="card span3"[^>]*>/)?.[0] || '', /\sopen(?:\s|=|>)/);
+});
+
 t('节点统计合计不显示请求级与尝试级口径说明', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   assert.ok(!app.includes('一次客户端请求换几个节点就记几笔'));

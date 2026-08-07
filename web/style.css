@@ -338,6 +338,15 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 /* ── 节点统计 ─────────────────────────────────────────── */
 
+/* 原生 summary 保留浏览器自带的展开标记和键盘行为；内部继续沿用卡头布局。 */
+.nstat-summary { cursor: pointer; }
+.nstat-summary .card-head {
+  display: inline-flex; width: calc(100% - 20px);
+  margin-bottom: 0; vertical-align: middle;
+}
+.nstat-title { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+details[open] > .nstat-summary { margin-bottom: 13px; }
+
 /* 通栏卡,不限高:行数 == 用过的节点数,比节点池只少不多,而且这张卡在最底下,
    页面本来就要滚到这儿,再套一层内部滚动只会多一条滚动条抢手势。 */
 .nstats { display: grid; gap: 7px; }
