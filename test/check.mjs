@@ -370,6 +370,16 @@ t('OpenCode 请求头开启状态使用绿色标签', () => {
   assert.ok(!html.includes('实验:出站补一组 OpenCode CLI 的身份头'), '指定说明文本应移除');
 });
 
+t('OpenCode 请求头开关排在「保存并应用」下方', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const form = html.match(/<form\b[^>]*id="cfg-form"[^>]*>([\s\S]*?)<\/form>/)?.[1] || '';
+  const save = form.indexOf('id="btn-save"');
+  const idt = form.indexOf('for="f-identity"');
+
+  assert.ok(save >= 0 && idt >= 0, '开关和保存按钮都应在配置表单内');
+  assert.ok(idt > save, '开关应位于保存按钮之后');
+});
+
 t('配置卡提供小时制自动更新订阅输入', () => {
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   const field = html.match(/<label\b[^>]*>[\s\S]*?自动更新订阅[\s\S]*?<\/label>/)?.[0] || '';

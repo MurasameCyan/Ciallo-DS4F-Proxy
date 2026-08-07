@@ -433,6 +433,10 @@ input[readonly] { color: var(--fg-2); }
 /* 开关下面那句说明:.hint 默认没上边距,和 label 贴太紧 */
 .chk.toggle + .hint { margin-top: 6px; }
 
+/* 开关排在「保存并应用」下方。按钮是行内级、没有下外边距,不给它加一道
+   上边距的话开关会贴在按钮上;下边距归零,让卡里那排按钮的 13px 说话。 */
+.btn.wide + .field { margin: 13px 0 0; }
+
 .models { display: flex; flex-wrap: wrap; gap: 6px; }
 .models li {
   font-family: var(--mono); font-size: 11px;
