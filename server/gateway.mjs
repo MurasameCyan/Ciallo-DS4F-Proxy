@@ -11,6 +11,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { MihomoAgent } from './proxy.mjs';
 import { LAST_NODE_FILE, USAGE_FILE, MIXED_PORT, CTRL_PORT, POOL_NAME } from './config.mjs';
 import {
@@ -21,7 +22,6 @@ import { safeEqual } from './auth.mjs';
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
 const MODELS_PATH = '/zen/v1/models';
-export const FIXED_MODEL = 'deepseek-v4-flash-free';
 export const COOLDOWN_MS = 90 * 1000;
 
 /**
@@ -119,8 +119,8 @@ export function pickFreeModels(ids) {
  */
 export const OPENAI = {
   name: 'openai',
-  /** 客户端传什么模型都忽略:上游免费端点只认 FIXED_MODEL */
-  toUpstream: (body) => ({ ...body, model: FIXED_MODEL }),
+  /** 客户端选哪个模型就用哪个 —— handleChat 已经拿实时免费清单挡过一道了 */
+  toUpstream: (body) => body,
   validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages required'),
   fail: (res, status, message, type, extra) => json(res, { error: { message, type, ...extra } }, status),
   respond: (res, oai) => json(res, oai),
@@ -129,16 +129,19 @@ export const OPENAI = {
 
 export const ANTHROPIC = {
   name: 'anthropic',
-  toUpstream: (body) => ({ ...anthropicToOpenAI(body), model: FIXED_MODEL }),
+  // anthropicToOpenAI 已经把 req.model 抄进去了,这里不再覆盖
+  toUpstream: (body) => anthropicToOpenAI(body),
   validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages: at least one message required'),
   // Anthropic 的错误体没有放附加字段的地方,所以把冷却剩余秒数并进 message,
-  // 而不是塞个上游 SDK 会忽略掉的字段 —— 信息宁可在文字里也别丢
+  // 而不是塞个上游 SDK 会忽略掉的字段 —— 信息宁可在文字里也别丢。
+  // type 参数刻意不用:Anthropic 只认自己那套枚举,按状态码映射才不会造出
+  // SDK 读不懂的类型(OpenAI 那边的 invalid_model 在这儿就得是 invalid_request_error)
   fail: (res, status, message, type, extra) => {
     const s = extra?.cooldown?.[0]?.remain;
     return json(res, anthropicError(s ? `${message}(约 ${s}s 后恢复)` : message, errTypeFor(status)), status);
   },
-  respond: (res, oai) => json(res, openAIToAnthropic(oai, FIXED_MODEL)),
-  sink: (res) => anthropicSink(res, FIXED_MODEL),
+  respond: (res, oai, model) => json(res, openAIToAnthropic(oai, model)),
+  sink: (res, model) => anthropicSink(res, model),
 };
 
 /** OpenAI 流:上游字节原样透传,不解析不重排 */
@@ -170,10 +173,104 @@ function anthropicSink(res, model) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 客户端请求口径的桶:一个客户端请求记一次 */
 const blankTotals = () => ({
   requests: 0, success: 0, fail: 0,
   promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
+  cacheReadTokens: 0, cacheWriteTokens: 0,
 });
+
+/**
+ * 节点尝试口径的桶:每次真实发出的上游 HTTP 请求记一次。
+ *
+ * 和上面那套刻意分开:一个客户端请求可能先撞 429、再超时、最后在第三个节点
+ * 成功 —— 顶部总览要显示「1 次成功」,而这里要显示三次尝试各自的归属。
+ * 混在一个数里的话「换了几个节点」和「客户端失败了几次」永远分不出来。
+ */
+const NODE_OUTCOMES = ['success', 'rateLimited', 'timeout', 'upstreamError'];
+
+const blankNode = () => ({
+  requests: 0, ...Object.fromEntries(NODE_OUTCOMES.map((k) => [k, 0])),
+  promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
+  cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false,
+});
+
+/**
+ * 上游 usage → 统一字段名。
+ *
+ * 缓存 token 各家字段名都不一样,而上游会把底层模型的 usage 原样带出来,
+ * 所以见到哪个认哪个:OpenAI 是 prompt_tokens_details.cached_tokens,
+ * Anthropic 风格是 cache_read_input_tokens / cache_creation_input_tokens。
+ * 一个都没有时 token 仍归一成 0,另用 hasCacheData 标明「无数据」,
+ * 避免面板把「上游没报」误显示成「明确 0%」。
+ */
+export function readUsage(u) {
+  const pt = Number(u?.prompt_tokens) || 0;
+  const ct = Number(u?.completion_tokens) || 0;
+  const num = (...vals) => {
+    for (const v of vals) { const n = Number(v); if (Number.isFinite(n) && n > 0) return n; }
+    return 0;
+  };
+  const has = (...paths) => paths.some(([obj, key]) => obj != null && Object.hasOwn(obj, key));
+  return {
+    promptTokens: pt,
+    completionTokens: ct,
+    reasoningTokens: Number(u?.completion_tokens_details?.reasoning_tokens) || 0,
+    totalTokens: Number(u?.total_tokens) || pt + ct,
+    cacheReadTokens: num(u?.prompt_tokens_details?.cached_tokens, u?.cache_read_input_tokens, u?.prompt_cache_hit_tokens),
+    cacheWriteTokens: num(u?.cache_creation_input_tokens, u?.prompt_tokens_details?.cache_creation_tokens),
+    hasCacheData: has(
+      [u?.prompt_tokens_details, 'cached_tokens'], [u, 'cache_read_input_tokens'],
+      [u, 'prompt_cache_hit_tokens'], [u, 'cache_creation_input_tokens'],
+      [u?.prompt_tokens_details, 'cache_creation_tokens'],
+    ),
+  };
+}
+
+/** 客户端可以自己带的那几个身份头。带了就透传,没带的按下面的默认值补 */
+const IDENTITY_DEFAULTS = {
+  'User-Agent': 'opencode-cli/1.0.0',
+  'x-opencode-client': 'cli',
+  'x-opencode-project': 'default',
+};
+
+/**
+ * 合成 OpenCode CLI 的身份头(实验开关,默认关)。
+ *
+ * 为什么值得试:上游的 prompt cache 很可能按会话/客户端身份分桶,而我们出站
+ * 一直是裸 `User-Agent: node`。补上真实 CLI 的那组头之后能不能拿到缓存
+ * usage,是这个开关唯一要观察的事 —— 它不改额度、也不改节点调度。
+ *
+ * request/session ID 必须在同一个客户端请求的多次节点重试之间保持不变:
+ * 每次重试换一个 ID 的话,上游看到的就是几个互不相干的新会话,缓存必然不命中,
+ * 这个实验也就白做了。所以在 handleChat 里构造一次,再传给每次尝试。
+ */
+export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
+  const h = {};
+  for (const [k, v] of Object.entries(inbound?.headers || {})) h[k.toLowerCase()] = v;
+  const pick = (...names) => {
+    for (const n of names) {
+      const v = h[n];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return '';
+  };
+
+  const out = { ...IDENTITY_DEFAULTS };
+  for (const [name, dflt] of Object.entries(IDENTITY_DEFAULTS)) {
+    out[name] = pick(name.toLowerCase()) || dflt;
+  }
+  out['x-opencode-request'] = pick('x-opencode-request') || uuid();
+  // 会话 ID 依次找这三个:OpenCode 自己的、粘性路由用的、以及通用的那个
+  out['x-opencode-session'] = pick('x-opencode-session', 'x-session-affinity', 'x-session-id') || uuid();
+  // 这两个没有合理的默认值,客户端没给就别凭空造
+  for (const n of ['x-session-id', 'x-title']) {
+    const v = pick(n);
+    if (v) out[n] = v;
+  }
+  return out;
+}
 
 /** 429 后把节点关小黑屋 90 秒,期间跳过它,避免连续请求撞同一个被限的出口 */
 export class NodeCooldown {
@@ -235,39 +332,73 @@ export class UsageTracker {
     try {
       if (fs.existsSync(this.filePath)) {
         const d = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-        if (d?.total) return d;
+        // 字段都是逐步加的:旧桶和空桶合并默认值,既保留历史数,
+        // 又避免后续做 `undefined += 2` 变成 NaN(JSON 落盘时会写成 null)
+        if (d?.total) {
+          const normalize = (map, blank) => Object.fromEntries(Object.entries(map || {})
+            .map(([name, value]) => [name, { ...blank(), ...value }]));
+          return {
+            ...d,
+            total: { ...blankTotals(), ...d.total },
+            byDay: normalize(d.byDay, blankTotals),
+            byModel: normalize(d.byModel, blankTotals),
+            byNode: normalize(d.byNode, blankNode),
+          };
+        }
       }
     } catch (e) { this.logger?.('warn', `[usage] 读取失败: ${e.message}`); }
-    return { total: blankTotals(), byDay: {}, byModel: {}, lastRequest: null, startTime: Date.now() };
+    return this.blank();
+  }
+  blank() {
+    return { total: blankTotals(), byDay: {}, byModel: {}, byNode: {}, lastRequest: null, startTime: Date.now() };
   }
   save() {
     try {
       fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
     } catch (e) { this.logger?.('warn', `[usage] 保存失败: ${e.message}`); }
   }
+  /** 客户端请求口径:一个客户端请求一次,不管中间换了几个节点 */
   record(model, usage, success) {
     const day = new Date().toISOString().slice(0, 10);
-    const pt = usage?.prompt_tokens || 0;
-    const ct = usage?.completion_tokens || 0;
-    const rt = usage?.completion_tokens_details?.reasoning_tokens || 0;
-    const tt = usage?.total_tokens || pt + ct;
+    const u = readUsage(usage);
 
     this.data.byDay[day] ??= blankTotals();
     this.data.byModel[model] ??= blankTotals();
     for (const b of [this.data.total, this.data.byDay[day], this.data.byModel[model]]) {
       b.requests++;
       if (success) b.success++; else b.fail++;
-      b.promptTokens += pt;
-      b.completionTokens += ct;
-      b.reasoningTokens += rt;
-      b.totalTokens += tt;
+      b.promptTokens += u.promptTokens;
+      b.completionTokens += u.completionTokens;
+      b.reasoningTokens += u.reasoningTokens;
+      b.totalTokens += u.totalTokens;
+      b.cacheReadTokens += u.cacheReadTokens;
+      b.cacheWriteTokens += u.cacheWriteTokens;
     }
     this.data.lastRequest = Date.now();
     this.save();
   }
+  /**
+   * 节点尝试口径:每次真实发出的上游请求一次。
+   * result ∈ success | rateLimited | timeout | upstreamError —— 互斥,只加一个。
+   * 不写 lastRequest,那是客户端口径的字段;也不 save,由调用方那次 record 顺手落盘
+   * (一次客户端请求最多写一次文件,而不是每换一个节点写一次)。
+   */
+  recordAttempt(node, result, usage = null) {
+    if (!node) return;
+    // 先验参再建桶:名字写错的时候不该在面板上留下一个凭空多出来的节点行
+    if (!NODE_OUTCOMES.includes(result)) throw new Error(`未知的节点尝试结果: ${result}`);
+    const b = (this.data.byNode[node] ??= blankNode());
+    b.requests++;
+    b[result]++;
+    if (!usage) return;
+    const u = readUsage(usage);
+    for (const k of ['promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens',
+      'cacheReadTokens', 'cacheWriteTokens']) b[k] += u[k];
+    if (u.hasCacheData) b.hasCacheData = true;
+  }
   getStats() { return this.data; }
   reset() {
-    this.data = { total: blankTotals(), byDay: {}, byModel: {}, lastRequest: null, startTime: Date.now() };
+    this.data = this.blank();
     this.save();
     this.logger?.('ok', '[usage] 用量已清零');
   }
@@ -444,6 +575,23 @@ export class Gateway {
     const wantStream = inbound.stream === true;
     const body = dialect.toUpstream(inbound);
 
+    // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
+    // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,
+    // 而它完全不知道被换过。宁可 400 说清楚,也不静默给个别的。
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
+    if (!model) return dialect.fail(res, 400, 'model is required', 'invalid_request_error');
+    const free = this.freeModels();
+    if (!free.includes(model)) {
+      // 不回显清单:那是 /v1/models 的活,错误体里塞几十个模型名没人读
+      return dialect.fail(res, 400,
+        `Model not available: ${model} —— 只接受 /v1/models 里的免费模型`, 'invalid_model');
+    }
+    body.model = model;
+
+    // 身份头在这儿构造一次,再传给下面每一次尝试 —— 换节点重试时 request/session ID
+    // 必须还是同一个,否则上游看到的是几个互不相干的新会话
+    const identity = this.config.opencodeIdentityHeaders ? identityHeaders(req) : null;
+
     // 排过序的表:延迟低的在前,测不通的直接不在表里。pickAvailable 取的是
     // 「第一个不冷却的」,所以排序在这儿就等于优先级。
     const nodes = this.rankNodes(await this.getAllNodes());
@@ -452,7 +600,7 @@ export class Gateway {
     }
     const cur = await this.ensureNode(nodes, res, dialect, deadline);
     if (!cur) return;   // ensureNode 已经回过错误了
-    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline);
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity);
   }
 
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
@@ -493,8 +641,16 @@ export class Gateway {
     }
     return cur;
   }
-  /** 重试循环:429 换节点,网络错误只重试当前节点(换了也是白换,避免振荡) */
-  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity) {
+  /**
+   * 重试循环:429 换节点,网络错误只重试当前节点(换了也是白换,避免振荡)。
+   *
+   * 两套账在这里分叉,别混:
+   *   this.usage.recordAttempt(cur, ...) 每次真实发出的上游请求都记一次
+   *   this.usage.record(model, ...)      整个客户端请求只记一次,在终态记
+   * 所以下面每条 `continue`(还要再试)之前只有 recordAttempt,
+   * 每条 `return`(定案了)才有 record。
+   */
+  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity, identity = null) {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
@@ -505,34 +661,48 @@ export class Gateway {
     // 时间防「每次都慢但都没超时」—— 只有次数上限的话后者能拖到几十分钟。
     while (switches <= MAX_NODE_TRIES) {
       if (left() < MIN_TRY_MS) {
-        this.usage.record(FIXED_MODEL, null, false);
+        // 一个字节都还没发出去,所以只记客户端那一笔,不记节点尝试
+        this.usage.record(body.model, null, false);
         this.logger('error', `[chat] 超出 ${REQUEST_DEADLINE_MS / 1000}s 预算,放弃(换过 ${switches} 个节点)`);
         return dialect.fail(res, 504, `Upstream did not respond within ${REQUEST_DEADLINE_MS / 1000}s`, 'timeout');
       }
       const t0 = Date.now();
       try {
         const result = wantStream
-          ? await this.forwardStream(res, body, dialect, left())
-          : await this.forward(body, left());
+          ? await this.forwardStream(res, body, dialect, left(), identity)
+          : await this.forward(body, left(), identity);
 
         const dt = Date.now() - t0;
+        if (wantStream) {
+          // 流式在 forwardStream 里边转发边攒 usage,这儿只拿到结果汇总。
+          // ok:false = 首字节之后断的 —— 响应已经发出去一半,重试不了,
+          // 但这次尝试对节点来说是上游错误,对客户端来说是一次失败。
+          if (result.ok) {
+            this.lockedNode = cur;
+            this.cooldown.clear(cur);
+            this.saveLastNode(cur);
+          }
+          this.usage.recordAttempt(cur, result.ok ? 'success' : 'upstreamError', result.usage);
+          this.usage.record(body.model, result.usage, result.ok);
+          this.logger(result.ok ? 'ok' : 'error',
+            `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}" ${dt}ms`);
+          return;
+        }
         this.lockedNode = cur;
         this.cooldown.clear(cur);
         this.saveLastNode(cur);
-        if (wantStream) {
-          // 流式的 usage 在 forwardStream 里边转发边记,这儿没有 result
-          this.logger('ok', `[stream-ok] node="${cur}" ${dt}ms`);
-          return;
-        }
-        this.usage.record(FIXED_MODEL, result.usage, true);
+        this.usage.recordAttempt(cur, 'success', result.usage);
+        this.usage.record(body.model, result.usage, true);
         this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`);
-        return dialect.respond(res, result);
+        return dialect.respond(res, result, body.model);
       } catch (e) {
         const status = e.status || 0;
 
         // 流已经开始吐了就不能重试:头都发出去了,换节点等于给客户端拼接两半响应。
         // 收尾由 forwardStream 里的 sink 负责(它才拿得到那个 sink),这里只记账。
         if (e.notStarted === false) {
+          this.usage.recordAttempt(cur, 'upstreamError');
+          this.usage.record(body.model, null, false);
           this.logger('error', `[stream-mid] node="${cur}" 中断: ${e.body || e.message}`);
           try { res.end(); } catch {}
           return;
@@ -540,7 +710,7 @@ export class Gateway {
 
         if (status === 429) {
           this.cooldown.mark429(cur);
-          this.usage.record(FIXED_MODEL, null, false);
+          this.usage.recordAttempt(cur, 'rateLimited');
           this.logger('warn', `[429] node="${cur}" 限流,冷却 ${COOLDOWN_MS / 1000}s`);
           tried.add(cur);
           netRetry = 0;
@@ -548,6 +718,7 @@ export class Gateway {
           const next = this.cooldown.pickAvailable(nodes, tried);
           if (!next) {
             const s = this.cooldown.summary();
+            this.usage.record(body.model, null, false);
             this.logger('error', `[chat] 全部节点冷却中: ${s.length} 个`);
             return dialect.fail(res, 429,
               `All nodes rate-limited, retry in ~${s[0]?.remain || 90}s`, 'all_nodes_429', { cooldown: s });
@@ -557,11 +728,26 @@ export class Gateway {
           await sleep(2000);
           switches++;
           if (await this.switchNode(next)) cur = next;
-          else tried.add(next);
+          else {
+            tried.add(next);
+            const fallback = this.cooldown.pickAvailable(nodes, tried);
+            if (!fallback) {
+              this.usage.record(body.model, null, false);
+              return dialect.fail(res, 503, 'No switchable upstream node', 'all_nodes_unavailable');
+            }
+            switches++;
+            if (await this.switchNode(fallback)) cur = fallback;
+            else {
+              tried.add(fallback);
+              continue;
+            }
+          }
           continue;
         }
 
         if (status === 0) {
+          // 超时/连接失败:每次都是真发出去过的一次尝试,所以重试前先记一笔
+          this.usage.recordAttempt(cur, 'timeout');
           if (++netRetry <= MAX_NET_RETRY) {
             this.logger('warn', `[net-retry ${netRetry}/${MAX_NET_RETRY}] node="${cur}": ${e.body || e.message}`);
             await sleep(1000);
@@ -572,17 +758,31 @@ export class Gateway {
           this.logger('warn', `[timeout] node="${cur}" 重试 ${MAX_NET_RETRY} 次仍失败,换下一个`);
           const next = this.cooldown.pickAvailable(nodes, tried);
           if (!next) {
-            this.usage.record(FIXED_MODEL, null, false);
+            this.usage.record(body.model, null, false);
             return dialect.fail(res, 504, 'All nodes timeout', 'timeout');
           }
           switches++;
           if (await this.switchNode(next)) cur = next;
-          else tried.add(next);
+          else {
+            tried.add(next);
+            const fallback = this.cooldown.pickAvailable(nodes, tried);
+            if (!fallback) {
+              this.usage.record(body.model, null, false);
+              return dialect.fail(res, 503, 'No switchable upstream node', 'all_nodes_unavailable');
+            }
+            switches++;
+            if (await this.switchNode(fallback)) cur = fallback;
+            else {
+              tried.add(fallback);
+              continue;
+            }
+          }
           continue;
         }
 
         // 400/500 之类:换节点也是同样结果,直接把上游的话原样带回去
-        this.usage.record(FIXED_MODEL, null, false);
+        this.usage.recordAttempt(cur, 'upstreamError');
+        this.usage.record(body.model, null, false);
         this.logger('error', `[chat] HTTP ${status}: ${String(e.body).slice(0, 300)}`);
         if (dialect === OPENAI) {
           let payload;
@@ -596,7 +796,7 @@ export class Gateway {
         return dialect.fail(res, status, msg, errTypeFor(status));
       }
     }
-    this.usage.record(FIXED_MODEL, null, false);
+    this.usage.record(body.model, null, false);
     this.logger('error', `[chat] 换过 ${MAX_NODE_TRIES} 个节点仍未成功`);
     return dialect.fail(res, 503,
       `Tried ${MAX_NODE_TRIES} nodes, all unavailable`, 'all_nodes_unavailable');
@@ -608,8 +808,11 @@ export class Gateway {
    *
    * 不带 Authorization + User-Agent: node 是刻意的 —— zen 免费端点就认这个形态,
    * 补上 Bearer 反而 401。额度按出口 IP 算,所以换 IP 才是有意义的动作。
+   *
+   * identity 非空时(实验开关开着)覆盖掉 User-Agent 并补上 OpenCode 那组头,
+   * 见 identityHeaders。关着的时候这里的行为和以前一模一样。
    */
-  reqOpts(bodyStr, { accept, timeout }) {
+  reqOpts(bodyStr, { accept, timeout, identity = null }) {
     return {
       host: OPENCODE_HOST,
       port: 443,
@@ -619,6 +822,7 @@ export class Gateway {
         'Content-Type': 'application/json',
         Accept: accept,
         'User-Agent': 'node',
+        ...identity,
         'Content-Length': Buffer.byteLength(bodyStr),
       },
       agent: this.agent,     // ← 真正经 mihomo 出站的地方
@@ -626,12 +830,12 @@ export class Gateway {
     };
   }
 
-  forward(body, budget = Infinity) {
+  forward(body, budget = Infinity, identity = null) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: false });
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(UPSTREAM_TIMEOUT_MS, budget));
-      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity }), (resp) => {
         let data = '';
         resp.on('data', (c) => (data += c));
         resp.on('end', () => {
@@ -651,8 +855,11 @@ export class Gateway {
    *
    * 两段超时刻意分开:等第一个字节要短(还能重试),开始吐了以后要长
    * (推理模型思考几十秒很正常,这时候掐掉等于毁掉一个已经成功的请求)。
+   *
+   * 首字节发出去之后就不再 reject,而是 resolve 成 { ok, usage } —— 记账
+   * 交给 attempt 一处做,不然「按节点分类」这件事得在两个文件里各写一遍。
    */
-  forwardStream(res, body, dialect = OPENAI, budget = Infinity) {
+  forwardStream(res, body, dialect = OPENAI, budget = Infinity, identity = null) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
       const ttfb = Math.max(1_000, Math.min(STREAM_TTFB_MS, budget));
@@ -666,9 +873,10 @@ export class Gateway {
       // 重试循环里,而此时头早就发出去了。
       let started = false;
       let settled = false;
+      let usage = null;     // 提到这一层:r 的 error 回调也要把已收到的 usage 带出去
       const finish = (fn) => { if (!settled) { settled = true; fn(); } };
 
-      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity }), (resp) => {
         if (resp.statusCode !== 200) {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
@@ -683,7 +891,7 @@ export class Gateway {
           'X-Accel-Buffering': 'no',
         });
         started = true;
-        const sink = dialect.sink(res);
+        const sink = dialect.sink(res, body.model);
 
         // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
         // 推理模型思考几十秒很正常,拿 TTFB 那个尺度掐会毁掉已经成功的请求
@@ -694,7 +902,6 @@ export class Gateway {
         });
 
         let buf = '';
-        let usage = null;
         resp.on('data', (chunk) => {
           sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
           buf += chunk.toString();
@@ -710,16 +917,14 @@ export class Gateway {
         });
         resp.on('end', () => finish(() => {
           sink.end();
-          if (usage) this.usage.record(FIXED_MODEL, usage, true);
-          resolve();
+          resolve({ ok: true, usage });
         }));
         resp.on('error', (e) => finish(() => {
           this.logger('error', `[stream] 中断: ${e.message}`);
           // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
           // 客户端的状态机于是能正常结束,而不是等到自己超时
           sink.fail(e.message);
-          this.usage.record(FIXED_MODEL, usage, false);
-          resolve();     // 已经发出去一部分了,重试不了,不算可重试失败
+          resolve({ ok: false, usage });   // 已经发出去一部分了,重试不了,不算可重试失败
         }));
       });
 
@@ -728,7 +933,7 @@ export class Gateway {
           // 头已经发了,只能就地收尾。这里不能 reject 回重试循环。
           this.logger('error', `[stream] 传输中断: ${e.message}`);
           try { res.end(); } catch {}
-          return resolve();
+          return resolve({ ok: false, usage });
         }
         reject({ status: 0, body: e.message, notStarted: true });
       }));

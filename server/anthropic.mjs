@@ -85,6 +85,7 @@ export function anthropicToOpenAI(req) {
     if (!Array.isArray(m.content)) continue;
 
     const texts = [];
+    const reasoning = [];
     const toolCalls = [];
     const toolResults = [];
     for (const b of m.content) {
@@ -92,6 +93,9 @@ export function anthropicToOpenAI(req) {
       switch (b.type) {
         case 'text':
           if (typeof b.text === 'string') texts.push(b.text);
+          break;
+        case 'thinking':
+          if (role === 'assistant' && typeof b.thinking === 'string') reasoning.push(b.thinking);
           break;
         case 'tool_use':
           toolCalls.push({
@@ -124,10 +128,14 @@ export function anthropicToOpenAI(req) {
       continue;
     }
     if (role === 'assistant' && toolCalls.length) {
-      msgs.push({ role: 'assistant', content: texts.join('\n') || null, tool_calls: toolCalls });
+      const assistant = { role: 'assistant', content: texts.join('\n') || null, tool_calls: toolCalls };
+      if (reasoning.length) assistant.reasoning_content = reasoning.join('\n');
+      msgs.push(assistant);
       continue;
     }
-    msgs.push({ role, content: texts.join('\n') });
+    const message = { role, content: texts.join('\n') };
+    if (role === 'assistant' && reasoning.length) message.reasoning_content = reasoning.join('\n');
+    msgs.push(message);
   }
 
   const out = { model: req.model, messages: msgs, stream: req.stream === true };
@@ -166,6 +174,10 @@ export function openAIToAnthropic(oai, fallbackModel = '') {
   const msg = choice.message ?? choice.delta ?? {};
   const content = [];
 
+  const reasoning = str(msg.reasoning_content) || str(msg.reasoning);
+  if (reasoning) content.push({
+    type: 'thinking', thinking: reasoning, signature: 'ciallo-ds4f-proxy',
+  });
   if (typeof msg.content === 'string' && msg.content) content.push({ type: 'text', text: msg.content });
   for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
     content.push({
@@ -183,7 +195,9 @@ export function openAIToAnthropic(oai, fallbackModel = '') {
     id: msgId(),
     type: 'message',
     role: 'assistant',
-    model: oai?.model || fallbackModel,
+    // 调用方传入的是已校验并实际发给上游的客户端模型；上游可能回内部别名，
+    // Messages 响应仍应保持客户端看到的模型身份。
+    model: fallbackModel || oai?.model || '',
     content,
     stop_reason: mapStop(choice.finish_reason),
     stop_sequence: null,
@@ -344,8 +358,8 @@ export class AnthropicStream {
 
   /**
    * 关掉思考块。signature 是占位符,不是真签名 —— 上游没有给我们任何可签的
-   * 东西。客户端把它原样发回来时会走 anthropicToOpenAI,thinking 块在那边
-   * 本来就被忽略,所以不会有人去验它;而缺这个字段的话按 SDK 类型是非法块。
+   * 东西。客户端把块发回来时,anthropicToOpenAI 只取 thinking 文本并还原成
+   * reasoning_content,不会把占位 signature 发给上游；而缺 signature 时 SDK 会把块判为非法。
    */
   closeThinking() {
     if (this.thinkIndex < 0) return;

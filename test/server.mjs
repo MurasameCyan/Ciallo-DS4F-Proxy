@@ -28,7 +28,10 @@ process.env.GIT_COMMIT = 'a'.repeat(40);
 delete process.env.SUBSCRIPTION_URL;
 delete process.env.API_KEY;
 
-const { NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels } = await import('../server/gateway.mjs');
+const {
+  NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
+  identityHeaders, OPENAI, ANTHROPIC,
+} = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
@@ -87,16 +90,22 @@ await t('clearAll 返回清掉的个数(面板要显示)', () => {
 
 // ── 用量统计 ────────────────────────────────────────────
 
-await t('用量三个维度一起涨,reasoning 从嵌套字段取', () => {
+await t('用量三个维度一起涨,reasoning 和缓存 token 从嵌套字段取', () => {
   const f = path.join(TMP, 'u1.json');
   const u = new UsageTracker(f, () => {});
-  u.record('m1', { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, completion_tokens_details: { reasoning_tokens: 3 } }, true);
+  u.record('m1', {
+    prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
+    completion_tokens_details: { reasoning_tokens: 3 },
+    prompt_tokens_details: { cached_tokens: 4 },
+  }, true);
   u.record('m1', null, false);
   const d = u.getStats();
   assert.equal(d.total.requests, 2);
   assert.equal(d.total.success, 1);
   assert.equal(d.total.fail, 1);
   assert.equal(d.total.reasoningTokens, 3);
+  assert.equal(d.total.cacheReadTokens, 4);
+  assert.equal(d.byModel.m1.cacheReadTokens, 4);
   assert.equal(d.byModel.m1.requests, 2);
   assert.equal(Object.values(d.byDay)[0].totalTokens, 15);
   assert.ok(fs.existsSync(f), '应落盘,重启不丢');
@@ -124,6 +133,306 @@ await t('reset 把三个维度一起清空,并且落盘', () => {
   assert.ok(d.startTime >= t0, '运行时长从清零那一刻重算');
   // 重新读一遍文件:清零必须落盘,否则重启一次数字又回来了
   assert.equal(new UsageTracker(f, () => {}).getStats().total.requests, 0);
+});
+
+// ── 节点尝试口径(byNode)────────────────────────────────
+
+await t('recordAttempt 按结果分类,四类互斥只加一个', () => {
+  const u = new UsageTracker(path.join(TMP, 'n1.json'), () => {});
+  u.recordAttempt('A', 'success', { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 });
+  u.recordAttempt('A', 'rateLimited');
+  u.recordAttempt('B', 'timeout');
+  const d = u.getStats().byNode;
+  assert.equal(d.A.requests, 2);
+  assert.equal(d.A.success, 1);
+  assert.equal(d.A.rateLimited, 1);
+  assert.equal(d.A.timeout, 0, '分类互斥:一次尝试只能落一个桶');
+  assert.equal(d.A.totalTokens, 14);
+  assert.equal(d.B.timeout, 1);
+  assert.equal(d.B.requests, 1);
+});
+
+await t('recordAttempt 认不出的结果类型直接抛(拼错字段会静默丢数)', () => {
+  const u = new UsageTracker(path.join(TMP, 'n2.json'), () => {});
+  assert.throws(() => u.recordAttempt('A', 'rate_limited'), /未知的节点尝试结果/);
+  u.recordAttempt(null, 'success');   // 没节点名时安静跳过,不该崩
+  assert.deepEqual(u.getStats().byNode.A ? Object.keys(u.getStats().byNode.A) : [], [],
+    '抛之前 requests 已经加过了也没关系,但不能凭空多出一个桶');
+});
+
+await t('缓存 token 三种写法都认得(上游把底层模型的 usage 原样带出来)', () => {
+  const u = new UsageTracker(path.join(TMP, 'n3.json'), () => {});
+  u.recordAttempt('oai', 'success', { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 60 } });
+  u.recordAttempt('ant', 'success', { prompt_tokens: 100, cache_read_input_tokens: 40, cache_creation_input_tokens: 25 });
+  u.recordAttempt('none', 'success', { prompt_tokens: 100, completion_tokens: 5 });
+  const d = u.getStats().byNode;
+  assert.equal(d.oai.cacheReadTokens, 60);
+  assert.equal(d.ant.cacheReadTokens, 40);
+  assert.equal(d.ant.cacheWriteTokens, 25);
+  assert.equal(d.none.cacheReadTokens, 0, '上游没给就是 0 —— 命中率那边靠分母判「无数据」');
+});
+
+await t('旧 usage.json 没有 byNode 也能加载,不做破坏性迁移', () => {
+  const f = path.join(TMP, 'old.json');
+  fs.writeFileSync(f, JSON.stringify({
+    total: { requests: 7, success: 6, fail: 1, promptTokens: 70, completionTokens: 30, reasoningTokens: 0, totalTokens: 100 },
+    byDay: { '2026-01-01': { requests: 7 } },
+    byModel: { 'deepseek-v4-flash-free': { requests: 7 } },
+    lastRequest: 1735689600000, startTime: 1735689000000,
+  }));
+  const u = new UsageTracker(f, () => {});
+  const d = u.getStats();
+  assert.equal(d.total.requests, 7, '历史数据必须留着');
+  assert.equal(d.byModel['deepseek-v4-flash-free'].requests, 7, '不重写历史模型名');
+  assert.equal(d.startTime, 1735689000000);
+  assert.deepEqual(d.byNode, {}, '缺的那个补空对象就行,编不出历史的按节点数据');
+  u.recordAttempt('A', 'success');
+  assert.equal(u.getStats().byNode.A.requests, 1, '补完之后照常能记');
+});
+
+await t('旧节点桶缺少新增字段时归一化,后续累加不产生 null', () => {
+  const f = path.join(TMP, 'old-node.json');
+  fs.writeFileSync(f, JSON.stringify({
+    total: { requests: 1, success: 1, fail: 0 }, byDay: {}, byModel: {},
+    byNode: { A: { requests: 1, success: 1, promptTokens: 10 } },
+    lastRequest: null, startTime: 123,
+  }));
+  const u = new UsageTracker(f, () => {});
+  u.recordAttempt('A', 'success', { prompt_tokens: 5, completion_tokens: 2 });
+  const a = u.getStats().byNode.A;
+  assert.equal(a.requests, 2);
+  assert.equal(a.completionTokens, 2);
+  assert.equal(a.cacheReadTokens, 0);
+  assert.equal(a.hasCacheData, false);
+});
+
+await t('缓存字段明确返回 0 与完全缺失能区分', () => {
+  const u = new UsageTracker(path.join(TMP, 'cache-presence.json'), () => {});
+  u.recordAttempt('missing', 'success', { prompt_tokens: 10 });
+  u.recordAttempt('zero', 'success', {
+    prompt_tokens: 10, prompt_tokens_details: { cached_tokens: 0 },
+  });
+  assert.equal(u.getStats().byNode.missing.hasCacheData, false);
+  assert.equal(u.getStats().byNode.zero.hasCacheData, true);
+});
+
+await t('清零把 byNode 一起清(只清一半会让两套口径对不上)', () => {
+  const f = path.join(TMP, 'n4.json');
+  const u = new UsageTracker(f, () => {});
+  u.recordAttempt('A', 'success', { prompt_tokens: 1, total_tokens: 1 });
+  u.record('m', { prompt_tokens: 1, total_tokens: 1 }, true);
+  u.reset();
+  assert.deepEqual(u.getStats().byNode, {});
+  assert.deepEqual(new UsageTracker(f, () => {}).getStats().byNode, {}, '清零得落盘');
+});
+
+// ── OpenCode 身份头 ─────────────────────────────────────
+
+await t('身份头:缺的补默认值,客户端给了的优先', () => {
+  const h = identityHeaders({ headers: { 'x-opencode-project': 'my-proj' } }, () => 'uuid-1');
+  assert.equal(h['User-Agent'], 'opencode-cli/1.0.0');
+  assert.equal(h['x-opencode-client'], 'cli');
+  assert.equal(h['x-opencode-project'], 'my-proj', '客户端值优先');
+  assert.equal(h['x-opencode-request'], 'uuid-1');
+  assert.equal(h['x-opencode-session'], 'uuid-1');
+  assert.equal(h['x-title'], undefined, '没合理默认值的就别凭空造');
+});
+
+await t('身份头:读入站头大小写不敏感', () => {
+  // Node 收到的 req.headers 本来就是小写,但客户端和测试夹具不一定 ——
+  // 大小写敏感的话「客户端值优先」这条会在真实请求上悄悄失效
+  const h = identityHeaders({ headers: { 'USER-AGENT': 'my-cli/9', 'X-Opencode-Session': ' sess-7 ' } }, () => 'uuid-2');
+  assert.equal(h['User-Agent'], 'my-cli/9');
+  assert.equal(h['x-opencode-session'], 'sess-7', '顺手去掉首尾空白');
+});
+
+await t('身份头:session 依次找三个来源', () => {
+  const a = identityHeaders({ headers: { 'x-session-affinity': 'aff-1' } }, () => 'u');
+  assert.equal(a['x-opencode-session'], 'aff-1');
+  const b = identityHeaders({ headers: { 'x-session-id': 'sid-1' } }, () => 'u');
+  assert.equal(b['x-opencode-session'], 'sid-1');
+  assert.equal(b['x-session-id'], 'sid-1', 'x-session-id 本身也照原样透传');
+});
+
+await t('身份头:不同请求的 request ID 不一样', () => {
+  const a = identityHeaders({ headers: {} });
+  const b = identityHeaders({ headers: {} });
+  assert.notEqual(a['x-opencode-request'], b['x-opencode-request']);
+  assert.match(a['x-opencode-request'], /^[0-9a-f-]{36}$/);
+});
+
+await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
+  const g = new Gateway(load(), () => {});
+  const off = g.reqOpts('{}', { accept: '*/*', timeout: 1000 });
+  assert.equal(off.headers['User-Agent'], 'node');
+  assert.equal(off.headers['x-opencode-client'], undefined);
+  assert.equal(off.headers.Authorization, undefined, '免费端点认的就是「不带 Bearer」这个形态');
+
+  const on = g.reqOpts('{}', { accept: '*/*', timeout: 1000, identity: identityHeaders({ headers: {} }) });
+  assert.equal(on.headers['User-Agent'], 'opencode-cli/1.0.0', '身份头得盖掉默认的 node');
+  assert.equal(on.headers['x-opencode-client'], 'cli');
+  assert.equal(on.headers['Content-Length'], 2, 'Content-Length 排在身份头后面,不能被盖掉');
+});
+
+// ── 两套账在重试循环里怎么分叉 ──────────────────────────
+
+/** attempt() 对 res 只用 writeHead/end/write,不用真起 HTTP 服务就能验状态机 */
+function fakeRes() {
+  const r = { code: 0, chunks: [] };
+  r.writeHead = (c) => { r.code = c; return r; };
+  r.write = (c) => { r.chunks.push(String(c)); return true; };
+  r.end = (c) => { if (c) r.chunks.push(String(c)); r.ended = true; };
+  Object.defineProperty(r, 'body', { get: () => r.chunks.join('') });
+  return r;
+}
+
+/**
+ * 只跑重试循环的 Gateway:出站换成脚本,switchNode 记下换到哪儿并立刻成功
+ * (真的那个要 sleep(1000) 等连接建起来,这里等不起)。
+ * 脚本按「第几次出站」返回:抛 {status} 就是那个错,返回对象就是成功。
+ */
+function retryGateway(file, script) {
+  const g = new Gateway(load(), () => {});
+  g.usage = new UsageTracker(path.join(TMP, file), () => {});
+  g.getCurrentNode = async () => g.cur;
+  g.switchNode = async (name) => { g.cur = name; return true; };
+  g.saveLastNode = () => {};
+  g.tries = [];
+  const run = async () => {
+    const i = g.tries.length;
+    g.tries.push(g.cur);          // 记「这一次出站用的是哪个节点」
+    return script(i, g.cur);
+  };
+  g.forward = run;
+  g.forwardStream = run;
+  return g;
+}
+
+const BODY = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
+
+await t('A 撞 429、B 成功:总览记 1 次成功,两个节点各记自己那一笔', async () => {
+  const g = retryGateway('sm1.json', (i) => {
+    if (i === 0) throw Object.assign(new Error('429'), { status: 429 });
+    return { choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } };
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 200, '客户端最终拿到的是成功');
+  const d = g.usage.getStats();
+  assert.equal(d.total.requests, 1, '客户端口径:换了节点也只算一次请求');
+  assert.equal(d.total.success, 1);
+  assert.equal(d.total.fail, 0, '中途那次 429 不算客户端失败 —— 它最后成功了');
+  assert.equal(d.total.totalTokens, 7);
+  assert.equal(d.byNode.A.requests, 1);
+  assert.equal(d.byNode.A.rateLimited, 1);
+  assert.equal(d.byNode.A.success, 0);
+  assert.equal(d.byNode.A.totalTokens, 0, '被限流的那次没有 token');
+  assert.equal(d.byNode.B.requests, 1);
+  assert.equal(d.byNode.B.success, 1);
+  assert.equal(d.byNode.B.totalTokens, 7, 'token 记在真正干活的那个节点上');
+  assert.deepEqual(g.tries, ['A', 'B']);
+});
+
+await t('同一节点上的网络重试:每次真发出去都记一笔,不是整段算一次', async () => {
+  // 网络错误只重试当前节点(换了也白换),重试满了才换 —— 于是 A 上会有
+  // 3 笔 timeout(首发 + 2 次重试),这正是「按真实上游尝试计」要体现的
+  const g = retryGateway('sm2.json', (i) => {
+    if (i < 3) throw Object.assign(new Error('socket hang up'), { status: 0 });
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 3 } };
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  const d = g.usage.getStats();
+  assert.equal(d.total.requests, 1);
+  assert.equal(d.total.success, 1);
+  assert.equal(d.byNode.A.requests, 3, '首发一次 + 重试两次');
+  assert.equal(d.byNode.A.timeout, 3);
+  assert.equal(d.byNode.B.success, 1);
+  assert.deepEqual(g.tries, ['A', 'A', 'A', 'B']);
+});
+
+await t('全员 429:客户端记 1 次失败,每个节点各记自己被限流那次', async () => {
+  const g = retryGateway('sm3.json', () => {
+    throw Object.assign(new Error('429'), { status: 429 });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 429);
+  const d = g.usage.getStats();
+  assert.equal(d.total.requests, 1);
+  assert.equal(d.total.fail, 1);
+  assert.equal(d.byNode.A.rateLimited, 1);
+  assert.equal(d.byNode.B.rateLimited, 1);
+  assert.equal(Object.keys(d.byNode).length, 2, '没试过的节点不该凭空出现在统计里');
+});
+
+await t('流式首字节之后中断:节点记上游错误、总览记失败,而且不换节点', async () => {
+  // 头都发出去了,换节点等于给客户端拼两半响应 —— 所以这里必须只有一次尝试
+  const g = retryGateway('sm4.json', () => {
+    throw Object.assign(new Error('read ECONNRESET'), { status: 0, notStarted: false });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', true, ANTHROPIC, Date.now() + 60_000);
+
+  const d = g.usage.getStats();
+  assert.equal(d.byNode.A.upstreamError, 1);
+  assert.equal(d.byNode.A.timeout, 0, '首字节之后断了算上游错误,不算超时');
+  assert.equal(d.byNode.B, undefined, '不能换节点重试');
+  assert.equal(d.total.requests, 1);
+  assert.equal(d.total.fail, 1);
+  assert.deepEqual(g.tries, ['A']);
+  assert.ok(res.ended, '得把响应关掉,不然客户端挂到超时');
+});
+
+await t('流式成功:usage 记在节点上,总览也拿到同一份', async () => {
+  const g = retryGateway('sm5.json', () => ({ ok: true, usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 } }));
+  g.cur = 'A';
+  await g.attempt(fakeRes(), BODY, ['A'], 'A', true, ANTHROPIC, Date.now() + 60_000);
+
+  const d = g.usage.getStats();
+  assert.equal(d.byNode.A.success, 1);
+  assert.equal(d.byNode.A.totalTokens, 12);
+  assert.equal(d.total.success, 1);
+  assert.equal(d.total.totalTokens, 12);
+  assert.equal(d.byModel[FREE_MODELS[0]].requests, 1, '按客户端真选的模型记,不是写死那个');
+});
+
+await t('流式中断的节点不锁定,下次请求不能继续优先粘着它', async () => {
+  const g = retryGateway('sm6.json', () => ({ ok: false, usage: null }));
+  g.cur = 'A';
+  await g.attempt(fakeRes(), BODY, ['A'], 'A', true, ANTHROPIC, Date.now() + 60_000);
+
+  assert.equal(g.lockedNode, null);
+  assert.equal(g.usage.getStats().byNode.A.upstreamError, 1);
+});
+
+await t('换节点失败时继续找下一个,不能回头再打刚限流的节点', async () => {
+  const g = retryGateway('sm7.json', (i, node) => {
+    if (i === 0) throw Object.assign(new Error('429'), { status: 429 });
+    assert.equal(node, 'C', 'B 切换失败后应继续尝试 C,不能仍从 A 出站');
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 1 } };
+  });
+  g.cur = 'A';
+  const switched = [];
+  g.switchNode = async (name) => {
+    switched.push(name);
+    if (name === 'B') return false;
+    g.cur = name;
+    return true;
+  };
+
+  await g.attempt(fakeRes(), BODY, ['A', 'B', 'C'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.deepEqual(switched, ['B', 'C']);
+  assert.deepEqual(g.tries, ['A', 'C']);
+  assert.equal(g.usage.getStats().byNode.C.success, 1);
 });
 
 // ── 节点延迟与排序 ──────────────────────────────────────
@@ -568,7 +877,9 @@ await t('/health 不要凭据(docker healthcheck 得进得来)', async () => {
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.ok, true);
-  assert.equal(j.model, 'deepseek-v4-flash-free');
+  // 不再报单一模型名 —— 模型是客户端选的,这里只说清单里有几个
+  assert.equal(j.model, undefined, '固定模型这个概念已经没有了,别让它复活');
+  assert.equal(j.models, FREE_MODELS.length);
 });
 
 await t('匿名:页面跳登录页,/api/* 给 401,而且哪儿都不发 WWW-Authenticate', async () => {
@@ -677,10 +988,11 @@ await t('带对凭据能读到配置和状态', async () => {
   const r = await fetch(`${base}/api/config`, { headers: { authorization: auth } });
   assert.equal(r.status, 200);
   const j = await r.json();
-  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'port', 'subscriptionUrl'], '字段形状是前端契约,不能改');
+  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'opencodeIdentityHeaders', 'port', 'subscriptionUrl'], '字段形状是前端契约,不能改');
+  assert.equal(j.opencodeIdentityHeaders, false, '实验开关默认关');
 
   const s = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
-  assert.equal(s.fixedModel, 'deepseek-v4-flash-free');
+  assert.equal(s.fixedModel, undefined, '固定模型已废,留着这个字段会让前端以为还能靠它');
   assert.equal(s.mihomoRunning, false, '测试环境没有内核,应老实报 false');
   assert.equal(s.gatewayRunning, true);
   // 免费模型清单也搭这趟车。这里出不了站,所以看到的必然是兜底那份 ——
@@ -714,10 +1026,51 @@ await t('没节点时 chat 返回 503 而不是挂住', async () => {
   const r = await fetch(`${base}/v1/chat/completions`, {
     method: 'POST',
     headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] }),
   });
   assert.equal(r.status, 503);
   assert.equal((await r.json()).error.type, 'no_nodes');
+});
+
+// ── 严格模型透传 ────────────────────────────────────────
+
+await t('模型不在免费清单:400 invalid_model,而且一个字节都不出站', async () => {
+  // 这条比「有没有 400」更重要:以前的行为是静默改写成固定模型,
+  // 客户端拿到的是另一个模型的回答却毫不知情
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5-turbo-ultra', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 400, '没节点也该先在这儿挡下 —— 校验在选节点之前');
+  const j = await r.json();
+  assert.equal(j.error.type, 'invalid_model');
+  assert.match(j.error.message, /gpt-5-turbo-ultra/, '得说清是哪个模型被拒了');
+});
+
+await t('缺 model:400,不给默认值顶上', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error.type, 'invalid_request_error');
+});
+
+await t('Anthropic 侧同样挡,但错误体得是 Anthropic 那套', async () => {
+  // invalid_model 是 OpenAI 的说法,Anthropic SDK 读不懂,得映射成
+  // invalid_request_error —— 否则客户端把畸形响应翻译成「模型不存在或没权限」
+  const r = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': cfg.apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: '不存在的模型', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 400);
+  const j = await r.json();
+  assert.equal(j.type, 'error');
+  assert.equal(j.error.type, 'invalid_request_error');
+  assert.match(j.error.message, /不存在的模型/);
 });
 
 await t('POST 改端口无效(不然面板会显示一个连不上的接入地址)', async () => {
@@ -730,6 +1083,64 @@ await t('POST 改端口无效(不然面板会显示一个连不上的接入地�
   assert.equal(r.status, 200);
   assert.equal((await r.json()).port, before, '端口由 compose 映射决定,进程说了不算');
   assert.equal(cfg.port, before);
+});
+
+await t('单独切身份头:已有订阅也不刷新、不测速、不重启内核', async () => {
+  const oldSub = cfg.subscriptionUrl;
+  cfg.subscriptionUrl = 'https://sub.example/existing';
+  let updates = 0, reads = 0, tests = 0;
+  const savedUpdate = gateway.updateProvider;
+  const savedGetAll = gateway.getAllNodes;
+  const savedTest = gateway.testNodes;
+  gateway.updateProvider = async () => { updates++; };
+  gateway.getAllNodes = async () => { reads++; return ['A']; };
+  gateway.testNodes = async () => { tests++; return {}; };
+
+  try {
+    const r = await fetch(`${base}/api/config`, {
+      method: 'POST',
+      headers: { authorization: auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ opencodeIdentityHeaders: true }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).opencodeIdentityHeaders, true);
+    assert.equal(cfg.opencodeIdentityHeaders, true, '同一个 cfg 对象,下一个请求就用上了');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(TMP, 'config.json'), 'utf8')).opencodeIdentityHeaders, true,
+      '得落盘,不然重启就回到关闭');
+    assert.deepEqual({ updates, reads, tests }, { updates: 0, reads: 0, tests: 0 },
+      '请求体没带 subscriptionUrl 时不能借旧地址触发任何订阅操作');
+  } finally {
+    gateway.updateProvider = savedUpdate;
+    gateway.getAllNodes = savedGetAll;
+    gateway.testNodes = savedTest;
+    cfg.subscriptionUrl = oldSub;
+  }
+
+  // 关回去,别影响后面几组
+  await (await fetch(`${base}/api/config`, {
+    method: 'POST',
+    headers: { authorization: auth, 'content-type': 'application/json' },
+    body: JSON.stringify({ opencodeIdentityHeaders: false }),
+  })).text();
+  assert.equal(cfg.opencodeIdentityHeaders, false);
+});
+
+await t('旧 config.json 没有身份头字段也能加载,默认关闭', () => {
+  // 升级上来的实例配置文件里没这个键。缺了得当「关闭」,而不是 undefined ——
+  // undefined 在 reqOpts 那个三元里虽然也走 false 分支,但面板的 checkbox
+  // 会显示成未定态,而且下次保存会把 undefined 写进文件
+  const f = path.join(TMP, 'config.json');
+  const saved = fs.readFileSync(f, 'utf8');
+  const old = JSON.parse(saved);
+  delete old.opencodeIdentityHeaders;
+  fs.writeFileSync(f, JSON.stringify(old));
+  try {
+    const c = load();
+    assert.equal(c.opencodeIdentityHeaders, false, '默认必须是关的 —— 这是个实验开关');
+    assert.equal(c.apiKey, old.apiKey, '其余字段照原样读出来,不重新生成');
+  } finally {
+    fs.writeFileSync(f, saved);
+  }
 });
 
 await t('保存非法订阅地址被挡下', async () => {
@@ -811,7 +1222,7 @@ await t('没节点时 /v1/messages 回 503 且形状正确', async () => {
   const r = await fetch(`${base}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': cfg.apiKey, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'x', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: FREE_MODELS[0], max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   assert.equal(r.status, 503);
   const b = await r.json();
@@ -823,7 +1234,7 @@ await t('messages 为空时 400,而不是打到上游', async () => {
   const r = await fetch(`${base}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': cfg.apiKey, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'x', max_tokens: 10, messages: [] }),
+    body: JSON.stringify({ model: FREE_MODELS[0], max_tokens: 10, messages: [] }),
   });
   assert.equal(r.status, 400);
   assert.equal((await r.json()).error.type, 'invalid_request_error');

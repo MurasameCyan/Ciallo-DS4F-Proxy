@@ -86,6 +86,21 @@ t('assistant 的 tool_use 变成 tool_calls,arguments 是 JSON 字符串', () =>
   assert.deepEqual(JSON.parse(m.tool_calls[0].function.arguments), { path: '/a' });
 });
 
+t('多轮 assistant thinking 原样回传为 reasoning_content', () => {
+  const r = anthropicToOpenAI({
+    messages: [{
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: '先检查文件', signature: 'opaque-signature' },
+        { type: 'tool_use', id: 't1', name: 'read', input: { path: '/a' } },
+      ],
+    }],
+  });
+  assert.equal(r.messages[0].reasoning_content, '先检查文件',
+    'thinking 模式的后续轮次必须把原推理内容交还上游');
+  assert.equal(r.messages[0].tool_calls[0].function.name, 'read');
+});
+
 t('工具结果和文字混在一条消息时,文字排在结果之后', () => {
   const r = anthropicToOpenAI({
     messages: [{
@@ -148,6 +163,30 @@ t('普通回复转成 content 数组 + usage 改名', () => {
   assert.deepEqual(r.content, [{ type: 'text', text: 'hello' }]);
   assert.equal(r.stop_reason, 'end_turn');
   assert.deepEqual(r.usage, { input_tokens: 10, output_tokens: 5 });
+});
+
+t('非流式响应报告客户端实际请求模型,不采用上游别名', () => {
+  const r = openAIToAnthropic({
+    model: 'provider-internal-alias',
+    choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
+  }, 'mimo-v2.5-free');
+  assert.equal(r.model, 'mimo-v2.5-free');
+});
+
+t('非流式 reasoning_content 变成可在下轮回传的 thinking 块', () => {
+  const r = openAIToAnthropic({
+    choices: [{
+      finish_reason: 'tool_calls',
+      message: {
+        reasoning_content: '先查配置',
+        tool_calls: [{ id: 't1', function: { name: 'read', arguments: '{"path":"/a"}' } }],
+      },
+    }],
+  });
+  assert.deepEqual(r.content[0], {
+    type: 'thinking', thinking: '先查配置', signature: 'ciallo-ds4f-proxy',
+  });
+  assert.equal(r.content[1].type, 'tool_use');
 });
 
 t('tool_calls 转回 tool_use,arguments 字符串解析成对象', () => {

@@ -15,7 +15,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
-import { Gateway, FIXED_MODEL, OPENAI, ANTHROPIC, json } from './gateway.mjs';
+import { Gateway, OPENAI, ANTHROPIC, json } from './gateway.mjs';
 import { buildInfo, checkUpdate } from './build.mjs';
 import {
   matches, parseBasic, readCookie, resolveCredentials,
@@ -142,7 +142,8 @@ export function createApp({ cfg, creds, gateway }) {
 
     // healthcheck 不能要凭据:docker healthcheck 不方便带
     if (path === '/health') {
-      return json(res, { ok: true, model: FIXED_MODEL, paused: gateway.paused });
+      // 不再报单一模型名 —— 客户端选什么就转发什么,这里只说清单里有几个
+      return json(res, { ok: true, models: gateway.freeModels().length, paused: gateway.paused });
     }
 
     if (path.startsWith('/v1/')) {
@@ -254,7 +255,6 @@ function makeApiRoutes({ cfg, gateway }) {
         gatewayPort: cfg.port,
         mihomoRunning: version !== null,
         mihomoVersion: version,
-        fixedModel: FIXED_MODEL,
         paused: gateway.paused,
         // 免费模型清单。从上游现拉、缓存 30 分钟,拉不到就是兜底常量 ——
         // 写死在前端的那份已经漏过一个新上线的免费模型
@@ -278,17 +278,26 @@ function makeApiRoutes({ cfg, gateway }) {
     }
 
     if (path === '/api/config' && m === 'GET') {
-      return json(res, { subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port });
+      return json(res, {
+        subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
+        opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
+      });
     }
 
     if (path === '/api/config' && m === 'POST') {
       const b = await readBody(req);
-      const nextSub = b.subscriptionUrl === undefined ? cfg.subscriptionUrl : String(b.subscriptionUrl).trim();
+      const hasSubscription = b.subscriptionUrl !== undefined;
+      const nextSub = hasSubscription ? String(b.subscriptionUrl).trim() : cfg.subscriptionUrl;
       if (nextSub && !/^https?:\/\//i.test(nextSub)) {
         return json(res, { error: '订阅地址得是 http(s):// 开头' }, 400);
       }
-      const subChanged = nextSub !== cfg.subscriptionUrl;
+      const subChanged = hasSubscription && nextSub !== cfg.subscriptionUrl;
       cfg.subscriptionUrl = nextSub;
+      // 身份头只影响出站请求头,不进 mihomo 配置。请求体没带 subscriptionUrl
+      // 时下面的订阅分支一步都不走,即使配置里已经存着旧地址也一样
+      if (b.opencodeIdentityHeaders !== undefined) {
+        cfg.opencodeIdentityHeaders = b.opencodeIdentityHeaders === true;
+      }
 
       // 端口刻意不接受修改。容器对外端口由 compose 的 ports 决定,进程改绑
       // 只会让映射指向一个没人听的地方;而 /api/status 会把新值报给前端,
@@ -305,7 +314,7 @@ function makeApiRoutes({ cfg, gateway }) {
       //               不重启内核也就不会有那几秒 503
       let refreshed = null;
       let speed = null;
-      if (nextSub) {
+      if (hasSubscription && nextSub) {
         if (subChanged) {
           cfgMod.writeMihomoConfig(nextSub);
           log('info', '[sub] 订阅地址已变,重启内核');
@@ -343,6 +352,7 @@ function makeApiRoutes({ cfg, gateway }) {
       }
       return json(res, {
         subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
+        opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
         nodes: refreshed,   // 前端据此提示「刷到了几个节点」,null=没订阅地址
         speed,              // {tested,alive,dead,fastest,ms};null=没测或还没测完
       });
@@ -436,7 +446,7 @@ async function main() {
     server.listen(cfg.port, '0.0.0.0', resolve);
   });
   log('ok', `[gateway] 监听 0.0.0.0:${cfg.port}`);
-  log('info', `[gateway] Model: ${FIXED_MODEL} (固定)`);
+  log('info', `[gateway] 免费模型 ${gateway.freeModels().length} 个,客户端选哪个转发哪个`);
 
   if (creds.generated) {
     // 打在日志里而不是静默放行。docker logs 看一眼就有,

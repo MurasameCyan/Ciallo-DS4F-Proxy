@@ -25,6 +25,7 @@ if (!BASE || !KEY) {
 }
 
 let failed = 0;
+let model = '';
 const ok = (m) => console.log(`  ok  ${m}`);
 const bad = (m) => { failed++; console.log(`  FAIL ${m}`); };
 const note = (m) => console.log(`  ..  ${m}`);
@@ -37,7 +38,7 @@ console.log(`verify-api: ${BASE}\n`);
 try {
   const r = await fetch(`${BASE}/health`, { signal: withTimeout(20_000) });
   const j = await r.json();
-  if (r.status === 200 && j.ok) ok(`/health 通,model=${j.fixedModel || j.model}${j.paused ? ' (paused)' : ''}`);
+  if (r.status === 200 && j.ok) ok(`/health 通,免费模型 ${j.models} 个${j.paused ? ' (paused)' : ''}`);
   else bad(`/health 异常: ${r.status} ${JSON.stringify(j).slice(0, 120)}`);
 } catch (e) {
   bad(`/health 连不上: ${e.message} —— 后面的检查无意义`);
@@ -51,11 +52,21 @@ for (const [label, headers] of [
 ]) {
   try {
     const r = await fetch(`${BASE}/v1/models`, { headers, signal: withTimeout(20_000) });
-    await r.text();
-    if (r.status === 200) ok(`${label} 能过`);
-    else bad(`${label} 被拒(${r.status})—— 这类客户端会把它显示成「模型不存在」`);
+    const text = await r.text();
+    if (r.status === 200) {
+      ok(`${label} 能过`);
+      if (!model) {
+        try { model = JSON.parse(text)?.data?.[0]?.id || ''; } catch {}
+      }
+    } else bad(`${label} 被拒(${r.status})—— 这类客户端会把它显示成「模型不存在」`);
   } catch (e) { bad(`${label} 请求失败: ${e.message}`); }
 }
+
+if (!model) {
+  bad('/v1/models 没有返回可用免费模型,无法继续聊天验证');
+  process.exit(1);
+}
+note(`聊天验证使用模型 ${model}`);
 
 try {
   const r = await fetch(`${BASE}/v1/models`, { headers: { 'x-api-key': 'definitely-wrong' }, signal: withTimeout(20_000) });
@@ -70,7 +81,7 @@ try {
   const r = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
     headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: '只回复数字 2' }] }),
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: '只回复数字 2' }] }),
     signal: withTimeout(TIMEOUT),
   });
   const dt = Date.now() - t0;
@@ -90,7 +101,7 @@ try {
   const r = await fetch(`${BASE}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'x', max_tokens: 64, messages: [{ role: 'user', content: '只回复数字 2' }] }),
+    body: JSON.stringify({ model, max_tokens: 64, messages: [{ role: 'user', content: '只回复数字 2' }] }),
     signal: withTimeout(TIMEOUT),
   });
   const dt = Date.now() - t0;
@@ -115,7 +126,7 @@ try {
   const r = await fetch(`${BASE}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'x', max_tokens: 64, stream: true, messages: [{ role: 'user', content: '数到 3' }] }),
+    body: JSON.stringify({ model, max_tokens: 64, stream: true, messages: [{ role: 'user', content: '数到 3' }] }),
     signal: withTimeout(TIMEOUT),
   });
 
@@ -168,7 +179,7 @@ try {
   const r = await fetch(`${BASE}/v1/messages/count_tokens`, {
     method: 'POST',
     headers: { 'x-api-key': KEY, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hello world' }] }),
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hello world' }] }),
     signal: withTimeout(20_000),
   });
   const j = await r.json();

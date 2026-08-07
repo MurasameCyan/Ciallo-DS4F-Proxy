@@ -28,7 +28,7 @@ export const MIXED_PORT = 17897;
 export const CTRL_PORT = 19090;
 export const POOL_NAME = 'zen-pool';
 
-const DEFAULTS = { subscriptionUrl: '', apiKey: '', port: 9527 };
+const DEFAULTS = { subscriptionUrl: '', apiKey: '', port: 9527, opencodeIdentityHeaders: false };
 
 export function genApiKey() {
   return 'zen-' + crypto.randomBytes(4).toString('hex');
@@ -57,6 +57,9 @@ export function load() {
     ...saved,   // 放最后:已保存的值优先级最高
   };
   cfg.port = Number(process.env.PORT) || Number(cfg.port) || DEFAULTS.port;
+  // 旧 config.json 里没有这个字段,读出来是 undefined —— 归一成布尔,
+  // 免得前端的 toggle 拿到 undefined 显示成不确定状态
+  cfg.opencodeIdentityHeaders = cfg.opencodeIdentityHeaders === true;
 
   if (!cfg.apiKey) {
     cfg.apiKey = genApiKey();
@@ -67,8 +70,9 @@ export function load() {
 
 export function save(cfg) {
   ensureDirs();
-  const { subscriptionUrl = '', apiKey = '', port = 9527 } = cfg;
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify({ subscriptionUrl, apiKey, port }, null, 2), 'utf8');
+  const { subscriptionUrl = '', apiKey = '', port = 9527, opencodeIdentityHeaders = false } = cfg;
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(
+    { subscriptionUrl, apiKey, port, opencodeIdentityHeaders: opencodeIdentityHeaders === true }, null, 2), 'utf8');
 }
 
 /**

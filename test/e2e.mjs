@@ -35,7 +35,10 @@ const ctrl = http.createServer((req, res) => {
 });
 await new Promise((r) => ctrl.listen(CTRL_PORT, '127.0.0.1', r));
 
-const { Gateway } = await import('../server/gateway.mjs');
+const { Gateway, FREE_MODELS } = await import('../server/gateway.mjs');
+// 每个请求都得带一个真在免费清单里的模型 —— 网关现在严格校验,
+// 不在清单里的当场 400 而不出站(见 server.mjs 的「严格模型透传」那几组)
+const MODEL = FREE_MODELS[0];
 const { createApp } = await import('../server/index.mjs');
 const cfgMod = await import('../server/config.mjs');
 
@@ -58,10 +61,11 @@ gw.forward = async () => ({
 });
 gw.forwardStream = async (res, body, dialect) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-  const sink = dialect.sink(res);
+  const sink = dialect.sink(res, body.model);
   for (const c of STREAM_CHUNKS) sink.write(`data: ${JSON.stringify(c)}\n\n`);
   sink.write('data: [DONE]\n\n');
   sink.end();
+  return { ok: true, usage: STREAM_CHUNKS.at(-1).usage };
 };
 
 const app = createApp({ cfg, creds: { user: 'a', pass: 'p' }, gateway: gw });
@@ -77,7 +81,7 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   const r = await fetch(`${base}/v1/chat/completions`, {
     method: 'POST',
     headers: { authorization: 'Bearer k', 'content-type': 'application/json' },
-    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const j = await r.json();
   j.choices?.[0]?.message?.content === '2'
@@ -90,7 +94,7 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   const r = await fetch(`${base}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
-    body: JSON.stringify({ max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const j = await r.json();
   const good = j.type === 'message' && j.content?.[0]?.text === '2' && j.usage?.input_tokens === 3;
@@ -102,7 +106,7 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   const r = await fetch(`${base}/v1/chat/completions`, {
     method: 'POST',
     headers: { authorization: 'Bearer k', 'content-type': 'application/json' },
-    body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const body = await r.text();
   body.includes('data: {') && body.includes('[DONE]') && !body.includes('event: ')
@@ -115,13 +119,16 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   const r = await fetch(`${base}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
-    body: JSON.stringify({ stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const body = await r.text();
   const events = [...body.matchAll(/^event: (.+)$/gm)].map((m) => m[1].trim());
   const text = [...body.matchAll(/"text_delta","text":"([^"]*)"/g)].map((m) => m[1]).join('');
 
   events[0] === 'message_start' ? ok('流式:message_start 打头') : no(`流式首事件是 ${events[0]}`);
+  body.includes(`\"model\":\"${MODEL}\"`)
+    ? ok('流式:message_start 报告客户端实际请求模型')
+    : no(`流式 message_start 没报告客户端模型 ${MODEL}`);
   events.at(-1) === 'message_stop' ? ok('流式:message_stop 收尾') : no(`流式末事件是 ${events.at(-1)}`);
 
   const opens = events.filter((e) => e === 'content_block_start').length;
@@ -143,19 +150,20 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   const saved = gw.forwardStream;
   gw.forwardStream = async (res, body, dialect) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-    const sink = dialect.sink(res);
+    const sink = dialect.sink(res, body.model);
     for (const s of ['让我', '想想']) {
       sink.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: s } }] })}\n\n`);
     }
     sink.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '答案' } }], usage: { completion_tokens: 7 } })}\n\n`);
     sink.write('data: [DONE]\n\n');
     sink.end();
+    return { ok: true, usage: { completion_tokens: 7 } };
   };
 
   const r = await fetch(`${base}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
-    body: JSON.stringify({ stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const body = await r.text();
   const events = [...body.matchAll(/^event: (.+)$/gm)].map((m) => m[1].trim());
@@ -183,7 +191,7 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   const p = fetch(`${base}/v1/messages`, {
     method: 'POST', signal: ac.signal,
     headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
-    body: JSON.stringify({ stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   }).catch(() => null);
   ac.abort();
   await p;
@@ -200,16 +208,17 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   gw.forwardStream = async (res, body, dialect) => {
     calls++;
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-    const sink = dialect.sink(res);
+    const sink = dialect.sink(res, body.model);
     sink.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '半句' } }] })}\n\n`);
     // 模拟 forwardStream 内部「started 之后出错」的收尾路径
     sink.fail('upstream died mid-stream');
+    return { ok: false, usage: null };
   };
 
   const r = await fetch(`${base}/v1/messages`, {
     method: 'POST',
     headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
-    body: JSON.stringify({ stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const body = await r.text();
   const events = [...body.matchAll(/^event: (.+)$/gm)].map((m) => m[1].trim());
