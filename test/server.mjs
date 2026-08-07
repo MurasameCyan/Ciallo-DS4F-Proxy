@@ -36,7 +36,8 @@ const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs'
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
-const { createApp } = await import('../server/index.mjs');
+const indexMod = await import('../server/index.mjs');
+const { createApp, createSubscriptionUpdater } = indexMod;
 
 let n = 0;
 const t = async (name, fn) => { await fn(); n++; console.log(`  ok  ${name}`); };
@@ -618,6 +619,8 @@ await t('yaml 含 provider、select 组和两条规则', () => {
   assert.ok(!/GEOIP|GEOSITE/.test(y), '不能引入 geo 规则,否则镜像得带 geoip.dat');
   assert.match(y, /mixed-port: 17897/);
   assert.match(y, /external-controller: 127\.0\.0\.1:19090/);
+  assert.match(y, /proxy-providers:[\s\S]*?airport:[\s\S]*?interval: 0\b/,
+    'provider 的周期更新应由网关唯一调度,避免更新后漏测速或双重刷新');
 });
 
 await t('不含 DNS fallback,否则内核会去下 MMDB', () => {
@@ -647,6 +650,93 @@ await t('首次 load 自动生成并落盘 apiKey', () => {
   const again = load();
   assert.equal(again.apiKey, cfg.apiKey, '第二次读应拿到同一个 Key,不能每次重启都换');
   assert.notEqual(genApiKey(), genApiKey());
+});
+
+await t('自动更新小时数默认一小时、合法值持久化、旧配置兼容', async () => {
+  const f = path.join(TMP, 'config.json');
+  const saved = fs.readFileSync(f, 'utf8');
+  try {
+    const old = JSON.parse(saved);
+    delete old.subscriptionUpdateHours;
+    fs.writeFileSync(f, JSON.stringify(old));
+    assert.equal(load().subscriptionUpdateHours, 1, '旧版原本每小时自动更新,升级后不能静默关闭');
+
+    const c = load();
+    c.subscriptionUpdateHours = 6;
+    const { save } = await import('../server/config.mjs');
+    save(c);
+    assert.equal(load().subscriptionUpdateHours, 6, '小时数必须落盘,重启后不能丢');
+  } finally {
+    fs.writeFileSync(f, saved);
+  }
+});
+
+await t('自动更新调度:按小时触发,每次更新后自动测速,重排时取消旧计划', async () => {
+  const scheduled = [];
+  const cleared = [];
+  const logs = [];
+  const fakeGateway = {
+    updateProvider: async () => { logs.push('update'); },
+    getAllNodes: async () => { logs.push('nodes'); return ['A', 'B']; },
+    testNodes: async () => { logs.push('speed'); return { tested: 2, alive: 2 }; },
+  };
+  const updater = createSubscriptionUpdater({
+    cfg: { subscriptionUrl: 'https://sub.example/a', subscriptionUpdateHours: 2 },
+    gateway: fakeGateway,
+    logger: (level, msg) => logs.push(`${level}:${msg}`),
+    setTimer: (fn, ms) => { const h = { fn, ms }; scheduled.push(h); return h; },
+    clearTimer: (h) => cleared.push(h),
+  });
+
+  updater.schedule();
+  assert.equal(scheduled[0].ms, 2 * 3600_000);
+  await scheduled[0].fn();
+  assert.deepEqual(logs.filter((x) => ['update', 'nodes', 'speed'].includes(x)), ['update', 'nodes', 'speed'],
+    '自动更新的固定顺序应为重拉订阅、读取新节点、自动测速');
+  assert.equal(scheduled.length, 2, '执行完要安排下一个周期');
+
+  updater.schedule(4);
+  assert.equal(cleared.at(-1), scheduled[1], '修改周期时必须取消旧计划');
+  assert.equal(scheduled.at(-1).ms, 4 * 3600_000);
+
+  updater.schedule(8760);
+  assert.ok(scheduled.at(-1).ms <= 2_147_000_000,
+    'Node 的 setTimeout 超过约 24.8 天会溢出,长周期必须分段等待');
+  updater.stop();
+  assert.equal(cleared.at(-1), scheduled.at(-1));
+});
+
+await t('自动更新关闭、无订阅、更新失败时行为可控', async () => {
+  let scheduled = 0, speed = 0;
+  const cfg = { subscriptionUrl: '', subscriptionUpdateHours: 3 };
+  const updater = createSubscriptionUpdater({
+    cfg,
+    gateway: { updateProvider: async () => { throw new Error('down'); }, getAllNodes: async () => ['A'], testNodes: async () => { speed++; } },
+    logger: () => {},
+    setTimer: () => { scheduled++; return {}; },
+    clearTimer: () => {},
+  });
+  updater.schedule();
+  assert.equal(scheduled, 0, '没有订阅地址时不应启动空转定时器');
+  cfg.subscriptionUrl = 'https://sub.example/a';
+  updater.schedule(0);
+  assert.equal(scheduled, 0, '0 小时表示关闭');
+  await updater.run();
+  assert.equal(speed, 0, '更新失败后不能拿旧节点表冒充新订阅测速');
+});
+
+await t('自动更新成功后即使节点为空也会自动测速', async () => {
+  let speed = 0;
+  const updater = createSubscriptionUpdater({
+    cfg: { subscriptionUrl: 'https://sub.example/a', subscriptionUpdateHours: 1 },
+    gateway: {
+      updateProvider: async () => {}, getAllNodes: async () => [],
+      testNodes: async () => { speed++; return { tested: 0, alive: 0 }; },
+    },
+    logger: () => {},
+  });
+  await updater.run();
+  assert.equal(speed, 1, '每次更新都必须紧接自动测速,空节点也不能跳过');
 });
 
 // ── 鉴权 ────────────────────────────────────────────────
@@ -856,7 +946,11 @@ const gateway = new Gateway(cfg, () => {});
 // 别让测试真的出站去拉模型清单:/api/status 每次都会顺手起一次刷新,
 // 有没有内核、能不能连上游都不该影响断言
 gateway.upstreamGet = async () => { throw new Error('测试不出站'); };
-const app = createApp({ cfg, creds, gateway });
+const subscriptionSchedules = [];
+const app = createApp({
+  cfg, creds, gateway,
+  subscriptionUpdater: { schedule: (hours) => subscriptionSchedules.push(hours) },
+});
 await new Promise((r) => app.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${app.address().port}`;
 const auth = 'Basic ' + Buffer.from('tester:test-pass').toString('base64');
@@ -988,8 +1082,9 @@ await t('带对凭据能读到配置和状态', async () => {
   const r = await fetch(`${base}/api/config`, { headers: { authorization: auth } });
   assert.equal(r.status, 200);
   const j = await r.json();
-  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'opencodeIdentityHeaders', 'port', 'subscriptionUrl'], '字段形状是前端契约,不能改');
-  assert.equal(j.opencodeIdentityHeaders, false, '实验开关默认关');
+  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'opencodeIdentityHeaders', 'port', 'subscriptionUpdateHours', 'subscriptionUrl'], '字段形状是前端契约,不能改');
+  assert.equal(j.opencodeIdentityHeaders, false, '请求头开关默认关');
+  assert.equal(j.subscriptionUpdateHours, 1, '保持旧版每小时自动更新的默认行为');
 
   const s = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
   assert.equal(s.fixedModel, undefined, '固定模型已废,留着这个字段会让前端以为还能靠它');
@@ -1097,6 +1192,7 @@ await t('单独切身份头:已有订阅也不刷新、不测速、不重启内�
   gateway.testNodes = async () => { tests++; return {}; };
 
   try {
+    const beforeSchedules = subscriptionSchedules.length;
     const r = await fetch(`${base}/api/config`, {
       method: 'POST',
       headers: { authorization: auth, 'content-type': 'application/json' },
@@ -1109,6 +1205,8 @@ await t('单独切身份头:已有订阅也不刷新、不测速、不重启内�
       '得落盘,不然重启就回到关闭');
     assert.deepEqual({ updates, reads, tests }, { updates: 0, reads: 0, tests: 0 },
       '请求体没带 subscriptionUrl 时不能借旧地址触发任何订阅操作');
+    assert.equal(subscriptionSchedules.length, beforeSchedules,
+      '只切请求头不能重排自动更新,否则下一次更新时间会被无故向后顺延');
   } finally {
     gateway.updateProvider = savedUpdate;
     gateway.getAllNodes = savedGetAll;
@@ -1143,14 +1241,57 @@ await t('旧 config.json 没有身份头字段也能加载,默认关闭', () => 
   }
 });
 
-await t('保存非法订阅地址被挡下', async () => {
-  const r = await fetch(`${base}/api/config`, {
-    method: 'POST',
-    headers: { authorization: auth, 'content-type': 'application/json' },
-    body: JSON.stringify({ subscriptionUrl: 'ftp://nope' }),
+await t('保存非法订阅地址和自动更新小时数被挡下', async () => {
+  for (const body of [
+    { subscriptionUrl: 'ftp://nope' },
+    { subscriptionUpdateHours: -1 },
+    { subscriptionUpdateHours: 1.5 },
+    { subscriptionUpdateHours: 8761 },
+  ]) {
+    const r = await fetch(`${base}/api/config`, {
+      method: 'POST',
+      headers: { authorization: auth, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(r.status, 400, JSON.stringify(body));
+    await r.text();
+  }
+
+  const before = cfg.opencodeIdentityHeaders;
+  const mixed = await fetch(`${base}/api/config`, {
+    method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
+    body: JSON.stringify({ opencodeIdentityHeaders: !before, subscriptionUpdateHours: -1 }),
   });
-  assert.equal(r.status, 400);
-  await r.text();
+  assert.equal(mixed.status, 400);
+  await mixed.text();
+  assert.equal(cfg.opencodeIdentityHeaders, before, '请求有非法字段时不能先应用同请求里的其他配置');
+});
+
+await t('保存自动更新小时数立即重排,且不刷新订阅或测速', async () => {
+  const seen = [];
+  const localCfg = { ...cfg, subscriptionUrl: 'https://sub.example/existing', subscriptionUpdateHours: 0 };
+  const localGateway = new Gateway(localCfg, () => {});
+  let updates = 0, tests = 0;
+  localGateway.updateProvider = async () => { updates++; };
+  localGateway.testNodes = async () => { tests++; };
+  const localApp = createApp({
+    cfg: localCfg, creds, gateway: localGateway,
+    subscriptionUpdater: { schedule: (hours) => seen.push(hours) },
+  });
+  await new Promise((r) => localApp.listen(0, '127.0.0.1', r));
+  try {
+    const localBase = `http://127.0.0.1:${localApp.address().port}`;
+    const r = await fetch(`${localBase}/api/config`, {
+      method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ subscriptionUpdateHours: 12 }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).subscriptionUpdateHours, 12);
+    assert.deepEqual(seen, [12]);
+    assert.deepEqual({ updates, tests }, { updates: 0, tests: 0 }, '保存周期本身不能立刻重拉,只重排下一次计划');
+  } finally {
+    await new Promise((r) => localApp.close(r));
+  }
 });
 
 await t('换 Key 立刻生效,旧 Key 立刻失效', async () => {

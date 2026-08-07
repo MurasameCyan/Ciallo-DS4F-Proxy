@@ -42,7 +42,8 @@ const NODES = [
 const state = {
   cfg: {
     subscriptionUrl: 'https://demo.example.com/subscribe?token=preview',
-    apiKey: 'zen-a1b2c3d4', port: 9527, opencodeIdentityHeaders: false,
+    apiKey: 'zen-a1b2c3d4', port: 9527,
+    opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
   },
   build: '9dfba56',
   hasUpdate: false,
@@ -265,7 +266,13 @@ async function handleApi(req, res, path) {
     if (b.port !== undefined) state.cfg.port = Number(b.port) || state.cfg.port;
     if (b.opencodeIdentityHeaders !== undefined) {
       state.cfg.opencodeIdentityHeaders = b.opencodeIdentityHeaders === true;
-      log('info', `[config] OpenCode 身份头${state.cfg.opencodeIdentityHeaders ? '已开启(实验)' : '已关闭'}`);
+      log('info', `[config] OpenCode 请求头${state.cfg.opencodeIdentityHeaders ? '已开启' : '已关闭'}`);
+    }
+    if (b.subscriptionUpdateHours !== undefined) {
+      state.cfg.subscriptionUpdateHours = Number(b.subscriptionUpdateHours) || 0;
+      log('info', state.cfg.subscriptionUpdateHours
+        ? `[sub-auto] 每 ${state.cfg.subscriptionUpdateHours} 小时自动更新并测速`
+        : '[sub-auto] 自动更新已关闭');
     }
     log('info', '[config] 已保存');
     if (b.subscriptionUrl === undefined) {

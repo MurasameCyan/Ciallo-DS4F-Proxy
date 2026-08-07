@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
-  fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, configPayload,
+  fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, configPayload, updateHours,
 } from '../web/core.js';
 
 let n = 0;
@@ -227,19 +227,32 @@ t('hasNewer 只在两个 hash 都有且不同时才亮', () => {
   assert.equal(hasNewer('c31f0a8', ''), false, '本地 hash 未知时新旧无从判断');
 });
 
-t('配置提交:只改身份头时省略订阅,主动保存时保留订阅以强制刷新', () => {
+t('配置提交:只改开关或周期时省略订阅,主动保存时保留订阅以强制刷新', () => {
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
-    savedIdentity: false, identity: true,
-  }), { opencodeIdentityHeaders: true });
+    savedIdentity: false, identity: true, savedUpdateHours: 0, updateHours: 0,
+  }), { opencodeIdentityHeaders: true, subscriptionUpdateHours: 0 });
+  assert.deepEqual(configPayload({
+    savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
+    savedIdentity: false, identity: false, savedUpdateHours: 0, updateHours: 6,
+  }), { opencodeIdentityHeaders: false, subscriptionUpdateHours: 6 });
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/b',
-    savedIdentity: false, identity: false,
-  }), { subscriptionUrl: 'https://sub.example/b', opencodeIdentityHeaders: false });
+    savedIdentity: false, identity: false, savedUpdateHours: 0, updateHours: 0,
+  }), { subscriptionUrl: 'https://sub.example/b', opencodeIdentityHeaders: false, subscriptionUpdateHours: 0 });
   assert.deepEqual(configPayload({
     savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
-    savedIdentity: false, identity: false,
-  }), { subscriptionUrl: 'https://sub.example/a', opencodeIdentityHeaders: false });
+    savedIdentity: false, identity: false, savedUpdateHours: 0, updateHours: 0,
+  }), { subscriptionUrl: 'https://sub.example/a', opencodeIdentityHeaders: false, subscriptionUpdateHours: 0 });
+});
+
+t('自动更新小时数只接受 0 或正整数', () => {
+  assert.equal(updateHours(''), 0);
+  assert.equal(updateHours('0'), 0);
+  assert.equal(updateHours('6'), 6);
+  assert.equal(updateHours('1.5'), null);
+  assert.equal(updateHours('-1'), null);
+  assert.equal(updateHours('8761'), null);
 });
 
 // ── 节点统计 ────────────────────────────────────────────
@@ -333,20 +346,38 @@ t('节点统计使用默认关闭且结构完整的原生折叠', () => {
 
 t('节点统计合计不显示请求级与尝试级口径说明', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   assert.ok(!app.includes('一次客户端请求换几个节点就记几笔'));
   assert.ok(!app.includes('故大于顶部请求总数'));
+  // HTML 里那份是渲染前占位,写死文案会在首帧闪出来,所以也不能留
+  assert.ok(!html.includes('各记一笔'), '首帧占位不能写死口径说明');
+  assert.match(html, /id="nstat-sum"[^>]*>\s*<\/span>/, '合计占位应为空,由 JS 填充');
 });
 
 t('OpenCode 请求头开启状态使用绿色标签', () => {
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const label = html.match(/<label\b[^>]*for="f-identity"[^>]*>([\s\S]*?)<\/label>/)?.[1] || '';
   const checked = css.match(/\.chk\.toggle input:checked ~ \.tag\s*\{([^}]*)\}/)?.[1] || '';
 
   assert.match(label, /<span>OpenCode 请求头<\/span>/);
   assert.doesNotMatch(label, /OpenCode 身份头/);
+  assert.match(app, /checked\s*\?\s*'开启'\s*:\s*'关闭'/);
+  assert.doesNotMatch(app, /checked\s*\?\s*'实验中'/);
   assert.match(checked, /color:\s*var\(--mint-dim\)/);
   assert.match(checked, /border-color:[^;]*var\(--mint\)/);
+  assert.ok(!html.includes('实验:出站补一组 OpenCode CLI 的身份头'), '指定说明文本应移除');
+});
+
+t('配置卡提供小时制自动更新订阅输入', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const field = html.match(/<label\b[^>]*>[\s\S]*?自动更新订阅[\s\S]*?<\/label>/)?.[0] || '';
+  assert.match(field, /for="f-sub-hours"|id="f-sub-hours"/);
+  assert.match(field, /type="number"/);
+  assert.match(field, /min="0"/);
+  assert.match(field, /step="1"/);
+  assert.match(field, /小时/);
 });
 
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);

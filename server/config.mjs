@@ -28,7 +28,10 @@ export const MIXED_PORT = 17897;
 export const CTRL_PORT = 19090;
 export const POOL_NAME = 'zen-pool';
 
-const DEFAULTS = { subscriptionUrl: '', apiKey: '', port: 9527, opencodeIdentityHeaders: false };
+const DEFAULTS = {
+  subscriptionUrl: '', apiKey: '', port: 9527,
+  opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
+};
 
 export function genApiKey() {
   return 'zen-' + crypto.randomBytes(4).toString('hex');
@@ -60,6 +63,9 @@ export function load() {
   // 旧 config.json 里没有这个字段,读出来是 undefined —— 归一成布尔,
   // 免得前端的 toggle 拿到 undefined 显示成不确定状态
   cfg.opencodeIdentityHeaders = cfg.opencodeIdentityHeaders === true;
+  const hours = Number(cfg.subscriptionUpdateHours);
+  cfg.subscriptionUpdateHours = Number.isInteger(hours) && hours >= 0 && hours <= 8760
+    ? hours : DEFAULTS.subscriptionUpdateHours;
 
   if (!cfg.apiKey) {
     cfg.apiKey = genApiKey();
@@ -70,9 +76,15 @@ export function load() {
 
 export function save(cfg) {
   ensureDirs();
-  const { subscriptionUrl = '', apiKey = '', port = 9527, opencodeIdentityHeaders = false } = cfg;
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(
-    { subscriptionUrl, apiKey, port, opencodeIdentityHeaders: opencodeIdentityHeaders === true }, null, 2), 'utf8');
+  const {
+    subscriptionUrl = '', apiKey = '', port = 9527,
+    opencodeIdentityHeaders = false, subscriptionUpdateHours = 1,
+  } = cfg;
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify({
+    subscriptionUrl, apiKey, port,
+    opencodeIdentityHeaders: opencodeIdentityHeaders === true,
+    subscriptionUpdateHours,
+  }, null, 2), 'utf8');
 }
 
 /**
@@ -117,7 +129,8 @@ proxy-providers:
     type: http
     url: ${url}
     path: ./providers/airport.yaml
-    interval: 3600
+    # 周期更新由网关负责,这样每次更新后都能紧接着自动测速。
+    interval: 0
     health-check:
       enable: true
       # lazy:没请求走这个组时不主动测延迟。不然十几个节点每 5 分钟测一轮,

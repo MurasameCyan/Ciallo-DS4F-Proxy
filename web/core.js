@@ -188,12 +188,22 @@ export function rankBreakdown(map, limit = 5) {
  * 生成配置提交体。只切身份头时省略没变的订阅地址，避免服务端把它解释为
  * 「用户明确保存订阅」并强制重拉；点击保存且订阅变更/明确强制时仍发送地址。
  */
+export function updateHours(value) {
+  if (value === '') return 0;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 && n <= 8760 ? n : null;
+}
+
 export function configPayload({
   savedUrl = '', url = '', savedIdentity = false, identity = false,
+  savedUpdateHours = 0, updateHours: hours = 0,
 } = {}) {
-  const out = { opencodeIdentityHeaders: identity === true };
-  // 只改开关时不碰订阅；否则点击「保存并应用」仍保持原有的强制刷新语义。
-  if (url !== savedUrl || identity === savedIdentity) out.subscriptionUrl = url;
+  const out = {
+    opencodeIdentityHeaders: identity === true,
+    subscriptionUpdateHours: hours,
+  };
+  // 只改开关或周期时不碰订阅；否则点击「保存并应用」仍保持原有的强制刷新语义。
+  if (url !== savedUrl || (identity === savedIdentity && hours === savedUpdateHours)) out.subscriptionUrl = url;
   return out;
 }
 

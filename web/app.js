@@ -9,7 +9,7 @@ import {
   LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
-  fmtDelay, delayGrade, fmtAgo, hasNewer, nodeStats, configPayload,
+  fmtDelay, delayGrade, fmtAgo, hasNewer, nodeStats, configPayload, updateHours,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -307,6 +307,8 @@ async function refresh() {
     // 开关同理:用户刚点完还没提交时别被轮询拨回去
     const idt = $('f-identity');
     if (document.activeElement !== idt) idt.checked = S.cfg.opencodeIdentityHeaders === true;
+    const hours = $('f-sub-hours');
+    if (document.activeElement !== hours) hours.value = S.cfg.subscriptionUpdateHours || 0;
     syncIdentityTag();
   } catch (e) {
     setPill($('pill-node'), 'down', '连接不上后端');
@@ -356,9 +358,9 @@ async function run(btn, label, fn) {
   }
 }
 
-/** checkbox 旁边那个「关闭 / 实验中」标签。颜色靠 CSS 的 :checked,这里只管文字 */
+/** checkbox 旁边那个「关闭 / 开启」标签。颜色靠 CSS 的 :checked,这里只管文字 */
 function syncIdentityTag() {
-  $('f-identity-state').textContent = $('f-identity').checked ? '实验中' : '关闭';
+  $('f-identity-state').textContent = $('f-identity').checked ? '开启' : '关闭';
 }
 
 function wire() {
@@ -436,9 +438,15 @@ function wire() {
       err.hidden = false;
       return;
     }
+    const hours = updateHours($('f-sub-hours').value.trim());
+    if (hours == null) {
+      err.textContent = '自动更新小时数必须是 0 到 8760 的整数，0 表示关闭';
+      err.hidden = false;
+      return;
+    }
     err.hidden = true;
 
-    // 订阅地址 + 身份头开关一起提交。端口不在这张表里 —— 服务端本来也不接受
+    // 订阅地址 + 请求头开关 + 自动更新周期一起提交。端口不在这张表里 —— 服务端本来也不接受
     // 改端口(容器对外端口由 compose 的 ports 定),发过去只会被忽略。
     // 身份头单独切的时候订阅地址没变,服务端那边一步内核操作都不会做。
     run($('btn-save'), '保存', async () => {
@@ -449,6 +457,8 @@ function wire() {
           url,
           savedIdentity: S.cfg.opencodeIdentityHeaders === true,
           identity: $('f-identity').checked,
+          savedUpdateHours: S.cfg.subscriptionUpdateHours || 0,
+          updateHours: hours,
         })),
       });
       if (r?.nodes == null) return '';

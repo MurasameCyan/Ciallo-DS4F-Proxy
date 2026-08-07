@@ -140,8 +140,12 @@
           <span>OpenCode 请求头</span>
           <em class="tag" id="f-identity-state" aria-hidden="true">关闭</em>
         </label>
-        <p class="hint">实验:出站补一组 OpenCode CLI 的身份头,看上游会不会开始给缓存 usage。默认关闭,只影响之后的新请求,不重启内核。</p>
       </div>
+
+      <label class="field" for="f-sub-hours">
+        <span class="lbl">自动更新订阅（小时）</span>
+        <input type="number" id="f-sub-hours" min="0" max="8760" step="1" inputmode="numeric">
+      </label>
 
       <p class="err" id="cfg-err" role="alert" hidden></p>
       <button type="submit" class="btn primary wide" id="btn-save">保存并应用</button>
@@ -197,8 +201,8 @@
     <summary class="nstat-summary">
       <h2 class="card-head" id="h-nstat">
         <span class="nstat-title">节点统计</span>
-        <!-- 这句必须留着:两套口径的数对不上是最容易被当成 bug 的地方 -->
-        <span class="hint" id="nstat-sum">按每次真实上游尝试计 —— 一次客户端请求换了几个节点就在几个节点上各记一笔,所以合计通常大于顶部的请求总数。</span>
+        <!-- 合计由 renderNodeStats() 填,渲染前留空:写死一份文案只会在首帧闪一下 -->
+        <span class="hint" id="nstat-sum"></span>
       </h2>
     </summary>
     <ul class="nstats" id="nstats" aria-label="各节点的上游尝试统计,按尝试次数降序"></ul>

@@ -96,8 +96,8 @@ function isHttps(req) {
  * 建服务但不监听 —— 测试要能在临时端口上把它拉起来,
  * 所以启动副作用(写 mihomo 配置、拉内核)都不放这里。
  */
-export function createApp({ cfg, creds, gateway }) {
-  const api = makeApiRoutes({ cfg, gateway });
+export function createApp({ cfg, creds, gateway, subscriptionUpdater = null }) {
+  const api = makeApiRoutes({ cfg, gateway, subscriptionUpdater });
   const sessions = new Sessions();
   // 登录页和 Basic 共用一个失败计数器 —— 分开的话锁住表单还能拿 Basic 慢慢试
   const guard = new FailWindow();
@@ -225,7 +225,7 @@ export function createApp({ cfg, creds, gateway }) {
 }
 
 /** /api/* 路由。形状与 server/preview.mjs 逐字段对齐,前端一行没改。 */
-function makeApiRoutes({ cfg, gateway }) {
+function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
   /** 重启内核期间把网关暂停,请求收 503 重试,而不是打在半死的代理上 */
   async function withPause(fn) {
     gateway.pause();
@@ -281,6 +281,7 @@ function makeApiRoutes({ cfg, gateway }) {
       return json(res, {
         subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
         opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
+        subscriptionUpdateHours: cfg.subscriptionUpdateHours,
       });
     }
 
@@ -292,18 +293,31 @@ function makeApiRoutes({ cfg, gateway }) {
         return json(res, { error: '订阅地址得是 http(s):// 开头' }, 400);
       }
       const subChanged = hasSubscription && nextSub !== cfg.subscriptionUrl;
+      const oldHours = cfg.subscriptionUpdateHours;
+      let nextHours = oldHours;
+      if (b.subscriptionUpdateHours !== undefined) {
+        nextHours = Number(b.subscriptionUpdateHours);
+        if (!Number.isInteger(nextHours) || nextHours < 0 || nextHours > 8760) {
+          return json(res, { error: '自动更新小时数必须是 0 到 8760 的整数' }, 400);
+        }
+      }
+
+      // 所有字段都验完再修改共享 cfg；否则同一个请求里周期非法、开关合法时，
+      // 虽然回了 400，开关却已经悄悄生效。
       cfg.subscriptionUrl = nextSub;
-      // 身份头只影响出站请求头,不进 mihomo 配置。请求体没带 subscriptionUrl
-      // 时下面的订阅分支一步都不走,即使配置里已经存着旧地址也一样
       if (b.opencodeIdentityHeaders !== undefined) {
         cfg.opencodeIdentityHeaders = b.opencodeIdentityHeaders === true;
       }
+      cfg.subscriptionUpdateHours = nextHours;
 
       // 端口刻意不接受修改。容器对外端口由 compose 的 ports 决定,进程改绑
       // 只会让映射指向一个没人听的地方;而 /api/status 会把新值报给前端,
       // 面板于是把接入地址显示成一个连不上的 host:port。前端那个输入框是
       // readonly,但直接 POST 能绕过去,所以这里也得挡。要换端口改 compose。
       cfgMod.save(cfg);
+      if (hasSubscription || nextHours !== oldHours) {
+        subscriptionUpdater?.schedule(cfg.subscriptionUpdateHours);
+      }
       log('info', '[config] 已保存');
 
       // 「保存」必须真的刷新节点,哪怕地址一个字都没改 —— 机场加减节点、
@@ -353,6 +367,7 @@ function makeApiRoutes({ cfg, gateway }) {
       return json(res, {
         subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
         opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
+        subscriptionUpdateHours: cfg.subscriptionUpdateHours,
         nodes: refreshed,   // 前端据此提示「刷到了几个节点」,null=没订阅地址
         speed,              // {tested,alive,dead,fastest,ms};null=没测或还没测完
       });
@@ -432,6 +447,69 @@ function makeApiRoutes({ cfg, gateway }) {
     return json(res, { error: `Not found: ${m} ${path}` }, 404);
   };
 }
+
+/**
+ * 网关是订阅周期更新的唯一调度源。mihomo provider 的 interval=0，避免同一周期
+ * 双重拉取；在这里更新成功后紧接自动测速，保证两件事不会脱钩。
+ */
+export function createSubscriptionUpdater({
+  cfg, gateway, logger = log,
+  setTimer = setTimeout, clearTimer = clearTimeout,
+}) {
+  const MAX_TIMER_MS = 2_147_000_000;
+  let timer = null;
+  let running = null;
+  let dueAt = 0;
+
+  const stop = () => {
+    if (timer) clearTimer(timer);
+    timer = null;
+    dueAt = 0;
+  };
+
+  const run = async () => {
+    if (running) return running;
+    running = (async () => {
+      try {
+        logger('info', '[sub-auto] 开始更新订阅');
+        await gateway.updateProvider();
+        const nodes = await gateway.getAllNodes();
+        logger(nodes.length ? 'ok' : 'warn', `[sub-auto] 更新完成,${nodes.length} 个节点,开始测速`);
+        await gateway.testNodes();
+      } catch (e) {
+        logger('warn', `[sub-auto] 更新失败: ${e.message}`);
+      } finally {
+        running = null;
+      }
+    })();
+    return running;
+  };
+
+  // 等待时间可能超过 setTimeout 上限,那就分段等:被截断的那一段醒来后按
+  // 剩余时间重排,只有等满整段才真正触发。判断依据是这一段有没有被截断,而
+  // 不是当前时钟 —— 后者在定时器提前醒来时会把一次更新永远推下去。
+  const arm = (left) => {
+    const slice = Math.min(left, MAX_TIMER_MS);
+    timer = setTimer(async () => {
+      if (left > slice) return arm(dueAt - Date.now());
+      await run();
+      schedule(cfg.subscriptionUpdateHours);
+    }, slice);
+    timer.unref?.();
+  };
+
+  const schedule = (hours = cfg.subscriptionUpdateHours) => {
+    stop();
+    const ms = Number(hours) * 3600_000;
+    if (!cfg.subscriptionUrl || !Number.isFinite(ms) || ms <= 0) return;
+    dueAt = Date.now() + ms;
+    arm(ms);
+    logger('info', `[sub-auto] 每 ${hours} 小时自动更新并测速`);
+  };
+
+  return { run, schedule, stop };
+}
+
 // ── 启动 ────────────────────────────────────────────────
 
 async function main() {
@@ -439,7 +517,8 @@ async function main() {
   const cfg = cfgMod.load();
   const creds = resolveCredentials();
   const gateway = new Gateway(cfg, log);
-  const server = createApp({ cfg, creds, gateway });
+  const subscriptionUpdater = createSubscriptionUpdater({ cfg, gateway });
+  const server = createApp({ cfg, creds, gateway, subscriptionUpdater });
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -473,9 +552,11 @@ async function main() {
   } else {
     log('warn', '[config] 还没有订阅地址 —— 打开面板在「配置」里填,或设 SUBSCRIPTION_URL 环境变量');
   }
+  subscriptionUpdater.schedule();
 
   const bye = async (sig) => {
     log('info', `[exit] 收到 ${sig},收尾中`);
+    subscriptionUpdater.stop();
     server.close();
     await mihomo.stop(log);
     process.exit(0);
