@@ -195,11 +195,11 @@
        340px 那一列根本放不下,而且实时状态会被历史数字淹掉。 -->
   <details class="card span3" aria-labelledby="h-nstat">
     <summary class="nstat-summary">
-      <span class="card-head">
-        <span class="nstat-title" id="h-nstat">节点统计</span>
+      <h2 class="card-head" id="h-nstat">
+        <span class="nstat-title">节点统计</span>
         <!-- 这句必须留着:两套口径的数对不上是最容易被当成 bug 的地方 -->
         <span class="hint" id="nstat-sum">按每次真实上游尝试计 —— 一次客户端请求换了几个节点就在几个节点上各记一笔,所以合计通常大于顶部的请求总数。</span>
-      </span>
+      </h2>
     </summary>
     <ul class="nstats" id="nstats" aria-label="各节点的上游尝试统计,按尝试次数降序"></ul>
     <p class="empty" id="nstat-empty" hidden>还没有上游尝试记录 —— 发一次请求就会出现。</p>

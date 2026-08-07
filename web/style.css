@@ -343,8 +343,10 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .nstat-summary .card-head {
   display: inline-flex; width: calc(100% - 20px);
   margin-bottom: 0; vertical-align: middle;
+  font-size: inherit; letter-spacing: normal;
 }
 .nstat-title { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+.nstat-summary .hint { font-weight: 400; }
 details[open] > .nstat-summary { margin-bottom: 13px; }
 
 /* 通栏卡,不限高:行数 == 用过的节点数,比节点池只少不多,而且这张卡在最底下,

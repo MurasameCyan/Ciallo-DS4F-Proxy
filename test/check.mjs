@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
-  COOLDOWN_MS, MAX_LOG, fmtUptime, fmtClock, successRate, fmtPercent,
+  COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
   fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, configPayload,
 } from '../web/core.js';
@@ -200,6 +200,10 @@ t('掩码保留头尾 4 位,中段不泄漏长度', () => {
 
 // ── 其他 ────────────────────────────────────────────────
 
+t('fmtTokens 空值显示 0', () => {
+  assert.equal(fmtTokens(undefined), '0');
+});
+
 t('endpointBase 原样沿用当前地址,不拼进程端口', () => {
   assert.equal(endpointBase('http://ds4f.example.com'), 'http://ds4f.example.com/v1',
     '反代在 80 上时不能凭空补 :9527,那个地址外面连不上');
@@ -300,19 +304,31 @@ t('nodeStats 保留缓存字段存在性,兼容旧桶里的非零缓存', () => 
   assert.equal(legacy.cache, 0.25, '旧桶的非零缓存读数本身足以证明上游报过数据');
 });
 
-t('Token 消耗显示缓存读写明细', () => {
+t('Token 消耗显示格式化后的缓存读写明细', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  assert.ok(app.includes('缓存读 ${fmtTokens(t.cacheReadTokens)}'));
-  assert.ok(app.includes('缓存写 ${fmtTokens(t.cacheWriteTokens)}'));
+  assert.match(app, /缓存读\s*\$\{\s*fmtTokens\s*\(\s*t\.cacheReadTokens\s*\)\s*\}/);
+  assert.match(app, /缓存写\s*\$\{\s*fmtTokens\s*\(\s*t\.cacheWriteTokens\s*\)\s*\}/);
   assert.ok(html.includes('缓存读 — · 缓存写 —'));
 });
 
-t('节点统计使用默认关闭的原生折叠结构', () => {
+t('节点统计使用默认关闭且结构完整的原生折叠', () => {
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
-  assert.match(html, /<details[^>]*class="card span3"[^>]*>/);
-  assert.match(html, /<summary[^>]*>[^]*节点统计[^]*<\/summary>/);
-  assert.doesNotMatch(html.match(/<details[^>]*class="card span3"[^>]*>/)?.[0] || '', /\sopen(?:\s|=|>)/);
+  const details = html.match(/<details\b[^>]*class="card span3"[^>]*>[\s\S]*?<\/details>/)?.[0] || '';
+  const opening = details.match(/^<details\b[^>]*>/)?.[0] || '';
+  const summary = details.match(/<summary\b[^>]*>[\s\S]*?<\/summary>/)?.[0] || '';
+  const summaryBody = summary.match(/^<summary\b[^>]*>([\s\S]*)<\/summary>$/)?.[1] || '';
+  const body = details.slice(details.indexOf(summary) + summary.length);
+
+  assert.ok(details, '应存在节点统计 details');
+  assert.doesNotMatch(opening, /\sopen(?:\s|=|>)/, '节点统计默认应折叠');
+  assert.equal(summaryBody.match(/<h2\b/g)?.length, 1, 'summary 内应只有一个 heading');
+  assert.match(summaryBody, /^\s*<h2\b[^>]*id="h-nstat"[^>]*>[\s\S]*?<\/h2>\s*$/,
+    'summary 的唯一顶层内容应为节点统计 heading');
+  assert.match(summary, /id="nstat-sum"/, '动态合计应位于 summary 内');
+  assert.doesNotMatch(summary, /id="(?:nstats|nstat-empty)"/, '折叠正文不应混入 summary');
+  assert.match(body, /id="nstats"/, '节点明细应位于 summary 之后的 details 正文');
+  assert.match(body, /id="nstat-empty"/, '节点空态应位于 summary 之后的 details 正文');
 });
 
 t('节点统计合计不显示请求级与尝试级口径说明', () => {
