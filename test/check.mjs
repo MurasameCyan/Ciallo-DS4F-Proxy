@@ -337,4 +337,16 @@ t('节点统计合计不显示请求级与尝试级口径说明', () => {
   assert.ok(!app.includes('故大于顶部请求总数'));
 });
 
+t('OpenCode 请求头开启状态使用绿色标签', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  const label = html.match(/<label\b[^>]*for="f-identity"[^>]*>([\s\S]*?)<\/label>/)?.[1] || '';
+  const checked = css.match(/\.chk\.toggle input:checked ~ \.tag\s*\{([^}]*)\}/)?.[1] || '';
+
+  assert.match(label, /<span>OpenCode 请求头<\/span>/);
+  assert.doesNotMatch(label, /OpenCode 身份头/);
+  assert.match(checked, /color:\s*var\(--mint-dim\)/);
+  assert.match(checked, /border-color:[^;]*var\(--mint\)/);
+});
+
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);

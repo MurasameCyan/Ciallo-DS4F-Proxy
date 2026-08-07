@@ -427,8 +427,8 @@ input[readonly] { color: var(--fg-2); }
   border: 1px solid var(--line-2); color: var(--fg-2);
 }
 .chk.toggle input:checked ~ .tag {
-  color: var(--amber);
-  border-color: color-mix(in oklab, var(--amber) 45%, var(--line-2));
+  color: var(--mint-dim);
+  border-color: color-mix(in oklab, var(--mint) 45%, var(--line-2));
 }
 /* 开关下面那句说明:.hint 默认没上边距,和 label 贴太紧 */
 .chk.toggle + .hint { margin-top: 6px; }
