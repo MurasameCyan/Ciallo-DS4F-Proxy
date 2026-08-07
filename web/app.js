@@ -169,7 +169,7 @@ function renderNodeStats() {
   $('nstat-sum').textContent = rows.length
     ? `总尝试 ${fmtCount(totals.requests)} · 成功 ${fmtCount(totals.success)}`
       + ` · 429 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
-      + ` · 上游错误 ${fmtCount(totals.upstreamError)}(一次客户端请求换几个节点就记几笔,故大于顶部请求总数)`
+      + ` · 上游错误 ${fmtCount(totals.upstreamError)}`
     : '按每次真实上游尝试计,和顶部的请求总数不是同一个口径。';
 
   $('nstats').replaceChildren(...rows.map((r) => {

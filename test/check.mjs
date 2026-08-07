@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   COOLDOWN_MS, MAX_LOG, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
@@ -297,6 +298,12 @@ t('nodeStats 保留缓存字段存在性,兼容旧桶里的非零缓存', () => 
     requests: 1, promptTokens: 100, cacheReadTokens: 25,
   } }).rows[0];
   assert.equal(legacy.cache, 0.25, '旧桶的非零缓存读数本身足以证明上游报过数据');
+});
+
+t('节点统计合计不显示请求级与尝试级口径说明', () => {
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  assert.ok(!app.includes('一次客户端请求换几个节点就记几笔'));
+  assert.ok(!app.includes('故大于顶部请求总数'));
 });
 
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);
