@@ -40,7 +40,10 @@ const NODES = [
 ];
 
 const state = {
-  cfg: { subscriptionUrl: 'https://demo.example.com/subscribe?token=preview', apiKey: 'zen-a1b2c3d4', port: 9527 },
+  cfg: {
+    subscriptionUrl: 'https://demo.example.com/subscribe?token=preview',
+    apiKey: 'zen-a1b2c3d4', port: 9527, opencodeIdentityHeaders: false,
+  },
   build: '9dfba56',
   hasUpdate: false,
   current: NODES[2],
@@ -51,7 +54,7 @@ const state = {
   testedAt: Date.now() - 42_000,
   usage: {
     total: { requests: 1284, success: 1197, fail: 87, promptTokens: 2_841_302, completionTokens: 986_441, reasoningTokens: 412_887, totalTokens: 3_827_743 },
-    byDay: {}, byModel: {},
+    byDay: {}, byModel: {}, byNode: {},
     lastRequest: Date.now() - 4200,
     startTime: Date.now() - 3600_000 * 27,
   },
@@ -61,6 +64,17 @@ const state = {
 state.usage.byModel['deepseek-v4-flash-free'] = { requests: 1043, totalTokens: 3_102_884 };
 state.usage.byModel['big-pickle'] = { requests: 168, totalTokens: 561_209 };
 state.usage.byModel['mimo-v2.5-free'] = { requests: 73, totalTokens: 163_650 };
+
+// 节点尝试口径。合计(1519)刻意大于上面的请求总数(1284):重试和换节点就是
+// 这么多出来的,面板得能把这个差解释清楚,预览里没这个差就试不出那句提示。
+// 前两个有缓存 token(命中率能算),第三个 cacheRead=0(显示 0%),
+// 最后一个 promptTokens=0(显示 —)—— 三种状态在一屏里全见得着。
+for (const [name, v] of [
+  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true }],
+  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true }],
+  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true }],
+  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false }],
+]) state.usage.byNode[name] = v;
 
 const clients = new Set();
 
@@ -140,8 +154,17 @@ function simulate() {
   u.requests++;
   state.usage.lastRequest = Date.now();
 
+  // 节点那一笔单独记:这次真发出去了,不管结果如何
+  const nb = (state.usage.byNode[state.current] ??= {
+    requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0,
+    promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
+    cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false,
+  });
+  nb.requests++;
+
   if (Math.random() < 0.12) {
     u.fail++;
+    nb.rateLimited++;
     state.cooldowns.set(state.current, Date.now());
     log('warn', `[429] ${state.current} 限流,冷却 90s`);
     // 当场换,别把 current 留在冷却节点上等下一 tick —— 那几秒里 /api/nodes
@@ -157,6 +180,13 @@ function simulate() {
   const pt = 900 + Math.floor(Math.random() * 2600);
   const ct = 180 + Math.floor(Math.random() * 900);
   const rt = Math.floor(Math.random() * 500);
+  // 开了身份头才给缓存 token —— 这个实验开关想验证的正是这件事,
+  // 预览里也让它看得见,不然那张卡的「缓存命中」永远是同一个数
+  const cr = state.cfg.opencodeIdentityHeaders ? Math.floor(pt * (0.3 + Math.random() * 0.4)) : 0;
+  nb.success++; nb.promptTokens += pt; nb.completionTokens += ct;
+  nb.reasoningTokens += rt; nb.totalTokens += pt + ct;
+  nb.cacheReadTokens += cr; nb.cacheWriteTokens += cr ? Math.floor(pt * 0.05) : 0;
+  if (state.cfg.opencodeIdentityHeaders) nb.hasCacheData = true;
   u.success++; u.promptTokens += pt; u.completionTokens += ct;
   u.reasoningTokens += rt; u.totalTokens += pt + ct;
   log('ok', `[ok] node="${state.current}" ${620 + Math.floor(Math.random() * 2400)}ms tokens=${pt + ct}`);
@@ -196,7 +226,6 @@ async function handleApi(req, res, path) {
     return json(res, {
       gatewayRunning: true, gatewayPort: state.cfg.port,
       mihomoRunning: true, mihomoVersion: 'v1.19.13',
-      fixedModel: 'deepseek-v4-flash-free',
       paused: false, demo: true,
       // 真网关这一份是从上游 /zen/v1/models 现拉的(缓存 30 分钟)。
       // 这里写死一份形状一样的,longcat 那个就是「实时」才会出现的
@@ -234,7 +263,14 @@ async function handleApi(req, res, path) {
     const b = await readBody(req);
     if (b.subscriptionUrl !== undefined) state.cfg.subscriptionUrl = String(b.subscriptionUrl);
     if (b.port !== undefined) state.cfg.port = Number(b.port) || state.cfg.port;
+    if (b.opencodeIdentityHeaders !== undefined) {
+      state.cfg.opencodeIdentityHeaders = b.opencodeIdentityHeaders === true;
+      log('info', `[config] OpenCode 身份头${state.cfg.opencodeIdentityHeaders ? '已开启(实验)' : '已关闭'}`);
+    }
     log('info', '[config] 已保存');
+    if (b.subscriptionUrl === undefined) {
+      return json(res, { ...state.cfg });
+    }
     log('ok', `[sub] 刷新成功,${NODES.length} 个节点`);
     // 真网关刷完订阅会顺手测一遍延迟,预览也照做,不然「保存后节点重排」看不到
     const speed = await speedTest();
@@ -262,9 +298,11 @@ async function handleApi(req, res, path) {
     state.usage.total = {
       requests: 0, success: 0, fail: 0,
       promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
+      cacheReadTokens: 0, cacheWriteTokens: 0,
     };
     state.usage.byDay = {};
     state.usage.byModel = {};
+    state.usage.byNode = {};      // 清零把两套口径一起清,只清一套会对不上
     state.usage.lastRequest = null;
     state.usage.startTime = Date.now();
     log('ok', '[usage] 用量已清零');
@@ -338,7 +376,7 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`\n  Ciallo DS4F Proxy · UI 预览\n  http://localhost:${PORT}\n\n  演示数据,每 3 秒模拟一次请求。Ctrl+C 退出。\n`);
   log('ok', '[gateway] 监听 127.0.0.1:' + state.cfg.port);
   log('ok', `[mihomo] 已启动,${NODES.length} 个节点`);
-  log('info', `[gateway] Model: deepseek-v4-flash-free (固定)`);
+  log('info', `[gateway] 免费模型 8 个,客户端选哪个转发哪个`);
 });
 
 setInterval(simulate, 3000);

@@ -181,6 +181,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .grid { display: grid; gap: 16px; }
 .stats { grid-template-columns: repeat(2, 1fr); }  /* 2×2,占三列里的第一格 */
 .span2 { grid-column: span 2; }
+/* 通栏。用 1/-1 而不是 span 3:它在单列断点下也是「整行」,不用再写一条覆盖 */
+.span3 { grid-column: 1 / -1; }
 
 /* 下排两张卡:高度由行决定(取两者较高),内部滚动区吃掉剩余空间。
    日志的 300px 是基准高,节点池跟着它长 —— 于是不用再手算「几行半」
@@ -334,6 +336,45 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 .empty { color: var(--fg-2); font-size: 13px; padding: 14px 2px; }
 
+/* ── 节点统计 ─────────────────────────────────────────── */
+
+/* 通栏卡,不限高:行数 == 用过的节点数,比节点池只少不多,而且这张卡在最底下,
+   页面本来就要滚到这儿,再套一层内部滚动只会多一条滚动条抢手势。 */
+.nstats { display: grid; gap: 7px; }
+
+.nstat {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+}
+
+/* 数字全用行内标签(「尝试 12」)而不是表头列:flex-wrap 一开,窄屏自动折行,
+   不会有对不齐的表头,也就永远不会横向溢出。 */
+.nstat-main {
+  display: flex; align-items: baseline;
+  flex-wrap: wrap; gap: 6px 14px;
+}
+.nstat .nm {
+  flex: 1 1 180px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; font-weight: 600;
+}
+.nstat .num {
+  font-family: var(--mono); font-size: 12px; color: var(--fg-2);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.nstat .num b { color: var(--fg); font-weight: 600; }
+/* 缓存命中拿到过真数据才点亮 —— '—' 和 0% 得看着就不一样 */
+.nstat .num.hit b { color: var(--mint); }
+.nstat .sub {
+  margin-top: 5px;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+}
+/* 有过 429/超时/错误的那几项标出来,一眼看出是哪个节点在拖后腿 */
+.nstat .sub .bad { color: var(--amber); }
+
 /* ── 表单 ─────────────────────────────────────────────── */
 
 .field { display: block; margin-bottom: 13px; }
@@ -364,6 +405,22 @@ input[readonly] { color: var(--fg-2); }
 .copyrow input { flex: 1; min-width: 0; }
 
 .err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
+
+/* 复用 .chk(日志那个「自动滚动」),只把它拉成整行并把状态标签顶到右端。
+   标签文字比 checkbox 本身醒目:实验开关关着是常态,开着才需要被看见。 */
+.chk.toggle { display: flex; width: 100%; font-size: 13px; color: var(--fg); }
+.chk.toggle .tag {
+  margin-left: auto; font-style: normal;
+  font-family: var(--mono); font-size: 11px;
+  padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--line-2); color: var(--fg-2);
+}
+.chk.toggle input:checked ~ .tag {
+  color: var(--amber);
+  border-color: color-mix(in oklab, var(--amber) 45%, var(--line-2));
+}
+/* 开关下面那句说明:.hint 默认没上边距,和 label 贴太紧 */
+.chk.toggle + .hint { margin-top: 6px; }
 
 .models { display: flex; flex-wrap: wrap; gap: 6px; }
 .models li {

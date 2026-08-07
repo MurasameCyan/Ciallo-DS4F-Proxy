@@ -185,6 +185,66 @@ export function rankBreakdown(map, limit = 5) {
 }
 
 /**
+ * 生成配置提交体。只切身份头时省略没变的订阅地址，避免服务端把它解释为
+ * 「用户明确保存订阅」并强制重拉；点击保存且订阅变更/明确强制时仍发送地址。
+ */
+export function configPayload({
+  savedUrl = '', url = '', savedIdentity = false, identity = false,
+} = {}) {
+  const out = { opencodeIdentityHeaders: identity === true };
+  // 只改开关时不碰订阅；否则点击「保存并应用」仍保持原有的强制刷新语义。
+  if (url !== savedUrl || identity === savedIdentity) out.subscriptionUrl = url;
+  return out;
+}
+
+/**
+ * 缓存命中率 = 读到的缓存 token ÷ 输入 token。
+ *
+ * 分母为 0 时返回 null:上游不报 cached_tokens 的时候,显示「0%」等于断言
+ * 「试过、一次没命中」,而真相是「不知道」。这两件事在调身份头实验的时候
+ * 恰恰是最需要分清的 —— 所以宁可显示 —。
+ */
+export function cacheRate(b) {
+  if (!b || b.hasCacheData === false) return null;
+  const cached = Number(b.cacheReadTokens) || 0;
+  // 兼容 hasCacheData 引入前已写入的桶：非零缓存读数本身足以证明上游报过数据。
+  if (b.hasCacheData !== true && cached <= 0) return null;
+  const pt = Number(b.promptTokens) || 0;
+  if (pt <= 0) return null;
+  return cached / pt;
+}
+
+/**
+ * byNode -> 可直接渲染的行 + 汇总。
+ *
+ * 这套数和顶部总览刻意不是一回事:总览按**客户端请求**记,一次请求换三个
+ * 节点也只算一次;这里按**每次真实上游尝试**记,那次请求会在三个节点上各
+ * 留一笔。所以各行 requests 加起来通常大于总览的请求数,那不是 bug,而是
+ * 「为了完成这些请求,底下实际打了多少次」——两个数一样才说明从没重试过。
+ */
+export function nodeStats(byNode) {
+  const totals = { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 };
+  const rows = [];
+  for (const [name, v] of Object.entries(byNode || {})) {
+    const n = (k) => Number(v?.[k]) || 0;
+    const requests = n('requests');
+    if (!requests) continue;        // 一次都没试过的节点不占位置
+    const row = { name, requests };
+    for (const k of ['success', 'rateLimited', 'timeout', 'upstreamError',
+      'promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens',
+      'cacheReadTokens', 'cacheWriteTokens']) row[k] = n(k);
+    // undefined 要保留给 cacheRate 做旧桶兼容；强制成 false 会把历史非零缓存误判成无数据。
+    row.hasCacheData = v?.hasCacheData;
+    row.rate = successRate(row);     // 字段名对得上,直接复用总览那个
+    row.cache = cacheRate(row);
+    rows.push(row);
+    for (const k of Object.keys(totals)) totals[k] += row[k];
+  }
+  rows.sort((a, b) => b.requests - a.requests || a.name.localeCompare(b.name));
+  return { rows, totals };
+}
+
+/**
  * 构建标识要不要亮「有新版本」。
  *
  * 比的是两个 hash,而不是直接用后端那次检查返回的 hasUpdate:更新完镜像重启后

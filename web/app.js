@@ -9,7 +9,7 @@ import {
   LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
-  fmtDelay, delayGrade, fmtAgo, hasNewer,
+  fmtDelay, delayGrade, fmtAgo, hasNewer, nodeStats, configPayload,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -149,6 +149,64 @@ function tag(cls, text) {
   return s;
 }
 
+/** 「标签 + 值」那一小块。值加粗,标签留灰,扫的时候只看粗体就行 */
+function num(cls, label, value) {
+  const s = tag(`num ${cls}`, `${label} `);
+  const b = document.createElement('b');
+  b.textContent = value;
+  s.append(b);
+  return s;
+}
+
+/**
+ * 节点统计卡。数据来自 usage.byNode —— **每次真实上游尝试**记一笔,
+ * 和顶部总览那套「一次客户端请求记一次」不是同一个口径,卡头那句提示
+ * 就是为了让人别把两个数当成同一件事去对(见 core.js 的 nodeStats)。
+ */
+function renderNodeStats() {
+  const { rows, totals } = nodeStats(S.usage?.byNode);
+  $('nstat-empty').hidden = rows.length > 0;
+  $('nstat-sum').textContent = rows.length
+    ? `总尝试 ${fmtCount(totals.requests)} · 成功 ${fmtCount(totals.success)}`
+      + ` · 429 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
+      + ` · 上游错误 ${fmtCount(totals.upstreamError)}(一次客户端请求换几个节点就记几笔,故大于顶部请求总数)`
+    : '按每次真实上游尝试计,和顶部的请求总数不是同一个口径。';
+
+  $('nstats').replaceChildren(...rows.map((r) => {
+    const li = document.createElement('li');
+    li.className = 'nstat';
+
+    const nm = tag('nm', r.name);
+    nm.title = r.name;
+    const main = document.createElement('div');
+    main.className = 'nstat-main';
+    main.append(
+      nm,
+      num('', '尝试', fmtCount(r.requests)),
+      num('', '成功率', fmtPercent(r.rate)),
+      // 上游没报 cached_tokens 时 cache 是 null → '—'。显示 0% 会被读成
+      // 「试过、一次没命中」,而真相是「上游根本没给这个数」
+      num(r.cache ? 'hit' : '', '缓存命中', fmtPercent(r.cache)),
+    );
+
+    const sub = document.createElement('p');
+    sub.className = 'sub';
+    const bad = (label, n) => {
+      sub.append(tag(n ? 'bad' : '', `${label} ${fmtCount(n)}`), document.createTextNode(' · '));
+    };
+    bad('429', r.rateLimited);
+    bad('超时', r.timeout);
+    bad('上游错误', r.upstreamError);
+    sub.append(document.createTextNode(
+      `Token ${fmtTokens(r.totalTokens)}(入 ${fmtTokens(r.promptTokens)}`
+      + ` · 出 ${fmtTokens(r.completionTokens)} · 推理 ${fmtTokens(r.reasoningTokens)}`
+      + ` · 缓存读 ${fmtTokens(r.cacheReadTokens)} / 写 ${fmtTokens(r.cacheWriteTokens)})`));
+
+    li.append(main, sub);
+    return li;
+  }));
+}
+
 function renderConn() {
   $('f-base').value = endpointBase(location.origin);
   // 屏幕上永远是掩码;要用就点「复制」,那条路复制的是真值
@@ -239,10 +297,15 @@ async function refresh() {
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ node: c.node, deadline: cooldownDeadline(c.remain) }));
 
-    renderPills(); renderStats(); renderNodes(); renderConn(); renderModels(); renderBuild();
+    renderPills(); renderStats(); renderNodes(); renderNodeStats();
+    renderConn(); renderModels(); renderBuild();
 
     // 表单不在用户编辑时才回填,否则打字会被覆盖
     if (document.activeElement !== $('f-sub')) $('f-sub').value = S.cfg.subscriptionUrl || '';
+    // 开关同理:用户刚点完还没提交时别被轮询拨回去
+    const idt = $('f-identity');
+    if (document.activeElement !== idt) idt.checked = S.cfg.opencodeIdentityHeaders === true;
+    syncIdentityTag();
   } catch (e) {
     setPill($('pill-node'), 'down', '连接不上后端');
   }
@@ -289,6 +352,11 @@ async function run(btn, label, fn) {
     btn.textContent = old;
     refresh();
   }
+}
+
+/** checkbox 旁边那个「关闭 / 实验中」标签。颜色靠 CSS 的 :checked,这里只管文字 */
+function syncIdentityTag() {
+  $('f-identity-state').textContent = $('f-identity').checked ? '实验中' : '关闭';
 }
 
 function wire() {
@@ -368,10 +436,19 @@ function wire() {
     }
     err.hidden = true;
 
-    // 只发订阅地址。端口不在这张表里了 —— 服务端本来也不接受改端口
-    // (容器对外端口由 compose 的 ports 定),发过去只会被忽略
+    // 订阅地址 + 身份头开关一起提交。端口不在这张表里 —— 服务端本来也不接受
+    // 改端口(容器对外端口由 compose 的 ports 定),发过去只会被忽略。
+    // 身份头单独切的时候订阅地址没变,服务端那边一步内核操作都不会做。
     run($('btn-save'), '保存', async () => {
-      const r = await api('/config', { method: 'POST', body: JSON.stringify({ subscriptionUrl: url }) });
+      const r = await api('/config', {
+        method: 'POST',
+        body: JSON.stringify(configPayload({
+          savedUrl: S.cfg.subscriptionUrl || '',
+          url,
+          savedIdentity: S.cfg.opencodeIdentityHeaders === true,
+          identity: $('f-identity').checked,
+        })),
+      });
       if (r?.nodes == null) return '';
       // 保存会顺带测一遍延迟。测完了就把可用数一起说了,没测完(节点多、超了
       // 20 秒)只报节点数,结果稍后自己出现在节点池里
@@ -379,6 +456,9 @@ function wire() {
       return s ? `刷到 ${r.nodes} 个节点,${s.alive}/${s.tested} 可用` : `刷到 ${r.nodes} 个节点`;
     });
   };
+
+  // 勾了就立刻改标签文字,不等「保存并应用」—— 但真正生效还是在提交之后
+  $('f-identity').onchange = syncIdentityTag;
 
   for (const seg of document.querySelectorAll('.seg')) {
     seg.onclick = () => {

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   COOLDOWN_MS, MAX_LOG, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
-  fmtDelay, delayGrade, fmtAgo, hasNewer,
+  fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, configPayload,
 } from '../web/core.js';
 
 let n = 0;
@@ -220,6 +220,83 @@ t('hasNewer 只在两个 hash 都有且不同时才亮', () => {
   assert.equal(hasNewer('9dfba56', '9dfba56'), false, '更新完重启后标记要自己消失');
   assert.equal(hasNewer('', '9dfba56'), false, '还没查过就不该亮');
   assert.equal(hasNewer('c31f0a8', ''), false, '本地 hash 未知时新旧无从判断');
+});
+
+t('配置提交:只改身份头时省略订阅,主动保存时保留订阅以强制刷新', () => {
+  assert.deepEqual(configPayload({
+    savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
+    savedIdentity: false, identity: true,
+  }), { opencodeIdentityHeaders: true });
+  assert.deepEqual(configPayload({
+    savedUrl: 'https://sub.example/a', url: 'https://sub.example/b',
+    savedIdentity: false, identity: false,
+  }), { subscriptionUrl: 'https://sub.example/b', opencodeIdentityHeaders: false });
+  assert.deepEqual(configPayload({
+    savedUrl: 'https://sub.example/a', url: 'https://sub.example/a',
+    savedIdentity: false, identity: false,
+  }), { subscriptionUrl: 'https://sub.example/a', opencodeIdentityHeaders: false });
+});
+
+// ── 节点统计 ────────────────────────────────────────────
+
+t('缓存命中率:上游没给缓存字段或没有分母时显示无数据', () => {
+  // 0% 会被读成「试过、一次没命中」,而真相可能是上游根本没报这个数
+  assert.equal(cacheRate({ promptTokens: 100, cacheReadTokens: 0, hasCacheData: false }), null);
+  assert.equal(cacheRate({ promptTokens: 0, cacheReadTokens: 0, hasCacheData: true }), null);
+  assert.equal(cacheRate(undefined), null);
+  assert.equal(fmtPercent(cacheRate({ promptTokens: 100, hasCacheData: false })), '—');
+  assert.equal(cacheRate({ promptTokens: 100, cacheReadTokens: 0, hasCacheData: true }), 0,
+    '明确收到 cached_tokens:0 才是真的 0%');
+  assert.equal(cacheRate({ promptTokens: 200, cacheReadTokens: 50, hasCacheData: true }), 0.25);
+});
+
+t('nodeStats 按尝试次数降序,同分按名字稳定排', () => {
+  const { rows } = nodeStats({
+    B: { requests: 10, success: 10 },
+    A: { requests: 10, success: 3 },
+    C: { requests: 40, success: 40 },
+  });
+  assert.deepEqual(rows.map((r) => r.name), ['C', 'A', 'B'], '同为 10 次时 A 在 B 前,顺序不会每次轮询都跳');
+});
+
+t('nodeStats 跳过一次都没试过的节点', () => {
+  const { rows, totals } = nodeStats({ A: { requests: 0 }, B: { requests: 2, success: 1, timeout: 1 } });
+  assert.deepEqual(rows.map((r) => r.name), ['B'], '零尝试的节点不占一行');
+  assert.equal(totals.requests, 2);
+  assert.equal(totals.timeout, 1);
+});
+
+t('nodeStats 合计只加四类结果和尝试数,token 不进合计', () => {
+  const { totals } = nodeStats({
+    A: { requests: 3, success: 1, rateLimited: 1, timeout: 1, promptTokens: 900 },
+    B: { requests: 2, success: 1, upstreamError: 1, promptTokens: 100 },
+  });
+  assert.deepEqual(totals, { requests: 5, success: 2, rateLimited: 1, timeout: 1, upstreamError: 1 });
+});
+
+t('nodeStats 缺字段当 0,坏值不传染成 NaN', () => {
+  // 旧 usage.json 里的桶可能没有 cacheReadTokens 这类后加的字段
+  const { rows } = nodeStats({ A: {
+    requests: 4, success: 3, promptTokens: 200, cacheReadTokens: 50, hasCacheData: true,
+  } });
+  const r = rows[0];
+  assert.equal(r.upstreamError, 0);
+  assert.equal(r.cacheWriteTokens, 0);
+  assert.equal(r.rate, 0.75);
+  assert.equal(r.cache, 0.25);
+  assert.deepEqual(nodeStats(null), { rows: [], totals: { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 } });
+});
+
+t('nodeStats 保留缓存字段存在性,兼容旧桶里的非零缓存', () => {
+  const explicitZero = nodeStats({ A: {
+    requests: 1, promptTokens: 100, cacheReadTokens: 0, hasCacheData: true,
+  } }).rows[0];
+  assert.equal(explicitZero.cache, 0, '上游明确返回 0 时面板应显示 0%');
+
+  const legacy = nodeStats({ B: {
+    requests: 1, promptTokens: 100, cacheReadTokens: 25,
+  } }).rows[0];
+  assert.equal(legacy.cache, 0.25, '旧桶的非零缓存读数本身足以证明上游报过数据');
 });
 
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);
