@@ -261,11 +261,15 @@ export function nodeStats(byNode) {
     row.cache = cacheRate(row);
     row.ttfb = avgMs(n('ttfbMs'), n('ttfbCount'));
     row.duration = avgMs(n('durationMs'), n('durationCount'));
+    row.lastAt = n('lastAt');
     rows.push(row);
     for (const k of Object.keys(totals)) totals[k] += row[k];
     for (const k of Object.keys(acc)) acc[k] += n(k);
   }
-  rows.sort((a, b) => b.requests - a.requests || a.name.localeCompare(b.name));
+  // 最近打过的排最上面。按尝试数排的话,一个跑了几百次、早就被换掉的节点会
+  // 常驻榜首,而「现在在用哪个、刚出的问题出在谁身上」得往下翻才看得到。
+  // lastAt 缺失(旧桶)记 0 自然垫底,同分再退回原来那套尝试数 + 名字的稳定排序
+  rows.sort((a, b) => b.lastAt - a.lastAt || b.requests - a.requests || a.name.localeCompare(b.name));
   return {
     rows, totals,
     ttfb: avgMs(acc.ttfbMs, acc.ttfbCount),

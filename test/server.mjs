@@ -224,6 +224,18 @@ await t('耗时只在传了 timing 时累计,ttfb 测不到不记样本', () => 
   assert.equal(a.requests, 3, '不带 timing 的尝试照常计数');
 });
 
+await t('recordAttempt 记下这次尝试的时间(面板靠它把最近调用排在最上面)', () => {
+  const u = new UsageTracker(path.join(TMP, 'lastat.json'), () => {});
+  const before = Date.now();
+  u.recordAttempt('A', 'success', null, { ttfb: 100, total: 200 });
+  const a = u.getStats().byNode.A;
+  assert.ok(a.lastAt >= before && a.lastAt <= Date.now(), `lastAt 应落在这次调用区间内,实际 ${a.lastAt}`);
+
+  // 失败的尝试也算「打过」:一直被限流的节点正是最该看见的那个
+  u.recordAttempt('B', 'rateLimited');
+  assert.ok(u.getStats().byNode.B.lastAt > 0, '不带 timing 的尝试也要记时间');
+});
+
 await t('缓存字段明确返回 0 与完全缺失能区分', () => {
   const u = new UsageTracker(path.join(TMP, 'cache-presence.json'), () => {});
   u.recordAttempt('missing', 'success', { prompt_tokens: 10 });

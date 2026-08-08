@@ -198,6 +198,9 @@ const blankNode = () => ({
   // 显示成最快的那个。样本数单独记而不复用 success —— 旧桶里的 success
   // 是没有耗时数据的那些,拿它当分母会把平均值算低。
   ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0,
+  // 面板按这个倒序排:哪个节点现在正在用,比哪个节点历史上跑得多有用。
+  // 0 而不是 null —— 旧桶归一化后直接参与比较,不用在前端兜 null
+  lastAt: 0,
 });
 
 /**
@@ -394,6 +397,8 @@ export class UsageTracker {
     const b = (this.data.byNode[node] ??= blankNode());
     b.requests++;
     b[result]++;
+    // 成功失败都算「打过」:一直被限流的节点正是最该排在眼前的那个
+    b.lastAt = Date.now();
     // timing 只有成功那次会传。ttfb 测不到就不记样本(比如流式开了 200 却一个
     // chunk 都没来),记 0 会把平均值稀释成一个谁都没经历过的数
     if (timing) {

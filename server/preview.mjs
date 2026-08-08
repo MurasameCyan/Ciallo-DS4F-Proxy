@@ -72,11 +72,13 @@ state.usage.byModel['mimo-v2.5-free'] = { requests: 73, totalTokens: 163_650 };
 // 最后一个 promptTokens=0(显示 —)—— 三种状态在一屏里全见得着。
 // 耗时同理凑齐三档单位:第三个节点的首字落在 ms、总耗时超过一分钟(1.1m),
 // 最后一个没有成功样本所以两项都是 —,ms/s/m 和空值一屏内都能看到。
+// lastAt 刻意和尝试数反着来(跑得最多的那个反而最久没打过):面板按最近调用
+// 倒序,两种顺序一致的话预览就证明不了排的是时间而不是次数。
 for (const [name, v] of [
-  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true, ttfbMs: 1_099_080, ttfbCount: 774, durationMs: 6_656_400, durationCount: 774 }],
-  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true, ttfbMs: 1_004_400, ttfbCount: 372, durationMs: 5_282_400, durationCount: 372 }],
-  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true, ttfbMs: 145_080, ttfbCount: 186, durationMs: 12_852_000, durationCount: 189 }],
-  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false, ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 }],
+  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true, ttfbMs: 1_099_080, ttfbCount: 774, durationMs: 6_656_400, durationCount: 774, lastAt: Date.now() - 42_000 }],
+  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true, ttfbMs: 1_004_400, ttfbCount: 372, durationMs: 5_282_400, durationCount: 372, lastAt: Date.now() - 5_000 }],
+  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true, ttfbMs: 145_080, ttfbCount: 186, durationMs: 12_852_000, durationCount: 189, lastAt: Date.now() - 900 }],
+  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false, ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0, lastAt: Date.now() - 3600_000 }],
 ]) state.usage.byNode[name] = v;
 
 const clients = new Set();
@@ -162,9 +164,10 @@ function simulate() {
     requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0,
     promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
     cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false,
-    ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0,
+    ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0, lastAt: 0,
   });
   nb.requests++;
+  nb.lastAt = Date.now();       // 面板按这个倒序,预览里也得跟着动才看得出重排
 
   if (Math.random() < 0.12) {
     u.fail++;

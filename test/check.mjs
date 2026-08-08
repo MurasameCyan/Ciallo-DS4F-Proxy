@@ -271,13 +271,25 @@ t('缓存命中率:上游没给缓存字段或没有分母时显示无数据', (
   assert.equal(cacheRate({ promptTokens: 200, cacheReadTokens: 50, hasCacheData: true }), 0.25);
 });
 
-t('nodeStats 按尝试次数降序,同分按名字稳定排', () => {
+t('nodeStats 最近调用的排最上面', () => {
+  const { rows } = nodeStats({
+    busy: { requests: 400, success: 400, lastAt: 1_000 },
+    fresh: { requests: 2, success: 2, lastAt: 9_000 },
+    mid: { requests: 40, success: 40, lastAt: 5_000 },
+  });
+  assert.deepEqual(rows.map((r) => r.name), ['fresh', 'mid', 'busy'],
+    '刚打过的节点在最上面 —— 跑得多不代表现在还在用');
+});
+
+t('nodeStats 没有 lastAt 的旧桶垫底,同分按尝试数再按名字稳定排', () => {
   const { rows } = nodeStats({
     B: { requests: 10, success: 10 },
     A: { requests: 10, success: 3 },
     C: { requests: 40, success: 40 },
+    now: { requests: 1, success: 1, lastAt: 123 },
   });
-  assert.deepEqual(rows.map((r) => r.name), ['C', 'A', 'B'], '同为 10 次时 A 在 B 前,顺序不会每次轮询都跳');
+  assert.deepEqual(rows.map((r) => r.name), ['now', 'C', 'A', 'B'],
+    '升级前的桶没有时间戳,只能退回原来的次序,且不能盖在有时间戳的前面');
 });
 
 t('nodeStats 跳过一次都没试过的节点', () => {
