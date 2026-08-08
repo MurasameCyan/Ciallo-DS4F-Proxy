@@ -199,12 +199,29 @@ await t('旧节点桶缺少新增字段时归一化,后续累加不产生 null',
     lastRequest: null, startTime: 123,
   }));
   const u = new UsageTracker(f, () => {});
-  u.recordAttempt('A', 'success', { prompt_tokens: 5, completion_tokens: 2 });
+  u.recordAttempt('A', 'success', { prompt_tokens: 5, completion_tokens: 2 }, { ttfb: 200, total: 900 });
   const a = u.getStats().byNode.A;
   assert.equal(a.requests, 2);
   assert.equal(a.completionTokens, 2);
   assert.equal(a.cacheReadTokens, 0);
   assert.equal(a.hasCacheData, false);
+  assert.equal(a.ttfbMs, 200, '旧桶没有耗时字段,补 0 再累加,不能变成 null');
+  assert.equal(a.ttfbCount, 1);
+  assert.equal(a.durationMs, 900);
+  assert.equal(a.durationCount, 1, '样本数只数有耗时数据的那些 —— 旧桶那 1 次不算');
+});
+
+await t('耗时只在传了 timing 时累计,ttfb 测不到不记样本', () => {
+  const u = new UsageTracker(path.join(TMP, 'timing.json'), () => {});
+  u.recordAttempt('A', 'success', null, { ttfb: 300, total: 1200 });
+  u.recordAttempt('A', 'success', null, { ttfb: 0, total: 800 });   // 流开了却没收到 chunk
+  u.recordAttempt('A', 'rateLimited');                              // 被秒拒,不带 timing
+  const a = u.getStats().byNode.A;
+  assert.equal(a.ttfbMs, 300);
+  assert.equal(a.ttfbCount, 1, 'ttfb 记 0 会把平均值稀释成谁都没经历过的数');
+  assert.equal(a.durationMs, 2000);
+  assert.equal(a.durationCount, 2);
+  assert.equal(a.requests, 3, '不带 timing 的尝试照常计数');
 });
 
 await t('缓存字段明确返回 0 与完全缺失能区分', () => {

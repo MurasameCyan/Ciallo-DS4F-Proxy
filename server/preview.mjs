@@ -70,11 +70,13 @@ state.usage.byModel['mimo-v2.5-free'] = { requests: 73, totalTokens: 163_650 };
 // 这么多出来的,面板得能把这个差解释清楚,预览里没这个差就试不出那句提示。
 // 前两个有缓存 token(命中率能算),第三个 cacheRead=0(显示 0%),
 // 最后一个 promptTokens=0(显示 —)—— 三种状态在一屏里全见得着。
+// 耗时同理凑齐三档单位:第三个节点的首字落在 ms、总耗时超过一分钟(1.1m),
+// 最后一个没有成功样本所以两项都是 —,ms/s/m 和空值一屏内都能看到。
 for (const [name, v] of [
-  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true }],
-  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true }],
-  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true }],
-  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false }],
+  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true, ttfbMs: 1_099_080, ttfbCount: 774, durationMs: 6_656_400, durationCount: 774 }],
+  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true, ttfbMs: 1_004_400, ttfbCount: 372, durationMs: 5_282_400, durationCount: 372 }],
+  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true, ttfbMs: 145_080, ttfbCount: 186, durationMs: 12_852_000, durationCount: 189 }],
+  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false, ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 }],
 ]) state.usage.byNode[name] = v;
 
 const clients = new Set();
@@ -160,6 +162,7 @@ function simulate() {
     requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0,
     promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
     cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false,
+    ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0,
   });
   nb.requests++;
 
@@ -184,13 +187,18 @@ function simulate() {
   // 开了身份头才给缓存 token —— 这个实验开关想验证的正是这件事,
   // 预览里也让它看得见,不然那张卡的「缓存命中」永远是同一个数
   const cr = state.cfg.opencodeIdentityHeaders ? Math.floor(pt * (0.3 + Math.random() * 0.4)) : 0;
+  // 和日志里那个 ms 用同一个数:预览是用来核对面板显示的,日志说 1800ms
+  // 而统计另摇一个数的话,对不上的时候分不清是显示错了还是假数据在骗人
+  const dt = 620 + Math.floor(Math.random() * 2400);
   nb.success++; nb.promptTokens += pt; nb.completionTokens += ct;
   nb.reasoningTokens += rt; nb.totalTokens += pt + ct;
   nb.cacheReadTokens += cr; nb.cacheWriteTokens += cr ? Math.floor(pt * 0.05) : 0;
+  nb.ttfbMs += Math.floor(dt * (0.15 + Math.random() * 0.3)); nb.ttfbCount++;
+  nb.durationMs += dt; nb.durationCount++;
   if (state.cfg.opencodeIdentityHeaders) nb.hasCacheData = true;
   u.success++; u.promptTokens += pt; u.completionTokens += ct;
   u.reasoningTokens += rt; u.totalTokens += pt + ct;
-  log('ok', `[ok] node="${state.current}" ${620 + Math.floor(Math.random() * 2400)}ms tokens=${pt + ct}`);
+  log('ok', `[ok] node="${state.current}" ${dt}ms tokens=${pt + ct}`);
 }
 
 // ── 路由 ────────────────────────────────────────────────

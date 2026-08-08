@@ -114,10 +114,16 @@ export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = ''
   return [...rows, ...dead];
 }
 
-/** 延迟 -> 显示文本。没测过是 '—',不是 0 */
+/**
+ * 毫秒 -> 显示文本,逐级向上换单位。没测过是 '—',不是 0。
+ *
+ * 分钟那一档是给「平均耗时」用的:请求预算 75s,推理模型跑满很常见,
+ * 「92.4s」要在脑子里除一次才知道是一分半。节点延迟那边到不了这一档。
+ */
 export function fmtDelay(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n <= 0) return '—';
+  if (n >= 60_000) return `${(n / 60_000).toFixed(1)}m`;
   return n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${Math.round(n)}ms`;
 }
 
@@ -231,9 +237,15 @@ export function cacheRate(b) {
  * 节点也只算一次;这里按**每次真实上游尝试**记,那次请求会在三个节点上各
  * 留一笔。所以各行 requests 加起来通常大于总览的请求数,那不是 bug,而是
  * 「为了完成这些请求,底下实际打了多少次」——两个数一样才说明从没重试过。
+ *
+ * 耗时另算:后端只给成功的尝试记时,所以样本数和 requests 不是一回事,
+ * 平均值得拿自己那个 count 当分母(见 gateway.mjs 的 blankNode)。
  */
 export function nodeStats(byNode) {
   const totals = { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 };
+  // 平均值不能对各节点的平均再平均 —— 那是把跑了 800 次的节点和跑了 3 次的
+  // 等权看待。先把总和与样本数攒起来,最后除一次
+  const acc = { ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 };
   const rows = [];
   for (const [name, v] of Object.entries(byNode || {})) {
     const n = (k) => Number(v?.[k]) || 0;
@@ -247,11 +259,26 @@ export function nodeStats(byNode) {
     row.hasCacheData = v?.hasCacheData;
     row.rate = successRate(row);     // 字段名对得上,直接复用总览那个
     row.cache = cacheRate(row);
+    row.ttfb = avgMs(n('ttfbMs'), n('ttfbCount'));
+    row.duration = avgMs(n('durationMs'), n('durationCount'));
     rows.push(row);
     for (const k of Object.keys(totals)) totals[k] += row[k];
+    for (const k of Object.keys(acc)) acc[k] += n(k);
   }
   rows.sort((a, b) => b.requests - a.requests || a.name.localeCompare(b.name));
-  return { rows, totals };
+  return {
+    rows, totals,
+    ttfb: avgMs(acc.ttfbMs, acc.ttfbCount),
+    duration: avgMs(acc.durationMs, acc.durationCount),
+  };
+}
+
+/**
+ * 平均耗时。没有样本时返回 null —— 显示 0ms 等于断言「这节点零延迟」,
+ * 而真相是「还没有成功过、无从得知」。fmtDelay 会把 null 显示成 —。
+ */
+function avgMs(sum, count) {
+  return count > 0 ? sum / count : null;
 }
 
 /**

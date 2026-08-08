@@ -194,6 +194,10 @@ const blankNode = () => ({
   requests: 0, ...Object.fromEntries(NODE_OUTCOMES.map((k) => [k, 0])),
   promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
   cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false,
+  // 耗时只累计成功的尝试:429 被秒拒也很「快」,混进去会把限流最狠的节点
+  // 显示成最快的那个。样本数单独记而不复用 success —— 旧桶里的 success
+  // 是没有耗时数据的那些,拿它当分母会把平均值算低。
+  ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0,
 });
 
 /**
@@ -383,13 +387,19 @@ export class UsageTracker {
    * 不写 lastRequest,那是客户端口径的字段;也不 save,由调用方那次 record 顺手落盘
    * (一次客户端请求最多写一次文件,而不是每换一个节点写一次)。
    */
-  recordAttempt(node, result, usage = null) {
+  recordAttempt(node, result, usage = null, timing = null) {
     if (!node) return;
     // 先验参再建桶:名字写错的时候不该在面板上留下一个凭空多出来的节点行
     if (!NODE_OUTCOMES.includes(result)) throw new Error(`未知的节点尝试结果: ${result}`);
     const b = (this.data.byNode[node] ??= blankNode());
     b.requests++;
     b[result]++;
+    // timing 只有成功那次会传。ttfb 测不到就不记样本(比如流式开了 200 却一个
+    // chunk 都没来),记 0 会把平均值稀释成一个谁都没经历过的数
+    if (timing) {
+      if (timing.ttfb > 0) { b.ttfbMs += timing.ttfb; b.ttfbCount++; }
+      if (timing.total != null) { b.durationMs += timing.total; b.durationCount++; }
+    }
     if (!usage) return;
     const u = readUsage(usage);
     for (const k of ['promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens',
@@ -682,7 +692,10 @@ export class Gateway {
             this.cooldown.clear(cur);
             this.saveLastNode(cur);
           }
-          this.usage.recordAttempt(cur, result.ok ? 'success' : 'upstreamError', result.usage);
+          // 只给成功那次记耗时:中断的那次总耗时量的是「断在第几秒」,
+          // 不是这个节点跑完一次要多久,混进平均值里读不出任何东西
+          this.usage.recordAttempt(cur, result.ok ? 'success' : 'upstreamError', result.usage,
+            result.ok ? { ttfb: result.ttfb, total: dt } : null);
           this.usage.record(body.model, result.usage, result.ok);
           this.logger(result.ok ? 'ok' : 'error',
             `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}" ${dt}ms`);
@@ -691,7 +704,7 @@ export class Gateway {
         this.lockedNode = cur;
         this.cooldown.clear(cur);
         this.saveLastNode(cur);
-        this.usage.recordAttempt(cur, 'success', result.usage);
+        this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt });
         this.usage.record(body.model, result.usage, true);
         this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`);
         return dialect.respond(res, result, body.model);
@@ -835,12 +848,20 @@ export class Gateway {
       const bodyStr = JSON.stringify({ ...body, stream: false });
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(UPSTREAM_TIMEOUT_MS, budget));
+      const t0 = Date.now();
       const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity }), (resp) => {
         let data = '';
-        resp.on('data', (c) => (data += c));
+        // 非流式的「首字」= 上游开始回话的时刻。整个 body 是一次攒完的,
+        // 所以它和总耗时差的就是传输那点时间,不像流式那样能差几十秒
+        let ttfb = 0;
+        resp.on('data', (c) => { ttfb ||= Date.now() - t0; data += c; });
         resp.on('end', () => {
           if (resp.statusCode !== 200) return reject({ status: resp.statusCode, body: data });
-          try { resolve(JSON.parse(data)); } catch { reject({ status: 502, body: data }); }
+          try {
+            // 不可枚举:这个对象会被 OPENAI.respond 原样 JSON.stringify 给客户端,
+            // 普通属性会当成上游字段泄出去
+            resolve(Object.defineProperty(JSON.parse(data), '_ttfb', { value: ttfb }));
+          } catch { reject({ status: 502, body: data }); }
         });
       });
       r.on('error', (e) => reject({ status: 0, body: e.message }));
@@ -874,6 +895,11 @@ export class Gateway {
       let started = false;
       let settled = false;
       let usage = null;     // 提到这一层:r 的 error 回调也要把已收到的 usage 带出去
+      // 流式的「首字」量的是等到第一个 chunk 有多久,不是响应头到达的时刻:
+      // 推理模型 200 之后还要想几十秒才吐第一个字,量头等于把那段等待抹掉,
+      // 而那段等待恰恰是用户真正在等的东西。
+      const t0 = Date.now();
+      let firstByte = 0;
       const finish = (fn) => { if (!settled) { settled = true; fn(); } };
 
       const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity }), (resp) => {
@@ -903,6 +929,7 @@ export class Gateway {
 
         let buf = '';
         resp.on('data', (chunk) => {
+          firstByte ||= Date.now() - t0;
           sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
           buf += chunk.toString();
           const lines = buf.split('\n');
@@ -917,14 +944,14 @@ export class Gateway {
         });
         resp.on('end', () => finish(() => {
           sink.end();
-          resolve({ ok: true, usage });
+          resolve({ ok: true, usage, ttfb: firstByte });
         }));
         resp.on('error', (e) => finish(() => {
           this.logger('error', `[stream] 中断: ${e.message}`);
           // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
           // 客户端的状态机于是能正常结束,而不是等到自己超时
           sink.fail(e.message);
-          resolve({ ok: false, usage });   // 已经发出去一部分了,重试不了,不算可重试失败
+          resolve({ ok: false, usage, ttfb: firstByte });   // 已经发出去一部分了,重试不了,不算可重试失败
         }));
       });
 
@@ -933,7 +960,7 @@ export class Gateway {
           // 头已经发了,只能就地收尾。这里不能 reject 回重试循环。
           this.logger('error', `[stream] 传输中断: ${e.message}`);
           try { res.end(); } catch {}
-          return resolve({ ok: false, usage });
+          return resolve({ ok: false, usage, ttfb: firstByte });
         }
         reject({ status: 0, body: e.message, notStarted: true });
       }));

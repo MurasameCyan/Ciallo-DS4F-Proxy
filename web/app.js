@@ -166,12 +166,15 @@ function num(cls, label, value) {
  * 就是为了让人别把两个数当成同一件事去对(见 core.js 的 nodeStats)。
  */
 function renderNodeStats() {
-  const { rows, totals } = nodeStats(S.usage?.byNode);
+  const { rows, totals, ttfb, duration } = nodeStats(S.usage?.byNode);
   $('nstat-empty').hidden = rows.length > 0;
   $('nstat-sum').textContent = rows.length
     ? `总尝试 ${fmtCount(totals.requests)} · 成功 ${fmtCount(totals.success)}`
-      + ` · 429 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
-      + ` · 上游错误 ${fmtCount(totals.upstreamError)}`
+      + ` · 限流 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
+      + ` · 错误 ${fmtCount(totals.upstreamError)}`
+      // 折叠状态下只看得见这一行,所以两个平均值放这儿:哪个节点慢要展开才知道,
+      // 但「整体现在快不快」不该逼人先点开
+      + ` · 平均首字 ${fmtDelay(ttfb)} · 平均耗时 ${fmtDelay(duration)}`
     : '按每次真实上游尝试计,和顶部的请求总数不是同一个口径。';
 
   $('nstats').replaceChildren(...rows.map((r) => {
@@ -186,6 +189,9 @@ function renderNodeStats() {
       nm,
       num('', '尝试', fmtCount(r.requests)),
       num('', '成功率', fmtPercent(r.rate)),
+      // 只有成功的尝试才有耗时,所以没成功过的节点这两项是 '—' 而不是 0
+      num('', '首字', fmtDelay(r.ttfb)),
+      num('', '耗时', fmtDelay(r.duration)),
       // 上游没报 cached_tokens 时 cache 是 null → '—'。显示 0% 会被读成
       // 「试过、一次没命中」,而真相是「上游根本没给这个数」
       num(r.cache ? 'hit' : '', '缓存命中', fmtPercent(r.cache)),
@@ -196,9 +202,9 @@ function renderNodeStats() {
     const bad = (label, n) => {
       sub.append(tag(n ? 'bad' : '', `${label} ${fmtCount(n)}`), document.createTextNode(' · '));
     };
-    bad('429', r.rateLimited);
+    bad('限流', r.rateLimited);
     bad('超时', r.timeout);
-    bad('上游错误', r.upstreamError);
+    bad('错误', r.upstreamError);
     sub.append(document.createTextNode(
       `Token ${fmtTokens(r.totalTokens)}(入 ${fmtTokens(r.promptTokens)}`
       + ` · 出 ${fmtTokens(r.completionTokens)} · 推理 ${fmtTokens(r.reasoningTokens)}`

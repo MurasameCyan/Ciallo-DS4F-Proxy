@@ -25,6 +25,17 @@ services:
     ports:
       - "127.0.0.1:9527:9527"
 
+    # 想让同一台机器上别的 compose 项目(比如各种 agent 容器)直接按容器名连过来,
+    # 就把下面两段和文件末尾的 networks 一起解注释。加入同一个外部网络之后,
+    # 那些容器用 http://ciallo-ds4f-proxy:9527/v1 就能访问,不必绕
+    # host.docker.internal 或者宿主的回环端口 —— 回环映射在容器里连不上,而
+    # host.docker.internal 在 Linux 上默认不存在。上面的 ports 可以一起删掉,
+    # 只走内部网络的话面板和 API 都不再暴露到宿主。
+    # 网络得先自己建好(compose 不会替你建 external 的):
+    #   docker network create ai-internal
+    # networks:
+    #   - ai-internal
+
     environment:
       # 面板凭据。不设 PANEL_PASS 的话每次启动随机生成一个,
       # 密码只出现在 docker logs 里,容器一重启就变。
@@ -48,3 +59,9 @@ services:
 
 volumes:
   ciallo-data:
+
+# 配合上面 services.proxy.networks 一起解注释。external: true 是「这个网络我在
+# 外面建好了,别管它的生命周期」—— compose down 不会把它删掉,别的项目还连着。
+# networks:
+#   ai-internal:
+#     external: true

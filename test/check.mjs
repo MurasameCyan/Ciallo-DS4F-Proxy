@@ -146,6 +146,9 @@ t('fmtDelay:秒级换单位,没测过显示破折号', () => {
   assert.equal(fmtDelay(999), '999ms');
   assert.equal(fmtDelay(1000), '1.0s');
   assert.equal(fmtDelay(2480), '2.5s');
+  assert.equal(fmtDelay(59_999), '60.0s');
+  assert.equal(fmtDelay(60_000), '1.0m', '推理模型跑满预算时「92.4s」得能自己换成分钟');
+  assert.equal(fmtDelay(92_400), '1.5m');
   assert.equal(fmtDelay(null), '—');
   assert.equal(fmtDelay(0), '—', '0ms 不是真实结果');
   assert.equal(fmtDelay('x'), '—');
@@ -302,7 +305,10 @@ t('nodeStats 缺字段当 0,坏值不传染成 NaN', () => {
   assert.equal(r.cacheWriteTokens, 0);
   assert.equal(r.rate, 0.75);
   assert.equal(r.cache, 0.25);
-  assert.deepEqual(nodeStats(null), { rows: [], totals: { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 } });
+  assert.deepEqual(nodeStats(null), {
+    rows: [], totals: { requests: 0, success: 0, rateLimited: 0, timeout: 0, upstreamError: 0 },
+    ttfb: null, duration: null,
+  });
 });
 
 t('nodeStats 保留缓存字段存在性,兼容旧桶里的非零缓存', () => {
@@ -315,6 +321,49 @@ t('nodeStats 保留缓存字段存在性,兼容旧桶里的非零缓存', () => 
     requests: 1, promptTokens: 100, cacheReadTokens: 25,
   } }).rows[0];
   assert.equal(legacy.cache, 0.25, '旧桶的非零缓存读数本身足以证明上游报过数据');
+});
+
+t('nodeStats 耗时按样本数加权,不是对各节点的平均再平均', () => {
+  const { rows, ttfb, duration } = nodeStats({
+    // 跑了 100 次的快节点和跑了 1 次的慢节点:等权平均会算出 ~2.5s,
+    // 而实际经历过的平均值贴近 100ms 那一侧
+    fast: { requests: 100, success: 100, ttfbMs: 10_000, ttfbCount: 100, durationMs: 50_000, durationCount: 100 },
+    slow: { requests: 1, success: 1, ttfbMs: 5_000, ttfbCount: 1, durationMs: 9_000, durationCount: 1 },
+  });
+  assert.equal(rows.find((r) => r.name === 'fast').ttfb, 100);
+  assert.equal(rows.find((r) => r.name === 'slow').ttfb, 5_000);
+  assert.equal(ttfb, 15_000 / 101, '合计应是总和除以总样本数');
+  assert.equal(duration, 59_000 / 101);
+});
+
+t('nodeStats 没有成功样本时耗时是 null 而不是 0', () => {
+  // 一直超时的节点:显示 0ms 等于断言「零延迟」,而真相是无从得知
+  const { rows, ttfb, duration } = nodeStats({ A: { requests: 5, timeout: 5 } });
+  assert.equal(rows[0].ttfb, null);
+  assert.equal(rows[0].duration, null);
+  assert.equal(fmtDelay(rows[0].duration), '—');
+  assert.equal(ttfb, null);
+  assert.equal(duration, null);
+});
+
+t('节点统计标题显示平均首字与平均耗时,明细显示单节点耗时', () => {
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  assert.match(app, /平均首字\s*\$\{\s*fmtDelay\s*\(\s*ttfb\s*\)\s*\}/);
+  assert.match(app, /平均耗时\s*\$\{\s*fmtDelay\s*\(\s*duration\s*\)\s*\}/);
+  assert.match(app, /'首字',\s*fmtDelay\(r\.ttfb\)/);
+  assert.match(app, /'耗时',\s*fmtDelay\(r\.duration\)/);
+});
+
+t('节点统计用「限流」「错误」而不是 429 和上游错误', () => {
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const fn = app.match(/function renderNodeStats\(\)[\s\S]*?\n\}/)?.[0] || '';
+  assert.ok(fn, '应能定位 renderNodeStats');
+  assert.match(fn, /限流 \$\{fmtCount\(totals\.rateLimited\)\}/);
+  assert.match(fn, /错误 \$\{fmtCount\(totals\.upstreamError\)\}/);
+  assert.match(fn, /bad\('限流', r\.rateLimited\)/);
+  assert.match(fn, /bad\('错误', r\.upstreamError\)/);
+  assert.doesNotMatch(fn, /'?429/, '节点统计里不再出现 429 字样');
+  assert.doesNotMatch(fn, /上游错误/);
 });
 
 t('Token 消耗显示格式化后的缓存读写明细', () => {

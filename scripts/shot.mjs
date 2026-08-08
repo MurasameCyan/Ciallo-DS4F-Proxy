@@ -7,6 +7,7 @@
 //
 //   node scripts/shot.mjs                      # 默认三档宽度
 //   SIZES=1592x1150 node scripts/shot.mjs      # 只测一档
+//   EXPAND=1 node scripts/shot.mjs             # 顺带展开折叠的 <details> 再体检
 import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -167,6 +168,15 @@ async function main() {
       ready = result.value === true;
     }
     await sleep(600);                                 // 让过渡动画落定
+
+    // 折叠起来的 <details> 里面测不到布局:里头元素高宽都是 0,体检直接跳过。
+    // 节点统计默认折叠,每行又是最长的一行,不展开就永远查不到它溢出。
+    if (process.env.EXPAND) {
+      await s('Runtime.evaluate', {
+        expression: `document.querySelectorAll('details').forEach((d) => (d.open = true))`,
+      });
+      await sleep(400);
+    }
 
     const { result: audit } = await s('Runtime.evaluate', {
       expression: AUDIT, returnByValue: true,
