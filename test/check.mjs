@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
-  cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
+  cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown,
   fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, callLog, configPayload, updateHours,
 } from '../web/core.js';
 
@@ -215,6 +215,16 @@ t('endpointBase 原样沿用当前地址,不拼进程端口', () => {
   assert.equal(endpointBase('http://h:8080/'), 'http://h:8080/v1', '末尾斜杠不能变成 //v1');
   assert.equal(endpointBase(''), 'http://localhost:9527/v1', '没 origin 时给个能用的默认');
   assert.equal(endpointBase(null), 'http://localhost:9527/v1');
+});
+
+t('anthropicBase 是裸地址,不带 /v1(客户端自己拼 /v1/messages)', () => {
+  assert.equal(anthropicBase('https://ds4f.example.com'), 'https://ds4f.example.com',
+    'base 带 /v1 会被拼成 /v1/v1/messages');
+  assert.equal(anthropicBase('http://h:8080/'), 'http://h:8080', '末尾斜杠要去掉');
+  assert.equal(anthropicBase(''), 'http://localhost:9527', '没 origin 时退回本机默认');
+  assert.equal(anthropicBase(null), 'http://localhost:9527');
+  // 两个协议同源,只差末尾那段 /v1
+  assert.equal(endpointBase('https://a.b'), `${anthropicBase('https://a.b')}/v1`);
 });
 
 t('rankBreakdown 按请求数降序并截断', () => {
@@ -530,6 +540,19 @@ t('根元素常驻滚动条槽,展开调用日志不横向位移', () => {
   // 槽必须挂在滚动容器(视口 = 根元素)上,挂到 body 上不起作用
   const html = css.match(/^html\s*\{([^}]*)\}/m)?.[1] || '';
   assert.match(html, /scrollbar-gutter:\s*stable/, '根元素应预留滚动条槽');
+});
+
+t('概览大数字按卡片宽度缩放,窄三列档不溢出框', () => {
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  // cqi 要有基准,卡片必须先声明成查询容器 —— 漏了它 cqi 退化成视口宽,
+  // clamp 永远顶到 27px,窄档「1 天 3 时」照旧溢出
+  assert.match(css, /\.stat\s*\{[^}]*container-type:\s*inline-size/,
+    '.stat 要声明为查询容器,大数字缩放靠它做基准');
+  const big = css.match(/\.stat \.big\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(big, /font-size:\s*clamp\([^)]*cqi[^)]*\)/,
+    '大数字字号应随卡片宽度 clamp,固定 27px 会在最窄三列档溢出框外');
+  assert.match(big, /white-space:\s*nowrap/,
+    'nowrap 仍要保留,否则窄档带空格的值会断成两行把卡片顶高');
 });
 
 t('OpenCode 请求头开启状态使用绿色标签', () => {

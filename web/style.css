@@ -229,17 +229,25 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 /* ── 概览数字 ─────────────────────────────────────────── */
 
+/* 卡片声明为查询容器:大数字按卡片自身宽度缩放(见 .big 的 clamp)。
+   用容器查询而非媒体查询 —— 同一张卡在三列布局被 340px 侧栏挤窄、在单列布局
+   却很宽,宽度不是视口的简单函数,只有卡片自己知道该缩多少。 */
+.stat { container-type: inline-size; }
 .stat h3 {
   font-size: 11px; font-weight: 500; letter-spacing: .07em;
   text-transform: uppercase; color: var(--fg-2);
 }
 .stat .big {
   font-family: var(--mono);
-  font-size: 27px; font-weight: 600;
+  /* nowrap 防止「1 天 3 时」这类带空格的值在窄档断成两行把卡片顶高;
+     但 nowrap 会让它在最窄的三列档(首列被 340px 侧栏挤到 ~121px)横向溢出
+     框外,于是按卡片宽度缩字号 —— 宽屏保持 27px,窄到放不下时线性缩小。
+     ponytail: 上限是「365 天 23 时」这类超长串在最窄档仍可能溢出,真到那步
+     得截断或改 JS 量算,不为假想值买单。 */
+  font-size: clamp(18px, 16.5cqi, 27px); font-weight: 600;
   letter-spacing: -.02em;
   margin: 7px 0 5px;
   font-variant-numeric: tabular-nums;
-  /* 「1 天 3 时」这类带单位的值有空格,窄断点下会断成两行把卡片顶高一截 */
   white-space: nowrap;
 }
 .stat .sub { color: var(--fg-2); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -431,6 +439,8 @@ input[readonly] { color: var(--fg-2); }
 
 .copyrow { display: flex; gap: 7px; }
 .copyrow input { flex: 1; min-width: 0; }
+/* 接入地址那行:两颗协议按钮各占一半,和上面 input 的 flex:1 一个意思 */
+.copyrow.proto .btn { flex: 1; min-width: 0; }
 
 .err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
 

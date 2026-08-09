@@ -8,7 +8,7 @@
 import {
   LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
-  pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
+  pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown, COOLDOWN_MS,
   fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
 } from './core.js';
 
@@ -54,8 +54,8 @@ function setPill(el, cls, text) {
 }
 
 /**
- * 「订阅地址」右端那一个状态灯。原来是三个:网关的端口在接入卡的 Base URL 上
- * 已经有了,内核版本看一眼就够、不会变,真会动的只有节点数,所以只留这一个。
+ * 「订阅地址」右端那一个状态灯。原来是三个:网关能打开这个面板就说明活着
+ * (面板和 /v1 同一个 server),内核版本看一眼就够、不会变,真会动的只有节点数,所以只留这一个。
  *
  * 内核挂了的时候借它报出来 —— 只显示「无节点」的话,看不出是订阅没填还是
  * 内核死了,而这两件事要做的处置完全不同。
@@ -224,8 +224,8 @@ function renderCallLog() {
 }
 
 function renderConn() {
-  $('f-base').value = endpointBase(location.origin);
-  // 屏幕上永远是掩码;要用就点「复制」,那条路复制的是真值
+  // 屏幕上永远是掩码;要用就点「复制」,那条路复制的是真值。
+  // 两个协议的 base URL 不落框、点按钮时现算(见下面的 data-copy-proto 绑定)
   $('f-key').value = maskKey(S.cfg.apiKey || '');
 }
 
@@ -428,17 +428,27 @@ function wire() {
     }
   };
 
+  const copyToClipboard = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('已复制', 'ok');
+    } catch {
+      toast('复制失败,请手动选中', 'err');
+    }
+  };
+
   // 复制:key 那栏永远复制真值,不能把掩码复制出去
   for (const btn of document.querySelectorAll('[data-copy]')) {
-    btn.onclick = async () => {
-      const text = btn.dataset.copyReal === 'key' ? (S.cfg.apiKey || '') : $(btn.dataset.copy).value;
-      try {
-        await navigator.clipboard.writeText(text);
-        toast('已复制', 'ok');
-      } catch {
-        toast('复制失败,请手动选中', 'err');
-      }
-    };
+    btn.onclick = () => copyToClipboard(
+      btn.dataset.copyReal === 'key' ? (S.cfg.apiKey || '') : $(btn.dataset.copy).value);
+  }
+
+  // 接入地址:两个协议各复制自己的 base URL,现算 —— 取当前访问地址,和原 f-base 同源
+  for (const btn of document.querySelectorAll('[data-copy-proto]')) {
+    btn.onclick = () => copyToClipboard(
+      btn.dataset.copyProto === 'anthropic'
+        ? anthropicBase(location.origin)
+        : endpointBase(location.origin));
   }
 
   $('cfg-form').onsubmit = (e) => {

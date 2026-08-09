@@ -86,13 +86,16 @@
   <section class="card" aria-labelledby="h-conn">
     <div class="card-head"><h2 id="h-conn">接入</h2></div>
 
-    <label class="field">
-      <span class="lbl">Base URL</span>
-      <span class="copyrow">
-        <input type="text" id="f-base" readonly>
-        <button type="button" class="btn tiny" data-copy="f-base">复制</button>
+    <div class="field">
+      <span class="lbl">接入地址</span>
+      <!-- 一行两颗:各复制自己协议的 base URL。不再落只读框 —— 两条地址一个框摆不下,
+           且地址现算(取当前访问地址),点按钮时才拿。OpenAI 带 /v1,
+           Anthropic 裸地址(客户端自己拼 /v1/messages)。 -->
+      <span class="copyrow proto">
+        <button type="button" class="btn tiny" data-copy-proto="openai">复制 OpenAI 协议</button>
+        <button type="button" class="btn tiny" data-copy-proto="anthropic">复制 Anthropic 协议</button>
       </span>
-    </label>
+    </div>
 
     <label class="field">
       <span class="lbl">API Key</span>
@@ -117,7 +120,7 @@
 
     <form id="cfg-form" novalidate>
       <!-- 状态灯收成一个,贴在「订阅地址」右端。原来三个(网关/内核/节点)里
-           网关的端口在接入卡的 Base URL 上已经有了,内核版本看一眼就够,
+           网关能打开这个面板就说明活着(面板和 /v1 同一个 server),内核版本看一眼就够,
            真会动的只有节点数 —— 内核挂了的时候借这个灯报出来(见 app.js)。
            这里不用 <label> 包一圈:灯在 label 里会被读进输入框的名字,
            变成「订阅地址 节点 8/12 可用」。所以 div + <label for>。 -->

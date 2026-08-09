@@ -175,11 +175,23 @@ export function maskKey(k) {
  *
  * origin 已经带了协议和「非默认才出现」的端口(https://h/ 不带 443、
  * http://h:8080/ 带 8080),正是需要的行为,不用自己判断。
+ * 没有 origin 可用(比如 file:// 打开)时退回本机默认,总比给个空串好。
  */
+function baseOrigin(origin) {
+  return String(origin ?? '').replace(/\/+$/, '') || 'http://localhost:9527';
+}
+
+/** OpenAI 协议 base URL:带 /v1(客户端只往后拼 /chat/completions)。 */
 export function endpointBase(origin) {
-  const s = String(origin ?? '').replace(/\/+$/, '');
-  // 没有 origin 可用(比如 file:// 打开)时退回本机默认,总比给个空串好
-  return `${s || 'http://localhost:9527'}/v1`;
+  return `${baseOrigin(origin)}/v1`;
+}
+
+/**
+ * Anthropic 协议 base URL:裸地址,不带 /v1。Claude Code 这类客户端自己拼
+ * /v1/messages —— base 再带 /v1 就成了 /v1/v1/messages,握手直接 404。
+ */
+export function anthropicBase(origin) {
+  return baseOrigin(origin);
 }
 
 /** byModel / byDay 这种 { key: {requests,...} } 映射 -> 按请求数降序的数组 */
