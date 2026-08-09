@@ -43,8 +43,8 @@
 
 * { box-sizing: border-box; }
 
-/* 滚动条槽常驻。这页的高度会成倍变化(调用日志一展开就是两百行),不预留槽位
-   的话滚动条一出现视口就窄 15px,margin:0 auto 的 #main 连带顶栏一起左移半格。 */
+/* 滚动条槽常驻。展开调用日志会把页面顶过一屏,不预留槽位的话滚动条一出现
+   视口就窄 15px,margin:0 auto 的 #main 连带顶栏一起左移半格。 */
 html { color-scheme: dark light; scrollbar-gutter: stable; }
 
 body {
@@ -351,9 +351,20 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .nstat-summary .hint { font-weight: 400; }
 details[open] > .nstat-summary { margin-bottom: 13px; }
 
-/* 通栏卡,不限高:最多 200 行,而这张卡在最底下、页面本来就要滚到这儿,
-   再套一层内部滚动只会多一条滚动条抢手势。 */
-.nstats { display: grid; gap: 7px; }
+/* 通栏卡,限高 + 内部滚动。200 行铺开是十几屏,会把整页拽长、外层滚动条的滑块
+   压成一条线,别的卡片全被挤到那个尺度上去。
+   滚动条藏掉(要求如此):高度用 vh 而不是行高的整数倍,末行被切一半就是「下面
+   还有」仅剩的暗示;键盘滚动靠 <ul> 上的 tabindex,和运行日志一个做法。
+   不写 overscroll-behavior: contain —— 节点池和日志有可见滚动条,滚到底停住
+   是看得懂的;这儿滚动条藏了,停住只会像卡死。何况它是页面最后一个元素,
+   滚穿它就到底了,让滚动链下去没有代价。 */
+.nstats {
+  display: grid; gap: 7px;
+  max-height: 60vh; overflow-y: auto;
+  scrollbar-width: none;                 /* Firefox */
+}
+/* WebKit/Blink 不认 scrollbar-width,得单独关一次 */
+.nstats::-webkit-scrollbar { display: none; }
 
 .nstat {
   padding: 10px 12px;

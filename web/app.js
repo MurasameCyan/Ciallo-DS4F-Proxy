@@ -183,7 +183,12 @@ function renderCallLog() {
       + ` · 错误 ${fmtCount(totals.upstreamError)}`
     : '每条成功的上游调用记一行,失败的尝试只进运行日志。';
 
-  $('nstats').replaceChildren(...rows.map((r) => {
+  // 列表现在是自己的滚动容器(限高 + 藏起来的滚动条),而 replaceChildren 会把
+  // 内容清空一瞬间,scrollTop 被夹回 0 —— 不存回来的话每 2 秒轮询一次就把人
+  // 弹回顶部,翻旧记录根本翻不动
+  const ul = $('nstats');
+  const top = ul.scrollTop;
+  ul.replaceChildren(...rows.map((r) => {
     const li = document.createElement('li');
     li.className = 'nstat';
 
@@ -215,6 +220,7 @@ function renderCallLog() {
     li.append(main, sub);
     return li;
   }));
+  ul.scrollTop = top;
 }
 
 function renderConn() {

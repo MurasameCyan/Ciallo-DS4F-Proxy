@@ -504,6 +504,27 @@ t('调用日志合计不显示请求级与尝试级口径说明', () => {
   assert.match(html, /id="nstat-sum"[^>]*>\s*<\/span>/, '合计占位应为空,由 JS 填充');
 });
 
+t('调用日志限高内部滚动,滚动条隐藏但键盘可滚', () => {
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const rule = css.match(/^\.nstats\s*\{([^}]*)\}/m)?.[1] || '';
+
+  assert.match(rule, /max-height:/, '不限高的话 200 行会把页面拽到十几屏');
+  assert.match(rule, /overflow-y:\s*auto/);
+  assert.match(rule, /scrollbar-width:\s*none/, 'Firefox 侧要关滚动条');
+  assert.match(css, /\.nstats::-webkit-scrollbar\s*\{[^}]*display:\s*none/,
+    'WebKit/Blink 不认 scrollbar-width,得单独关');
+  // 藏了滚动条,鼠标之外的可供性就全靠这个:不可聚焦的滚动容器键盘滚不动
+  const ul = html.match(/<ul\b[^>]*class="nstats"[^>]*>/)?.[0] || '';
+  assert.match(ul, /tabindex="0"/, '隐藏滚动条的滚动区必须可聚焦');
+
+  // 轮询每 2 秒重建一次列表,不存回 scrollTop 就会把人弹回顶部
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
+  assert.match(fn, /const top = ul\.scrollTop/, '重建前应记下滚动位置');
+  assert.match(fn, /ul\.scrollTop = top/, '重建后应还原滚动位置');
+});
+
 t('根元素常驻滚动条槽,展开调用日志不横向位移', () => {
   const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
   // 槽必须挂在滚动容器(视口 = 根元素)上,挂到 body 上不起作用

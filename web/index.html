@@ -206,7 +206,9 @@
         <span class="hint" id="nstat-sum"></span>
       </h2>
     </summary>
-    <ul class="nstats" id="nstats" aria-label="每条成功调用一行,最近的排在最前"></ul>
+    <!-- tabindex:这个列表限高内部滚动而且滚动条是藏起来的,不可聚焦的话
+         键盘和读屏就没有任何办法滚它(运行日志同理) -->
+    <ul class="nstats" id="nstats" tabindex="0" aria-label="每条成功调用一行,最近的排在最前"></ul>
     <p class="empty" id="nstat-empty" hidden>还没有成功的调用 —— 发一次请求就会出现。</p>
   </details>
 </main>
