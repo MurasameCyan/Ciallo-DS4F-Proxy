@@ -20,6 +20,9 @@ import { fileURLToPath } from 'node:url';
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const PORT = Number(process.env.PORT) || 5173;
 const COOLDOWN_MS = 90_000;
+// 和 gateway.mjs 的同名常量对齐。这里不 import 它:预览刻意不依赖真网关代码,
+// 否则改坏了 gateway 连预览都起不来,而预览正是用来对界面的
+const CALL_LOG_LIMIT = 200;
 const REPO_URL = 'https://github.com/MurasameCyan/Ciallo-DS4F-Proxy';
 
 const MIME = {
@@ -55,7 +58,7 @@ const state = {
   testedAt: Date.now() - 42_000,
   usage: {
     total: { requests: 1284, success: 1197, fail: 87, promptTokens: 2_841_302, completionTokens: 986_441, reasoningTokens: 412_887, totalTokens: 3_827_743 },
-    byDay: {}, byModel: {}, byNode: {},
+    byDay: {}, byModel: {}, byNode: {}, calls: [],
     lastRequest: Date.now() - 4200,
     startTime: Date.now() - 3600_000 * 27,
   },
@@ -82,6 +85,26 @@ for (const [name, v] of [
   [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true, ttfbMs: 145_080, ttfbCount: 186, durationMs: 12_852_000, durationCount: 189, lastAt: Date.now() - 900, lastModel: 'north-mini-code-free', lastEffort: 'high' }],
   [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false, ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0, lastAt: Date.now() - 3600_000, lastModel: 'big-pickle', lastEffort: '' }],
 ]) state.usage.byNode[name] = v;
+
+// 调用日志的种子。要点是「同一个节点、同一个模型,连着几次强度不一样」——
+// 按节点聚合时这几条会互相覆盖成最后一次,而这张表存在的理由就是把它们拆开。
+// 顺序按时间正序(后端是 push 追加的),面板自己倒过来显示。
+// 另外凑齐几种边界:强度 '' 显示成 —(没发这个字段,随上游默认)、
+// ttfb 为 null(没测到首字节)、最长的模型名(布局最容易被挤坏的那个)。
+for (const [ago, node, model, effort, ttfb, ms, pt, ct, rt] of [
+  [26 * 60_000, NODES[2], 'deepseek-v4-flash-free', 'high', 1420, 8600, 3182, 741, 402],
+  [21 * 60_000, NODES[2], 'deepseek-v4-flash-free', 'max', 1610, 41_200, 3204, 2988, 2611],
+  [17 * 60_000, NODES[2], 'deepseek-v4-flash-free', '', 1380, 7900, 3190, 688, 351],
+  [12 * 60_000, NODES[0], 'north-mini-code-free', 'high', 890, 5400, 1204, 402, 96],
+  [8 * 60_000, NODES[6], 'big-pickle', '', null, 68_400, 8871, 1902, 0],
+  [3 * 60_000, NODES[0], 'deepseek-v4-flash-free', 'max', 1720, 39_800, 2044, 3102, 2740],
+  [42_000, NODES[2], 'deepseek-v4-flash-free', 'max', 1590, 44_100, 4127, 3311, 2904],
+]) {
+  state.usage.calls.push({
+    at: Date.now() - ago, node, model, effort, ttfb, ms,
+    in: pt, out: ct, reasoning: rt,
+  });
+}
 
 const clients = new Set();
 
@@ -171,9 +194,12 @@ function simulate() {
   });
   nb.requests++;
   nb.lastAt = Date.now();       // 面板按这个倒序,预览里也得跟着动才看得出重排
-  // 真实网关每次尝试都会覆盖这两个,预览不写的话 tick 一下就把行洗成 —
+  // 真实网关每次尝试都会覆盖这两个,预览不写的话 tick 一下就把行洗成 —。
+  // 强度轮着摇:调用日志要证明它能保住每一次的值,而不是像这个桶只留最后一次,
+  // 全用同一个强度就试不出来
   nb.lastModel = 'deepseek-v4-flash-free';
-  nb.lastEffort = 'max';
+  const effort = ['max', 'high', ''][Math.floor(Math.random() * 3)];
+  nb.lastEffort = effort;
 
   if (Math.random() < 0.12) {
     u.fail++;
@@ -207,6 +233,16 @@ function simulate() {
   if (state.cfg.opencodeIdentityHeaders) nb.hasCacheData = true;
   u.success++; u.promptTokens += pt; u.completionTokens += ct;
   u.reasoningTokens += rt; u.totalTokens += pt + ct;
+
+  // 每条成功的调用单独记一行,用的是上面那次尝试摇出来的强度
+  state.usage.calls.push({
+    at: Date.now(), node: state.current, model: nb.lastModel, effort,
+    ttfb: Math.floor(dt * (0.15 + Math.random() * 0.3)), ms: dt,
+    in: pt, out: ct, reasoning: rt,
+  });
+  if (state.usage.calls.length > CALL_LOG_LIMIT) {
+    state.usage.calls.splice(0, state.usage.calls.length - CALL_LOG_LIMIT);
+  }
   log('ok', `[ok] node="${state.current}" ${dt}ms tokens=${pt + ct}`);
 }
 
@@ -327,6 +363,7 @@ async function handleApi(req, res, path) {
     state.usage.byDay = {};
     state.usage.byModel = {};
     state.usage.byNode = {};      // 清零把两套口径一起清,只清一套会对不上
+    state.usage.calls = [];       // 调用日志同理:留着的话时间线里会横着一段清零前的旧记录
     state.usage.lastRequest = null;
     state.usage.startTime = Date.now();
     log('ok', '[usage] 用量已清零');

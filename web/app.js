@@ -9,7 +9,7 @@ import {
   LOG_LEVELS, fmtCount, fmtTokens, fmtUptime, fmtClock,
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, rankBreakdown, COOLDOWN_MS,
-  fmtDelay, delayGrade, fmtAgo, hasNewer, nodeStats, configPayload, updateHours,
+  fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -161,59 +161,56 @@ function num(cls, label, value) {
 }
 
 /**
- * 节点统计卡。数据来自 usage.byNode —— **每次真实上游尝试**记一笔,
- * 和顶部总览那套「一次客户端请求记一次」不是同一个口径,卡头那句提示
- * 就是为了让人别把两个数当成同一件事去对(见 core.js 的 nodeStats)。
+ * 调用日志卡。数据来自 usage.calls —— **每条成功的上游调用**一行,最近的在最前。
+ *
+ * 和按节点聚合的做法刻意不同:聚合桶里一个节点只留得下「最近一次用的模型和
+ * 强度」,同一个节点连着跑十次不同档位就只剩最后一次。排查「客户端设了 max
+ * 却变成 high」要的正是被覆盖掉的那几次(见 core.js 的 callLog)。
  */
-function renderNodeStats() {
-  const { rows, totals, ttfb, duration } = nodeStats(S.usage?.byNode);
+function renderCallLog() {
+  const { rows, tokens, ttfb, duration } = callLog(S.usage?.calls);
+  // 失败那三个数只有按节点聚合的桶里有(逐条记录只收成功的)。带上「累计」二字:
+  // 它们是开机至今的总数,和前面那段「最近 N 条」不是同一个窗口,不标出来会被当成
+  // 这 N 条里的失败数去减
+  const { totals } = nodeStats(S.usage?.byNode);
   $('nstat-empty').hidden = rows.length > 0;
   $('nstat-sum').textContent = rows.length
-    ? `总尝试 ${fmtCount(totals.requests)} · 成功 ${fmtCount(totals.success)}`
-      + ` · 限流 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
-      + ` · 错误 ${fmtCount(totals.upstreamError)}`
-      // 折叠状态下只看得见这一行,所以两个平均值放这儿:哪个节点慢要展开才知道,
+    ? `最近 ${fmtCount(rows.length)} 条 · Token ${fmtTokens(tokens)}`
+      // 折叠状态下只看得见这一行,所以两个平均值放这儿:哪一次慢要展开才知道,
       // 但「整体现在快不快」不该逼人先点开
       + ` · 平均首字 ${fmtDelay(ttfb)} · 平均耗时 ${fmtDelay(duration)}`
-    : '按每次真实上游尝试计,和顶部的请求总数不是同一个口径。';
+      + ` · 累计限流 ${fmtCount(totals.rateLimited)} · 超时 ${fmtCount(totals.timeout)}`
+      + ` · 错误 ${fmtCount(totals.upstreamError)}`
+    : '每条成功的上游调用记一行,失败的尝试只进运行日志。';
 
   $('nstats').replaceChildren(...rows.map((r) => {
     const li = document.createElement('li');
     li.className = 'nstat';
 
-    const nm = tag('nm', r.name);
-    nm.title = r.name;
+    // 时刻在最左:这张表是按时间倒序的,没有它就看不出两行差了多久。
+    // 和节点名拆成两个元素 —— 时刻要等宽数字才对得齐,节点名要能省略号截断
+    const at = tag('at', fmtClock(r.at));
+    const nm = tag('nm', r.node || '—');
+    nm.title = r.node;
     const main = document.createElement('div');
     main.className = 'nstat-main';
     main.append(
-      nm,
-      // 最近一次这个节点发出去的模型和思考强度,紧跟节点名 —— 排查「客户端设了
-      // max 却没生效」时要的就是这两个数,而它们必须挨着看才对得上。
+      at, nm,
+      // 模型和强度紧跟节点名 —— 排查透传时要的就是这两个数,必须挨着看才对得上。
       // 强度 '—' = 没发这个字段(随上游默认),和显式发了 high 是两回事。
-      num('', '模型', r.lastModel || '—'),
-      num('', '强度', r.lastEffort || '—'),
-      num('', '尝试', fmtCount(r.requests)),
-      num('', '成功率', fmtPercent(r.rate)),
-      // 只有成功的尝试才有耗时,所以没成功过的节点这两项是 '—' 而不是 0
+      num('', '模型', r.model || '—'),
+      num('', '强度', r.effort || '—'),
       num('', '首字', fmtDelay(r.ttfb)),
-      num('', '耗时', fmtDelay(r.duration)),
-      // 上游没报 cached_tokens 时 cache 是 null → '—'。显示 0% 会被读成
-      // 「试过、一次没命中」,而真相是「上游根本没给这个数」
-      num(r.cache ? 'hit' : '', '缓存命中', fmtPercent(r.cache)),
+      num('', '耗时', fmtDelay(r.ms)),
+      num('', 'Token', fmtTokens(r.total)),
     );
 
     const sub = document.createElement('p');
     sub.className = 'sub';
-    const bad = (label, n) => {
-      sub.append(tag(n ? 'bad' : '', `${label} ${fmtCount(n)}`), document.createTextNode(' · '));
-    };
-    bad('限流', r.rateLimited);
-    bad('超时', r.timeout);
-    bad('错误', r.upstreamError);
-    sub.append(document.createTextNode(
-      `Token ${fmtTokens(r.totalTokens)}(入 ${fmtTokens(r.promptTokens)}`
-      + ` · 出 ${fmtTokens(r.completionTokens)} · 推理 ${fmtTokens(r.reasoningTokens)}`
-      + ` · 缓存读 ${fmtTokens(r.cacheReadTokens)} / 写 ${fmtTokens(r.cacheWriteTokens)})`));
+    // 推理 token 单列:它不计入 total(上游把它算在 completion 里),
+    // 但「这次到底想了多少」是判断强度有没有生效最直接的一个数
+    sub.textContent = `入 ${fmtTokens(r.in)} · 出 ${fmtTokens(r.out)}`
+      + ` · 推理 ${fmtTokens(r.reasoning)}`;
 
     li.append(main, sub);
     return li;
@@ -310,7 +307,7 @@ async function refresh() {
     // 服务端给秒,进来立刻折算成本地截止点,之后本地走秒不用等下次轮询
     S.cooldowns = (pool?.cooldowns || []).map((c) => ({ node: c.node, deadline: cooldownDeadline(c.remain) }));
 
-    renderPills(); renderStats(); renderNodes(); renderNodeStats();
+    renderPills(); renderStats(); renderNodes(); renderCallLog();
     renderConn(); renderModels(); renderBuild();
 
     // 表单不在用户编辑时才回填,否则打字会被覆盖

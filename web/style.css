@@ -336,7 +336,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 .empty { color: var(--fg-2); font-size: 13px; padding: 14px 2px; }
 
-/* ── 节点统计 ─────────────────────────────────────────── */
+/* ── 调用日志 ─────────────────────────────────────────── */
 
 /* 原生 summary 保留浏览器自带的展开标记和键盘行为；内部继续沿用卡头布局。 */
 .nstat-summary { cursor: pointer; }
@@ -349,8 +349,8 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .nstat-summary .hint { font-weight: 400; }
 details[open] > .nstat-summary { margin-bottom: 13px; }
 
-/* 通栏卡,不限高:行数 == 用过的节点数,比节点池只少不多,而且这张卡在最底下,
-   页面本来就要滚到这儿,再套一层内部滚动只会多一条滚动条抢手势。 */
+/* 通栏卡,不限高:最多 200 行,而这张卡在最底下、页面本来就要滚到这儿,
+   再套一层内部滚动只会多一条滚动条抢手势。 */
 .nstats { display: grid; gap: 7px; }
 
 .nstat {
@@ -360,14 +360,20 @@ details[open] > .nstat-summary { margin-bottom: 13px; }
   background: var(--card-2);
 }
 
-/* 数字全用行内标签(「尝试 12」)而不是表头列:flex-wrap 一开,窄屏自动折行,
+/* 数字全用行内标签(「强度 max」)而不是表头列:flex-wrap 一开,窄屏自动折行,
    不会有对不齐的表头,也就永远不会横向溢出。 */
 .nstat-main {
   display: flex; align-items: baseline;
   flex-wrap: wrap; gap: 6px 14px;
 }
+/* 时刻不参与伸缩:等宽 + 固定宽度,竖着扫一眼就能比出两行差了多久 */
+.nstat .at {
+  flex: 0 0 auto;
+  font-family: var(--mono); font-size: 12px; color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+}
 .nstat .nm {
-  flex: 1 1 180px; min-width: 0;
+  flex: 1 1 140px; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 13px; font-weight: 600;
 }
@@ -383,8 +389,6 @@ details[open] > .nstat-summary { margin-bottom: 13px; }
   font-family: var(--mono); font-size: 11px; color: var(--fg-2);
   font-variant-numeric: tabular-nums;
 }
-/* 有过 429/超时/错误的那几项标出来,一眼看出是哪个节点在拖后腿 */
-.nstat .sub .bad { color: var(--amber); }
 
 /* ── 表单 ─────────────────────────────────────────────── */
 

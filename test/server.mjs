@@ -30,7 +30,7 @@ delete process.env.API_KEY;
 
 const {
   NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
-  identityHeaders, OPENAI, ANTHROPIC,
+  identityHeaders, OPENAI, ANTHROPIC, CALL_LOG_LIMIT,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -276,6 +276,118 @@ await t('清零把 byNode 一起清(只清一半会让两套口径对不上)', (
   u.reset();
   assert.deepEqual(u.getStats().byNode, {});
   assert.deepEqual(new UsageTracker(f, () => {}).getStats().byNode, {}, '清零得落盘');
+});
+
+// ── 调用日志(calls)──────────────────────────────────────
+
+await t('每条成功调用单独记一行,同一节点的不同强度都留得住', () => {
+  // 这条是这套记录存在的理由:byNode 的 lastEffort 会被后一次覆盖成 '',
+  // 而排查「客户端设了 max 却变成 high」要看的正是被覆盖掉的那几次
+  const u = new UsageTracker(path.join(TMP, 'calls1.json'), () => {});
+  const mk = (effort) => u.recordAttempt('A', 'success',
+    { prompt_tokens: 10, completion_tokens: 4, completion_tokens_details: { reasoning_tokens: 2 } },
+    { ttfb: 100, total: 900 }, { model: 'ds4f', effort });
+  mk('high'); mk('max'); mk('');
+
+  const c = u.getStats().calls;
+  assert.equal(c.length, 3, '三次调用三行,不是覆盖成一行');
+  assert.deepEqual(c.map((x) => x.effort), ['high', 'max', ''], '按发生顺序追加');
+  assert.equal(u.getStats().byNode.A.lastEffort, '', '对照:聚合桶里只剩最后一次');
+  assert.equal(c[0].node, 'A');
+  assert.equal(c[0].model, 'ds4f');
+  assert.equal(c[0].in, 10);
+  assert.equal(c[0].out, 4);
+  assert.equal(c[0].reasoning, 2);
+  assert.equal(c[0].ttfb, 100);
+  assert.equal(c[0].ms, 900);
+  assert.ok(c[0].at > 0, '得有时间戳,面板靠它排序和显示时刻');
+});
+
+await t('只有成功的调用进日志(失败的没 token 没耗时,会把跑通的挤出窗口)', () => {
+  const u = new UsageTracker(path.join(TMP, 'calls2.json'), () => {});
+  u.recordAttempt('A', 'rateLimited', null, null, { model: 'm', effort: 'max' });
+  u.recordAttempt('A', 'timeout');
+  u.recordAttempt('A', 'upstreamError');
+  assert.deepEqual(u.getStats().calls, [], '失败的三类都不进');
+  // 但它们在 byNode 的计数里得留着 —— 面板的「累计限流/超时/错误」读的就是那儿
+  assert.equal(u.getStats().byNode.A.rateLimited, 1);
+  assert.equal(u.getStats().byNode.A.timeout, 1);
+  assert.equal(u.getStats().byNode.A.upstreamError, 1);
+});
+
+await t('没有 usage / timing 的成功调用也记一行,缺的字段归零而不是 undefined', () => {
+  const u = new UsageTracker(path.join(TMP, 'calls3.json'), () => {});
+  u.recordAttempt('A', 'success');                              // 上游没报 usage
+  u.recordAttempt('B', 'success', null, { ttfb: 0, total: 500 });  // 流开了没收到 chunk
+  const [a, b] = u.getStats().calls;
+  assert.equal(a.in, 0);
+  assert.equal(a.out, 0);
+  assert.equal(a.reasoning, 0);
+  assert.equal(a.ttfb, null, '没 timing 就是 null,不能是 undefined —— JSON 会把它整个键丢掉');
+  assert.equal(a.ms, null);
+  assert.equal(a.model, '', '不传 call 时归一成空串,前端靠它兜底显示 —');
+  assert.equal(a.effort, '');
+  // ttfb 记 0 会把平均值稀释成谁都没经历过的数,和 byNode 那边同一个判断
+  assert.equal(b.ttfb, null, '测不到首字节存 null');
+  assert.equal(b.ms, 500, '总耗时是真实的 500,照记');
+});
+
+await t('调用日志到上限就丢最旧的,不会把文件撑爆', () => {
+  const u = new UsageTracker(path.join(TMP, 'calls4.json'), () => {});
+  for (let i = 0; i < CALL_LOG_LIMIT + 30; i++) {
+    u.recordAttempt('A', 'success', null, null, { model: `m${i}`, effort: 'max' });
+  }
+  const c = u.getStats().calls;
+  assert.equal(c.length, CALL_LOG_LIMIT, '窗口固定,不随时间无限涨');
+  assert.equal(c[0].model, 'm30', '丢的是最旧的那 30 条');
+  assert.equal(c.at(-1).model, `m${CALL_LOG_LIMIT + 29}`, '最新的一定在');
+});
+
+await t('清零把 calls 一起清(留着的话时间线里会横着一段清零前的旧记录)', () => {
+  const f = path.join(TMP, 'calls5.json');
+  const u = new UsageTracker(f, () => {});
+  u.recordAttempt('A', 'success', { prompt_tokens: 1 }, null, { model: 'm', effort: 'max' });
+  u.record('m', { prompt_tokens: 1, total_tokens: 1 }, true);   // 顺手落盘
+  u.reset();
+  assert.deepEqual(u.getStats().calls, []);
+  assert.deepEqual(new UsageTracker(f, () => {}).getStats().calls, [], '清零得落盘');
+});
+
+await t('旧 usage.json 没有 calls 时补空数组,不编造历史条目', () => {
+  const f = path.join(TMP, 'old-calls.json');
+  fs.writeFileSync(f, JSON.stringify({
+    total: { requests: 3, success: 3, fail: 0 }, byDay: {}, byModel: {},
+    // 聚合桶里的 lastModel/lastEffort 只够还原最近一次,拆不出这 3 次分别是什么
+    byNode: { A: { requests: 3, success: 3, lastModel: 'ds4f', lastEffort: 'max' } },
+    lastRequest: null, startTime: 123,
+  }));
+  const u = new UsageTracker(f, () => {});
+  assert.deepEqual(u.getStats().calls, []);
+  u.recordAttempt('A', 'success', null, null, { model: 'ds4f', effort: 'high' });
+  assert.equal(u.getStats().calls.length, 1, '补完之后照常能记');
+});
+
+await t('文件里存了超量 calls 时加载就裁到上限(换小上限后不该一直超着)', () => {
+  const f = path.join(TMP, 'fat-calls.json');
+  const fat = Array.from({ length: CALL_LOG_LIMIT + 50 }, (_, i) => ({ at: i, node: 'A', model: `m${i}` }));
+  fs.writeFileSync(f, JSON.stringify({
+    total: { requests: 0, success: 0, fail: 0 }, byDay: {}, byModel: {}, byNode: {},
+    calls: fat, lastRequest: null, startTime: 123,
+  }));
+  const c = new UsageTracker(f, () => {}).getStats().calls;
+  assert.equal(c.length, CALL_LOG_LIMIT);
+  assert.equal(c.at(-1).model, `m${CALL_LOG_LIMIT + 49}`, '裁的是旧的那头');
+});
+
+await t('calls 坏成对象/字符串时退回空数组,不让面板拿着它去 map', () => {
+  for (const bad of [{}, 'nope', 42]) {
+    const f = path.join(TMP, `bad-calls-${typeof bad}.json`);
+    fs.writeFileSync(f, JSON.stringify({
+      total: { requests: 0, success: 0, fail: 0 }, byDay: {}, byModel: {}, byNode: {},
+      calls: bad, lastRequest: null, startTime: 1,
+    }));
+    assert.deepEqual(new UsageTracker(f, () => {}).getStats().calls, []);
+  }
 });
 
 // ── OpenCode 身份头 ─────────────────────────────────────

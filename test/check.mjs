@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, rankBreakdown,
-  fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, configPayload, updateHours,
+  fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, callLog, configPayload, updateHours,
 } from '../web/core.js';
 
 let n = 0;
@@ -372,23 +372,90 @@ t('nodeStats 没有成功样本时耗时是 null 而不是 0', () => {
   assert.equal(duration, null);
 });
 
-t('节点统计标题显示平均首字与平均耗时,明细显示单节点耗时', () => {
+// ── 调用日志 ────────────────────────────────────────────
+
+t('callLog 逐条保留同一节点的不同强度,不像聚合桶只剩最后一次', () => {
+  // 这条就是这张表存在的理由:同一个节点连着跑三个档位,按节点聚合只留得下 ''
+  const { rows } = callLog([
+    { at: 1, node: 'A', model: 'ds4f', effort: 'high' },
+    { at: 2, node: 'A', model: 'ds4f', effort: 'max' },
+    { at: 3, node: 'A', model: 'ds4f', effort: '' },
+  ]);
+  assert.deepEqual(rows.map((r) => r.effort), ['', 'max', 'high'], '最近的排最前');
+});
+
+t('callLog 用数组顺序倒排,同一毫秒内也保真实先后', () => {
+  // 按 at 排序会把同毫秒的两条打乱;后端是 push 追加的,数组本身就是时间序
+  const { rows } = callLog([
+    { at: 5, node: 'first' }, { at: 5, node: 'second' }, { at: 5, node: 'third' },
+  ]);
+  assert.deepEqual(rows.map((r) => r.node), ['third', 'second', 'first']);
+});
+
+t('callLog 的 ttfb 分清 null 和 0,坏值不传染成 NaN', () => {
+  const { rows } = callLog([
+    { at: 1, node: 'A', ttfb: 0, ms: 0 },
+    { at: 2, node: 'B', ttfb: null, ms: null },
+    { at: 3, node: 'C', ttfb: 'oops', ms: 'oops' },
+    { at: 4, node: 'D', ttfb: 1200, ms: 3400 },
+  ]);
+  const by = Object.fromEntries(rows.map((r) => [r.node, r]));
+  // 测不到首字节和「零延迟」不是一回事,两者都显示 —,但 ms=0 是个真实的数
+  assert.equal(by.A.ttfb, null, 'ttfb 为 0 等于没测到');
+  assert.equal(by.A.ms, 0, 'ms 为 0 是真实值,保留');
+  assert.equal(by.B.ttfb, null);
+  assert.equal(by.C.ttfb, null);
+  assert.equal(by.C.ms, null, '坏值归一成 null,不能变 NaN');
+  assert.equal(fmtDelay(by.C.ms), '—');
+  assert.equal(by.D.ttfb, 1200);
+});
+
+t('callLog 平均值按有样本的条数算,推理 token 不进 total', () => {
+  const { rows, tokens, ttfb, duration } = callLog([
+    { at: 1, node: 'A', in: 100, out: 20, reasoning: 500, ttfb: 1000, ms: 4000 },
+    { at: 2, node: 'B', in: 200, out: 30, reasoning: 0 },   // 没有耗时样本
+  ]);
+  assert.equal(rows[1].total, 120, 'total 只算入+出 —— 推理已经含在出里了');
+  assert.equal(tokens, 350);
+  assert.equal(ttfb, 1000, '分母是有样本的那一条,不是两条');
+  assert.equal(duration, 4000);
+});
+
+t('callLog 修掉两头空格,坏条目直接跳过', () => {
+  const { rows } = callLog([
+    null, 'nope', 42,
+    { at: 1, node: ' 🇭🇰 香港 01 ', model: ' ds4f ', effort: ' max ' },
+  ]);
+  assert.equal(rows.length, 1, '坏条目不占一行');
+  // 空格来自落盘数据,渲染前就该修掉,否则面板上是「模型  ds4f 」
+  assert.equal(rows[0].node, '🇭🇰 香港 01');
+  assert.equal(rows[0].model, 'ds4f');
+  assert.equal(rows[0].effort, 'max');
+});
+
+t('callLog 没有数据时给空表而不是崩', () => {
+  for (const bad of [null, undefined, {}, 'x']) {
+    assert.deepEqual(callLog(bad), { rows: [], tokens: 0, ttfb: null, duration: null });
+  }
+});
+
+t('调用日志标题显示平均首字与平均耗时,明细显示单次耗时', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   assert.match(app, /平均首字\s*\$\{\s*fmtDelay\s*\(\s*ttfb\s*\)\s*\}/);
   assert.match(app, /平均耗时\s*\$\{\s*fmtDelay\s*\(\s*duration\s*\)\s*\}/);
   assert.match(app, /'首字',\s*fmtDelay\(r\.ttfb\)/);
-  assert.match(app, /'耗时',\s*fmtDelay\(r\.duration\)/);
+  assert.match(app, /'耗时',\s*fmtDelay\(r\.ms\)/);
 });
 
-t('节点统计用「限流」「错误」而不是 429 和上游错误', () => {
+t('调用日志用「限流」「错误」而不是 429 和上游错误,且标明是累计口径', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const fn = app.match(/function renderNodeStats\(\)[\s\S]*?\n\}/)?.[0] || '';
-  assert.ok(fn, '应能定位 renderNodeStats');
-  assert.match(fn, /限流 \$\{fmtCount\(totals\.rateLimited\)\}/);
+  const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
+  assert.ok(fn, '应能定位 renderCallLog');
+  assert.match(fn, /累计限流 \$\{fmtCount\(totals\.rateLimited\)\}/,
+    '失败数是开机至今的总数,不加「累计」会被当成这几条里的失败数');
   assert.match(fn, /错误 \$\{fmtCount\(totals\.upstreamError\)\}/);
-  assert.match(fn, /bad\('限流', r\.rateLimited\)/);
-  assert.match(fn, /bad\('错误', r\.upstreamError\)/);
-  assert.doesNotMatch(fn, /'?429/, '节点统计里不再出现 429 字样');
+  assert.match(fn, /最近 \$\{fmtCount\(rows\.length\)\} 条/, '逐条那段要标明只是最近一批');
+  assert.doesNotMatch(fn, /'?429/, '调用日志里不出现 429 字样');
   assert.doesNotMatch(fn, /上游错误/);
 });
 
@@ -400,7 +467,7 @@ t('Token 消耗显示格式化后的缓存读写明细', () => {
   assert.ok(html.includes('缓存读 — · 缓存写 —'));
 });
 
-t('节点统计使用默认关闭且结构完整的原生折叠', () => {
+t('调用日志使用默认关闭且结构完整的原生折叠', () => {
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   const details = html.match(/<details\b[^>]*class="card span3"[^>]*>[\s\S]*?<\/details>/)?.[0] || '';
   const opening = details.match(/^<details\b[^>]*>/)?.[0] || '';
@@ -408,18 +475,26 @@ t('节点统计使用默认关闭且结构完整的原生折叠', () => {
   const summaryBody = summary.match(/^<summary\b[^>]*>([\s\S]*)<\/summary>$/)?.[1] || '';
   const body = details.slice(details.indexOf(summary) + summary.length);
 
-  assert.ok(details, '应存在节点统计 details');
-  assert.doesNotMatch(opening, /\sopen(?:\s|=|>)/, '节点统计默认应折叠');
+  assert.ok(details, '应存在调用日志 details');
+  assert.doesNotMatch(opening, /\sopen(?:\s|=|>)/, '调用日志默认应折叠');
   assert.equal(summaryBody.match(/<h2\b/g)?.length, 1, 'summary 内应只有一个 heading');
   assert.match(summaryBody, /^\s*<h2\b[^>]*id="h-nstat"[^>]*>[\s\S]*?<\/h2>\s*$/,
-    'summary 的唯一顶层内容应为节点统计 heading');
+    'summary 的唯一顶层内容应为调用日志 heading');
   assert.match(summary, /id="nstat-sum"/, '动态合计应位于 summary 内');
   assert.doesNotMatch(summary, /id="(?:nstats|nstat-empty)"/, '折叠正文不应混入 summary');
-  assert.match(body, /id="nstats"/, '节点明细应位于 summary 之后的 details 正文');
-  assert.match(body, /id="nstat-empty"/, '节点空态应位于 summary 之后的 details 正文');
+  assert.match(body, /id="nstats"/, '逐条明细应位于 summary 之后的 details 正文');
+  assert.match(body, /id="nstat-empty"/, '空态应位于 summary 之后的 details 正文');
 });
 
-t('节点统计合计不显示请求级与尝试级口径说明', () => {
+t('调用日志卡标题就叫「调用日志」', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.match(html, /<span class="nstat-title">调用日志<\/span>/);
+  // 「节点统计」是按节点聚合的旧口径,同一节点只留得下最近一次的模型和强度;
+  // 名字留着会让人以为展开还是那张表
+  assert.ok(!html.includes('节点统计'), '旧标题不该残留');
+});
+
+t('调用日志合计不显示请求级与尝试级口径说明', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   assert.ok(!app.includes('一次客户端请求换几个节点就记几笔'));

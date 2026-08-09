@@ -82,6 +82,32 @@ claude
 
 `Authorization: Bearer` 和 `x-api-key` 两个头都认 —— Anthropic 的 SDK 只发后者,只认 Bearer 的话客户端会收到 401,然后把它显示成「模型不存在或你没有权限」,排查方向直接被带偏。
 
+### 中间套了 CLIProxyAPI 的话
+
+链路是 `Claude Code → CLIProxyAPI → 本网关` 时,思考强度会在中间那一跳被改掉:面板上显示的永远是 `high`,哪怕客户端选的是 `max`。
+
+原因在 cpa 的配置默认值。`openai-compatibility` 渠道的模型如果没写 `thinking`,cpa 给它的档位表就是 `["low", "medium", "high"]`(见 cpa 的 `config.example.yaml`:*omit to default to levels ["low","medium","high"]*);它的 `clampLevel` 会把**不在这张表里**的档位夹到表内最接近的一档,`max` 最近的邻居就是 `high`。低档能正常透传就是这个道理 —— `low` 本来就在表里,压根不走夹取那条分支。
+
+在 cpa 的 `config.yaml` 里给这个模型显式声明档位表:
+
+```yaml
+openai-compatibility:
+  - name: "zen2api"
+    base-url: "https://你的网关地址/v1"
+    api-key-entries:
+      - api-key: "<网关的 Key>"
+    models:
+      - name: "deepseek-v4-flash-free"
+        alias: "deepseek-v4-flash-free"
+        thinking:
+          levels: ["low", "medium", "high", "max"]
+```
+
+两个坑:
+
+- **`base-url` 必须带 `/v1`。** 少了它 cpa 打的是 `/chat/completions`,那不是 API 路径。本网关对页面路径上的非 GET 请求一律回 404 JSON 就是为了让这个错当场看得出来 —— 早先那版会 302 到登录页,cpa 跟着跳转拿到 200 + 一坨登录页 HTML,当成模型的回答转给了客户端。
+- **别往 `levels` 里加 `xhigh`。** 上游对 DS4F 只认 `high` 和 `max`,`xhigh` 会被直接丢掉、退回默认档。网关自己会把 `xhigh` 折成该模型的最高档,但那只发生在 Anthropic 入站那条路上;cpa 是拿 `reasoning_effort` 直接打 OpenAI 路由的,折不到。
+
 ### 路由表
 
 | 路由 | 协议 | 说明 |
@@ -104,6 +130,10 @@ claude
 
 **推理内容。** `deepseek-v4-flash-free` 这类模型会先吐几分钟 `reasoning_content` 再出正文(实测「写个 SVG 动画」的提问 200 秒内推理 68000 字、正文 0 字)。这个字段在 OpenAI 协议里原样透传;在 Anthropic 协议里翻译成 `thinking` 块 —— 丢掉它的话客户端在 `message_start` 之后几分钟收不到任何事件,看起来就是卡死,而上游其实一直在吐。客户端下一轮带回 assistant `thinking` 时,网关会把原推理文本还原为 `reasoning_content` 交还上游,避免 thinking 模式报“必须回传 reasoning_content”。`SHOW_THINKING=0` 可以关掉,那时推理内容整段丢弃,也不占块序号。
 
+**思考强度透传。** 没有开关也没有配置项,客户端发什么就折算成什么。四种写法都认:`reasoning_effort`(OpenAI 顶层)、`reasoning.effort`、`output_config.effort`(Anthropic 现行 —— 新版 Claude Code 发的是这个)、`thinking.budget_tokens`(Anthropic 旧写法,按 2048 / 8000 / 16000 折成 low / medium / high,再往上是这个模型的最高档)。`thinking.type` 是 `adaptive` 时按开了思考算。
+
+**上游认得的档位每个模型不一样,所以按模型折。** 上游对认不出的档位是**直接丢字段**而不是降级,于是「发了个它不认的档位」和「什么都没发」结果一样 —— 这正是 `xhigh` 一度静默失效的原因(那是 Claude Code 的默认档)。网关的做法是把 `xhigh` 和 `max` 都视为「要最高档」,再按模型落地:`deepseek-v4-flash-free` 折成 `max`,其余模型折成 `high`。客户端明确关掉思考时不发这个字段 —— DS4F 关不掉思考,硬塞个最低档也会被上游丢掉,不如让它走默认,至少行为可预期。面板的调用日志里逐条记着实际发出去的档位,`—` 表示没发这个字段(随上游默认),和显式发了 `high` 是两回事。
+
 **超时预算。** 一个请求从进来到回复上限 75 秒,剩不到 8 秒就不再开新尝试,直接回 504。不这么管的话,轮换会把单个请求拖到客户端自己超时,报出来的错和真实原因完全对不上。**流式没有总时长上限** —— 只要上游还在吐(哪怕吐的全是推理),就一直转发;彻底没动静 120 秒才判定断流。
 
 **流开始后不重试。** 头一旦发出去,响应就定型了;这时候再换节点重发等于把两半响应拼给客户端。所以 `writeHead` 之后的任何失败都只做收尾 —— Anthropic 那边会补一个合法的 `error` + `message_stop`,客户端不会挂到超时。
@@ -124,7 +154,7 @@ claude
 | 配置 | 订阅地址（右端一个节点状态灯）+ 自动更新订阅周期 + 「保存并应用」+ OpenCode 请求头开关，以及「重启内核」「清零统计」「手动重置」 |
 | 运行日志 | 内核和网关的实时日志 |
 | 节点池 | 按实测延迟排序,从上往下就是网关接下来会用的顺序。每行带延迟数字,当前节点标出来,冷却中的显示剩余秒数,测不通的划掉垫在最底下 |
-| 节点统计 | 默认折叠,标题那行就写着平均首字和平均耗时。展开后按真实上游尝试展示每个节点的成功率、首字、耗时、限流、超时、错误、Token 与缓存命中率 |
+| 调用日志 | 默认折叠,标题那行写着最近多少条、Token、平均首字、平均耗时,以及累计的限流 / 超时 / 错误。展开后**每条成功的上游调用一行**:时刻、节点、模型、思考强度、首字、耗时、Token(入 / 出 / 推理) |
 
 **登录。** 没登录时任何页面都会被送到 `/login`,填 `PANEL_USER` / `PANEL_PASS`。这是面板自己的一页,不是浏览器那个凭据弹框 —— 弹框是 401 响应里的 `WWW-Authenticate` 头带出来的,样式不可控、密码错了给不出自己的提示、想退出只能关浏览器。现在服务端一律不发这个头,所以浏览器不再弹框。
 
@@ -142,7 +172,9 @@ API Key 屏幕上永远是掩码,只有「重置」和「复制」两个动作 �
 
 **OpenCode 请求头。** 开关排在「保存并应用」下方,但仍是这张表的一部分 —— 和订阅地址、更新周期一起提交才生效。默认关闭，出站仍是原来的 `User-Agent: node`。开启后会透传客户端给出的 OpenCode request/session/project/client 等请求头，缺失的 request/session ID 为当前客户端请求补默认值；同一请求换节点重试会复用同一组 ID，下一次客户端请求会生成新 ID。只改这个开关不会刷新订阅、测速、重启 mihomo、重写 mihomo 配置或重排自动更新时间。
 
-「清零统计」把请求数、Token 用量、按模型分项和按节点尝试统计全部归零并落盘,不可恢复,所以会先问一次。它不动订阅和 Key。
+**调用日志逐条记,不按节点覆盖。** 每条成功的上游调用单独一行,保留最近 200 条(超出丢最旧的)。按节点聚合的桶只留得下「最近一次用的模型和强度」,同一个节点连着跑三个档位就只剩最后一次 —— 而排查「客户端设了 max,到底哪一跳给改成了 high」要看的正是被覆盖掉的那几次。失败的尝试不进这张表:限流和超时在运行日志里有,而它们没有 token、没有耗时,逐条列出来只会把真正跑通的请求挤出那 200 条窗口;它们的累计数就显示在标题那行。
+
+「清零统计」把请求数、Token 用量、按模型分项、按节点尝试统计和调用日志全部归零并落盘,不可恢复,所以会先问一次。它不动订阅和 Key。
 
 **构建 hash 和检查更新。** 页头右端那个等宽小牌子是当前镜像的构建 commit(点它跳到那次提交),旁边 ⟳ 拿它和 GitHub 上 `beta` 的 HEAD 比一下。**只在你点的时候才出站** —— 匿名 GitHub API 每小时 60 次,自动轮询会烧光,而且它一小时也变不了几次。有新版本时牌子变琥珀色,`docker compose pull && docker compose up -d` 之后牌子自己恢复(比的是两个 hash,不是那次检查的结果)。
 
@@ -157,7 +189,7 @@ API Key 屏幕上永远是掩码,只有「重置」和「复制」两个动作 �
 | 文件 | 内容 |
 | --- | --- |
 | `config.json` | 订阅地址、API Key、端口、`opencodeIdentityHeaders` 开关和 `subscriptionUpdateHours` 周期。**含机场 token**，别往外发 |
-| `usage.json` | 客户端请求累计统计(`total` / `byDay` / `byModel`)和节点尝试统计(`byNode`)。「清零统计」写的就是它 |
+| `usage.json` | 客户端请求累计统计(`total` / `byDay` / `byModel`)、节点尝试统计(`byNode`)和逐条调用日志(`calls`,最近 200 条)。「清零统计」写的就是它 |
 | `mihomo-zen.yaml` | 生成的内核配置,每次改订阅地址重写 |
 | `mihomo-data/` | 内核自己的缓存(provider 快照、GeoIP) |
 | `last-node.txt` | 上次用的节点,重启后接着用它,不用从头试 |
@@ -174,7 +206,7 @@ API Key 屏幕上永远是掩码,只有「重置」和「复制」两个动作 �
 | `/api/config` | GET · POST | 读取/保存订阅地址、`opencodeIdentityHeaders` 与 `subscriptionUpdateHours`；明确提交订阅时当场应用，只切请求头不碰内核。`port` 只读，提交了也忽略 |
 | `/api/nodes` | GET | 排过序的节点表、被剔除的、延迟、冷却、当前节点 |
 | `/api/nodes/test` | POST | 立刻测一遍延迟,回 `{tested, alive, fastest}` |
-| `/api/usage` | GET | 客户端请求统计 + `byNode` 节点尝试统计。`/api/usage/reset` (POST) 全部清零 |
+| `/api/usage` | GET | 客户端请求统计 + `byNode` 节点尝试统计 + `calls` 逐条调用日志。`/api/usage/reset` (POST) 全部清零 |
 | `/api/regen-key` | POST | 换 API Key,不重启就生效 |
 | `/api/restart` | POST | 重启内核 |
 | `/api/reset` | POST | 清冷却 + 忘掉上次节点 + 重写配置 + 重启内核 |

@@ -210,6 +210,18 @@ const blankNode = () => ({
 });
 
 /**
+ * 调用日志保留多少条。
+ *
+ * 按节点聚合的桶只留得下「最近一次」,而排查思考强度、模型、耗时这类问题要的是
+ * 「每一次分别是什么」—— 同一个节点连着跑十次不同档位,聚合桶里只剩最后一次。
+ *
+ * ponytail: 上限写死 200 条,不做按时间过期。usage.json 是整份读写的,再大
+ * 就该换 append-only 的日志文件了 —— 那是另一件事,现在没到那个量。
+ * 200 条 × 约 120 字节 ≈ 24KB,对一个本来就几 KB 的 JSON 可以接受。
+ */
+export const CALL_LOG_LIMIT = 200;
+
+/**
  * 上游 usage → 统一字段名。
  *
  * 缓存 token 各家字段名都不一样,而上游会把底层模型的 usage 原样带出来,
@@ -356,6 +368,9 @@ export class UsageTracker {
             byDay: normalize(d.byDay, blankTotals),
             byModel: normalize(d.byModel, blankTotals),
             byNode: normalize(d.byNode, blankNode),
+            // 旧文件没有 calls;补空数组而不是编造历史条目 —— 聚合桶里的
+            // lastModel/lastEffort 只够还原最近一次,拆不出逐条记录
+            calls: Array.isArray(d.calls) ? d.calls.slice(-CALL_LOG_LIMIT) : [],
           };
         }
       }
@@ -363,7 +378,7 @@ export class UsageTracker {
     return this.blank();
   }
   blank() {
-    return { total: blankTotals(), byDay: {}, byModel: {}, byNode: {}, lastRequest: null, startTime: Date.now() };
+    return { total: blankTotals(), byDay: {}, byModel: {}, byNode: {}, calls: [], lastRequest: null, startTime: Date.now() };
   }
   save() {
     try {
@@ -395,7 +410,9 @@ export class UsageTracker {
    * result ∈ success | rateLimited | timeout | upstreamError —— 互斥,只加一个。
    * 不写 lastRequest,那是客户端口径的字段;也不 save,由调用方那次 record 顺手落盘
    * (一次客户端请求最多写一次文件,而不是每换一个节点写一次)。
-   * call 是这次尝试实际发出的 { model, effort },只记进 lastModel/lastEffort。
+   * call 是这次尝试实际发出的 { model, effort },记进 lastModel/lastEffort,
+   * 成功时还会在 calls 里独立留一条 —— 聚合桶按节点覆盖,同一个节点连着跑
+   * 十次不同档位只剩最后一次,而排查强度/模型问题要的正是逐条记录。
    */
   recordAttempt(node, result, usage = null, timing = null, call = null) {
     if (!node) return;
@@ -416,11 +433,38 @@ export class UsageTracker {
       if (timing.ttfb > 0) { b.ttfbMs += timing.ttfb; b.ttfbCount++; }
       if (timing.total != null) { b.durationMs += timing.total; b.durationCount++; }
     }
-    if (!usage) return;
-    const u = readUsage(usage);
+    const u = usage ? readUsage(usage) : null;
+    if (result === 'success') this.logCall(node, u, timing, call);
+    if (!u) return;
     for (const k of ['promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens',
       'cacheReadTokens', 'cacheWriteTokens']) b[k] += u[k];
     if (u.hasCacheData) b.hasCacheData = true;
+  }
+
+  /**
+   * 成功的调用记一条,超出上限丢最旧的。
+   *
+   * 只记成功:限流和超时那些在 byNode 的计数里已经有了,而它们没有 token、
+   * 没有耗时,逐条列出来只会把真正跑通的请求挤出这 200 条窗口。
+   * 不 save —— 和 recordAttempt 一样由调用方那次 record 顺手落盘。
+   */
+  logCall(node, u, timing, call) {
+    // 字段名取短的:这个数组会被整份读写,键名重复 200 遍不是可以忽略的开销
+    this.data.calls.push({
+      at: Date.now(),
+      node,
+      model: String(call?.model ?? '').trim(),
+      // '' = 没发这个字段,随上游默认 —— 和「发了 high」是两回事
+      effort: String(call?.effort ?? '').trim(),
+      ttfb: timing?.ttfb > 0 ? timing.ttfb : null,
+      ms: timing?.total ?? null,
+      in: u?.promptTokens ?? 0,
+      out: u?.completionTokens ?? 0,
+      reasoning: u?.reasoningTokens ?? 0,
+    });
+    if (this.data.calls.length > CALL_LOG_LIMIT) {
+      this.data.calls.splice(0, this.data.calls.length - CALL_LOG_LIMIT);
+    }
   }
   getStats() { return this.data; }
   reset() {

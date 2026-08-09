@@ -281,6 +281,50 @@ export function nodeStats(byNode) {
 }
 
 /**
+ * calls -> 可直接渲染的行 + 汇总。最近的排最前。
+ *
+ * 和 nodeStats 的区别就是这个模块存在的理由:那边按节点聚合,一个节点只留
+ * 得下「最近一次用的模型和强度」;这边每条成功调用独立一行,同一个节点连着
+ * 跑十次不同档位能看到十行。排查「客户端设了 max 却没生效」要的是后者 ——
+ * 聚合值只告诉你最后一次是什么,看不出中间被谁改过。
+ *
+ * 只有成功的调用会进来(见 gateway.mjs 的 logCall),所以这里没有成功率。
+ */
+export function callLog(calls) {
+  const rows = [];
+  const acc = { ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0 };
+  let tokens = 0;
+  for (const c of Array.isArray(calls) ? calls : []) {
+    if (!c || typeof c !== 'object') continue;
+    const n = (k) => Number(c[k]) || 0;
+    const row = {
+      at: n('at'),
+      node: String(c.node ?? '').trim(),
+      model: String(c.model ?? '').trim(),
+      // '' 保留原样 —— 前端显示 '—',表示没发这个字段(随上游默认)
+      effort: String(c.effort ?? '').trim(),
+      in: n('in'), out: n('out'), reasoning: n('reasoning'),
+      // null 和 0 要分开:测不到首字节和「零延迟」不是一回事
+      ttfb: Number.isFinite(Number(c.ttfb)) && Number(c.ttfb) > 0 ? Number(c.ttfb) : null,
+      ms: Number.isFinite(Number(c.ms)) ? Number(c.ms) : null,
+    };
+    row.total = row.in + row.out;
+    tokens += row.total;
+    if (row.ttfb != null) { acc.ttfbMs += row.ttfb; acc.ttfbCount++; }
+    if (row.ms != null) { acc.durationMs += row.ms; acc.durationCount++; }
+    rows.push(row);
+  }
+  // 后端是 push 追加的,所以数组本身就是时间序;倒过来即可,不用比较排序。
+  // 同一毫秒内的两条也能保持真实先后 —— 按 at 排序反而会打乱
+  rows.reverse();
+  return {
+    rows, tokens,
+    ttfb: avgMs(acc.ttfbMs, acc.ttfbCount),
+    duration: avgMs(acc.durationMs, acc.durationCount),
+  };
+}
+
+/**
  * 平均耗时。没有样本时返回 null —— 显示 0ms 等于断言「这节点零延迟」,
  * 而真相是「还没有成功过、无从得知」。fmtDelay 会把 null 显示成 —。
  */
