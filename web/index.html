@@ -69,16 +69,27 @@
       <p class="big" id="s-up">—</p>
       <p class="sub" id="s-up-sub">最后请求 —</p>
     </article>
-    <!-- 成功率并进这一格:它就是「成功 N / 总数 N」的另一种写法,原来单独占一格
-         等于把同一组数拆开摆两处。百分比落在副行,进度条留下 —— 那条是唯一
-         不用读数字就能看出健康度的东西。 -->
+    <!-- 成功率并进这一格:它就是「成功 N / 总数 N」的另一种写法,单独占一格
+         等于把同一组数拆开摆两处。两列并排而不是把百分比塞进副行 —— 它是个
+         主数值,和请求总数同级;副行留给成功/失败的拆分,进度条压在最下面,
+         那条是唯一不用读数字就能看出健康度的东西。
+         每列自己包一个 div(而不是标签一行、数值一行地平铺):读屏按 DOM 念,
+         平铺会念成「请求总数 成功率 341 53.1%」,配对全丢了。 -->
     <article class="stat">
-      <h3>请求总数</h3>
-      <p class="big" id="s-req">—</p>
-      <p class="sub"><span id="s-req-sub">成功 — · 失败 —</span> · <span id="s-rate">成功率 —</span></p>
-      <!-- 条形的可访问名取自 #s-rate(含「成功率」二字),不是卡片标题:
-           标题现在是「请求总数」,单挂标题会把 98% 读成请求数 -->
-      <div class="bar" role="img" aria-labelledby="s-rate"><span id="s-rate-bar"></span></div>
+      <div class="stat-duo">
+        <div>
+          <h3>请求总数</h3>
+          <p class="big" id="s-req">—</p>
+        </div>
+        <div>
+          <h3 id="h-rate">成功率</h3>
+          <p class="big" id="s-rate">—</p>
+        </div>
+      </div>
+      <p class="sub" id="s-req-sub">成功 — · 失败 —</p>
+      <!-- 可访问名挂「成功率」标题 + 百分数两段:只挂数值会念成没头没尾的一个
+           百分比,只挂标题又听不到当前值 -->
+      <div class="bar" role="img" aria-labelledby="h-rate s-rate"><span id="s-rate-bar"></span></div>
     </article>
     <!-- 各模型的成功调用次数,按次数降序。和「调用日志」不同口径:那边是逐条
          时间线(最近 200 条),这边是开机至今的累计分布。 -->

@@ -276,6 +276,19 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 }
 .stat .sub { color: var(--fg-2); font-size: 12px; font-variant-numeric: tabular-nums; }
 
+/* 请求总数那格装两个数:左「请求总数」右「成功率」,各自靠住格子两端,
+   中间那段留白就是分隔,不用再画竖线。每列连标签一起成块,所以两个 <h3>
+   在同一条线上、两个数字也在同一条线上,不用手写对齐。 */
+.stat-duo { display: flex; justify-content: space-between; gap: 10px; }
+.stat-duo > div { min-width: 0; }
+.stat-duo > div:last-child { text-align: right; }
+/* 两个数分掉一格的宽度,27px 摆不下,所以系数按半格重算。实测(最窄三列档,
+   视口 1082px)两列可用 116px、字号落到 14.5px,「999,999」配「100.0%」正好
+   占满 116px;桌面档 19.9px,单列档封顶 21px。
+   ponytail: 上限就是那个正好 —— 七位数(9,999,999)会差 17px,真到那步得让
+   请求数改走 fmtTokens 的紧凑写法(1.2M),不为假想值现在就买单。 */
+.stat-duo .big { font-size: clamp(14px, 12.5cqi, 21px); }
+
 /* 调用统计:模型名 + 成功次数,一行一个,按次数降序(排序在 core.js)。
    不给这格设 .big —— 它是一张小排行,没有哪个数字该被单独放大。
    不限高:模型是个位数量级(上游放出来的 free 模型就那几个),
@@ -452,8 +465,11 @@ details[open] > .nstat-summary { margin-bottom: 13px; }
 .nstat .num b { color: var(--fg); font-weight: 600; }
 /* 缓存命中拿到过真数据才点亮 —— '—' 和 0% 得看着就不一样 */
 .nstat .num.hit b { color: var(--mint); }
+/* 右对齐,贴在主行那串数字下面 —— 主行左半是「什么时候、哪个节点」,右半是
+   「发了什么、花了多少」,Token 明细属于右半,靠左会跑到时刻底下另起一栏。 */
 .nstat .sub {
   margin-top: 5px;
+  text-align: right;
   font-family: var(--mono); font-size: 11px; color: var(--fg-2);
   font-variant-numeric: tabular-nums;
 }

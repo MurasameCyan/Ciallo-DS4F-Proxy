@@ -80,10 +80,9 @@ function renderStats() {
   $('s-req').textContent = fmtCount(t.requests);
   $('s-req-sub').textContent = `成功 ${fmtCount(t.success)} · 失败 ${fmtCount(t.fail)}`;
 
-  // 成功率并进这一格。文案带上「成功率」二字 —— 这个 span 同时是下面进度条的
-  // 可访问名,只有一个百分数的话读屏念出来不知道是什么的百分比
+  // 成功率是请求总数右边一列,「成功率」三个字由那列的 <h3> 出,这里只填数值
   const rate = successRate(t);
-  $('s-rate').textContent = `成功率 ${fmtPercent(rate)}`;
+  $('s-rate').textContent = fmtPercent(rate);
   $('s-rate-bar').style.width = `${(rate ?? 0) * 100}%`;
 
   $('s-tok').textContent = fmtTokens(t.totalTokens);
@@ -235,15 +234,17 @@ function renderCallLog() {
       num('', '强度', r.effort || '—'),
       num('', '首字', fmtDelay(r.ttfb)),
       num('', '耗时', fmtDelay(r.ms)),
-      num('', 'Token', fmtTokens(r.total)),
     );
 
     const sub = document.createElement('p');
     sub.className = 'sub';
+    // Token 总数下来和分项同行:它就是入+出的和,拆在两行里对不起来。
+    // 主行少一个数之后,长节点名(机场那种带限速和流媒体标记的)不再把
+    // 模型和强度挤到折行。
     // 推理 token 单列:它不计入 total(上游把它算在 completion 里),
     // 但「这次到底想了多少」是判断强度有没有生效最直接的一个数
-    sub.textContent = `入 ${fmtTokens(r.in)} · 出 ${fmtTokens(r.out)}`
-      + ` · 推理 ${fmtTokens(r.reasoning)}`;
+    sub.textContent = `Token ${fmtTokens(r.total)} · 入 ${fmtTokens(r.in)}`
+      + ` · 出 ${fmtTokens(r.out)} · 推理 ${fmtTokens(r.reasoning)}`;
 
     li.append(main, sub);
     return li;

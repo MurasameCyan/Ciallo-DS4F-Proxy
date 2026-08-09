@@ -483,6 +483,23 @@ t('调用日志标题显示平均首字与平均耗时,明细显示单次耗时'
   assert.match(app, /'耗时',\s*fmtDelay\(r\.ms\)/);
 });
 
+t('调用日志把 Token 总数放在副行,和入/出/推理同一行右对齐', () => {
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
+  assert.ok(fn, '应能定位 renderCallLog');
+
+  // Token 是入+出的和,和分项拆在两行里对不起来;主行少一个数之后,
+  // 机场那种带限速和流媒体标记的长节点名不再把模型和强度挤到折行
+  assert.doesNotMatch(fn, /num\([^)]*'Token'/, 'Token 不该再占主行一格');
+  assert.match(fn, /Token \$\{fmtTokens\(r\.total\)\} · 入/, 'Token 应打头副行');
+  assert.match(fn, /推理 \$\{fmtTokens\(r\.reasoning\)\}/);
+
+  // 主行右半是「发了什么、花了多少」,副行靠左会跑到时刻底下另起一栏
+  const sub = css.match(/\.nstat \.sub\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(sub, /text-align:\s*right/, '副行应右对齐,贴在主行数字下面');
+});
+
 t('调用日志用「限流」「错误」而不是 429 和上游错误,且标明是累计口径', () => {
   const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const fn = app.match(/function renderCallLog\(\)[\s\S]*?\n\}/)?.[0] || '';
@@ -592,17 +609,45 @@ t('概览四格在一张卡内 2×2,DOM 顺序就是视觉顺序', () => {
 
   // 两列 grid 逐行填充,所以 DOM 顺序 == 左上→右上→左下→右下。
   // 需求把 Token 放左上、运行时长右上、请求总数左下、调用统计右下 ——
-  // 用 grid-area 显式定位能达到同样效果,但 Tab 顺序会和看到的不一致
+  // 用 grid-area 显式定位能达到同样效果,但 Tab 顺序会和看到的不一致。
+  // 取每格的**首个** h3:请求总数那格里还有个「成功率」小标题,平铺着数
+  // 会把它算成第五格
   const stats = css.match(/^\.stats\s*\{([^}]*)\}/m)?.[1] || '';
   assert.match(stats, /grid-template-columns:\s*repeat\(2,/, '概览内部应是两列');
-  const order = [...sec.matchAll(/<h3>([^<]+)<\/h3>/g)].map((m) => m[1]);
+  const tiles = [...sec.matchAll(/<article class="stat">([\s\S]*?)<\/article>/g)].map((m) => m[1]);
+  const order = tiles.map((tile) => tile.match(/<h3[^>]*>([^<]+)<\/h3>/)?.[1]);
   assert.deepEqual(order, ['Token 消耗', '运行时长', '请求总数', '调用统计'],
     'DOM 顺序决定视觉和 Tab 顺序:左上 Token、右上 运行时长、左下 请求总数、右下 调用统计');
 
-  // 成功率并进请求总数那格:进度条的可访问名要指向带「成功率」字样的元素,
-  // 指向卡片标题会把 98% 念成请求数
-  assert.match(sec, /aria-labelledby="s-rate"/, '进度条要有可访问名');
-  assert.doesNotMatch(sec, /<h3>成功率<\/h3>/, '成功率不再单独占一格');
+  // 成功率并进请求总数那格 —— 不是自己一格,而是那一格里的第二列
+  const reqTile = tiles.find((tile) => tile.includes('请求总数')) || '';
+  assert.match(reqTile, /<h3 id="h-rate">成功率<\/h3>/, '成功率应在请求总数那格内');
+  assert.equal(tiles.filter((tile) => tile.includes('成功率')).length, 1,
+    '成功率不该另占一格');
+  // 进度条的可访问名要同时给出「是什么」和「现在多少」:只挂数值会念成
+  // 没头没尾的一个百分比,只挂标题又听不到当前值
+  assert.match(reqTile, /aria-labelledby="h-rate s-rate"/, '进度条要报出标题和数值两段');
+});
+
+t('请求总数与成功率并排两列,数值字号按半格重算', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+
+  // 每列连标签一起成块。平铺成「标签 标签 数值 数值」的话读屏按 DOM 念出来
+  // 是「请求总数 成功率 341 53.1%」,配对全丢了
+  const duo = html.match(/<div class="stat-duo">([\s\S]*?)<\/div>\s*<p class="sub"/)?.[1] || '';
+  assert.match(duo, /<h3>请求总数<\/h3>\s*<p class="big" id="s-req">/, '标签应紧挨自己的数值');
+  assert.match(duo, /<h3 id="h-rate">成功率<\/h3>\s*<p class="big" id="s-rate">/);
+
+  // 半格宽摆不下 27px,系数必须比 .stat .big 小一档,否则两个数会顶出格子
+  const full = css.match(/\.stat \.big\s*\{([^}]*)\}/)?.[1]?.match(/clamp\(\s*[\d.]+px\s*,\s*([\d.]+)cqi/)?.[1];
+  const half = css.match(/\.stat-duo \.big\s*\{([^}]*)\}/)?.[1]?.match(/clamp\(\s*[\d.]+px\s*,\s*([\d.]+)cqi/)?.[1];
+  assert.ok(full && half, '两处都应按容器宽度 clamp');
+  assert.ok(Number(half) < Number(full), `并排两列的系数(${half}cqi)应小于独占一格的(${full}cqi)`);
+
+  // 标签由 <h3> 出,JS 再拼一遍「成功率」就重复了
+  assert.match(app, /\$\('s-rate'\)\.textContent = fmtPercent\(rate\)/, '数值不该再带标签文字');
 });
 
 t('OpenCode 请求头开启状态使用绿色标签', () => {
