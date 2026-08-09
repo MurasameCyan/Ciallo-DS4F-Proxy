@@ -200,6 +200,17 @@ export function createApp({ cfg, creds, gateway, subscriptionUpdater = null }) {
       return json(res, { ok: true });
     }
 
+    // 页面路径上只有 GET/HEAD 说得通,POST 到这儿一律 404 JSON。
+    //
+    // 不能 302 去登录页:HTTP 客户端跟着跳转会拿到 200 + 一坨登录页 HTML,
+    // 然后当成上游的回答。实测就被这么坑过 —— cpa 把 base URL 配成不带 /v1 的
+    // https://ds4f.yuzu.gv.uy,于是它打的是 /chat/completions,收到 200 + 登录页,
+    // 认为调用成功,把 HTML 转给了客户端。404 能让对面当场看出路径错了。
+    // /api/* 不在此列:面板自己有一堆 POST(见 makeApiRoutes)。
+    if (!isApi && req.method !== 'GET' && req.method !== 'HEAD') {
+      return json(res, { error: `Not found: ${req.method} ${path}` }, 404);
+    }
+
     if (path === '/login') {
       if (authed) return redirect(res, '/');    // 已经登录了就没必要再看登录页
       return send('/login.html');

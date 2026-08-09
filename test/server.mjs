@@ -1044,6 +1044,25 @@ await t('匿名:页面跳登录页,/api/* 给 401,而且哪儿都不发 WWW-Auth
   }
 });
 
+await t('POST 到页面路径给 404 JSON,绝不能 302 成一坨登录页 HTML', async () => {
+  // 反代把 base URL 配错(少个 /v1)时打的就是 /chat/completions。跟着 302
+  // 会拿到 200 + 登录页,对面认为调用成功,把 HTML 当模型回答转出去 —— 实测踩过。
+  for (const p of ['/chat/completions', '/messages', '/nope']) {
+    const r = await fetch(base + p, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', redirect: 'manual',
+    });
+    assert.equal(r.status, 404, `POST ${p} 该 404 而不是 ${r.status}`);
+    const j = await r.json();
+    assert.match(j.error, /Not found/, '得是 JSON 错误体,不是 HTML');
+  }
+  // 跟着跳转也一样:整条链路上不该有任何一步拿得到 200
+  const followed = await fetch(`${base}/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(followed.status, 404);
+  assert.ok(!(await followed.text()).includes('<!DOCTYPE'), 'HTML 漏出去就是这个 bug 本身');
+});
+
 await t('登录页和它引的两个文件不要凭据(不然只能看到一张白纸)', async () => {
   for (const p of ['/login', '/style.css', '/login.js']) {
     const r = await fetch(base + p);
