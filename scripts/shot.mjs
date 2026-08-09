@@ -170,7 +170,7 @@ async function main() {
     await sleep(600);                                 // 让过渡动画落定
 
     // 折叠起来的 <details> 里面测不到布局:里头元素高宽都是 0,体检直接跳过。
-    // 节点统计默认折叠,每行又是最长的一行,不展开就永远查不到它溢出。
+    // 调用日志默认折叠,每行又是最长的一行,不展开就永远查不到它溢出。
     if (process.env.EXPAND) {
       await s('Runtime.evaluate', {
         expression: `document.querySelectorAll('details').forEach((d) => (d.open = true))`,

@@ -504,6 +504,13 @@ t('调用日志合计不显示请求级与尝试级口径说明', () => {
   assert.match(html, /id="nstat-sum"[^>]*>\s*<\/span>/, '合计占位应为空,由 JS 填充');
 });
 
+t('根元素常驻滚动条槽,展开调用日志不横向位移', () => {
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  // 槽必须挂在滚动容器(视口 = 根元素)上,挂到 body 上不起作用
+  const html = css.match(/^html\s*\{([^}]*)\}/m)?.[1] || '';
+  assert.match(html, /scrollbar-gutter:\s*stable/, '根元素应预留滚动条槽');
+});
+
 t('OpenCode 请求头开启状态使用绿色标签', () => {
   const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');

@@ -43,7 +43,9 @@
 
 * { box-sizing: border-box; }
 
-html { color-scheme: dark light; }
+/* 滚动条槽常驻。这页的高度会成倍变化(调用日志一展开就是两百行),不预留槽位
+   的话滚动条一出现视口就窄 15px,margin:0 auto 的 #main 连带顶栏一起左移半格。 */
+html { color-scheme: dark light; scrollbar-gutter: stable; }
 
 body {
   margin: 0;
