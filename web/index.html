@@ -64,10 +64,14 @@
       <p class="big" id="s-tok">—</p>
       <p class="sub" id="s-tok-sub">输入 — · 输出 — · 推理 — · 缓存读 — · 缓存写 —</p>
     </article>
+    <!-- 各模型的成功调用次数,按次数降序。和「调用日志」不同口径:那边是逐条
+         时间线(最近 200 条),这边是开机至今的累计分布。 -->
     <article class="stat">
-      <h3>运行时长</h3>
-      <p class="big" id="s-up">—</p>
-      <p class="sub" id="s-up-sub">最后请求 —</p>
+      <h3>模型统计</h3>
+      <ul class="mstats" id="s-models" aria-label="各模型成功调用次数,按次数降序"></ul>
+      <!-- 初始 hidden,由 renderModelStats() 决定露不露:写死不 hidden 会在
+           首帧闪一下「还没有成功的调用」,哪怕其实有一千次 -->
+      <p class="empty mini" id="s-models-empty" hidden>还没有成功的调用</p>
     </article>
     <!-- 成功率并进这一格:它就是「成功 N / 总数 N」的另一种写法,单独占一格
          等于把同一组数拆开摆两处。两列并排而不是把百分比塞进副行 —— 它是个
@@ -91,14 +95,10 @@
            百分比,只挂标题又听不到当前值 -->
       <div class="bar" role="img" aria-labelledby="h-rate s-rate"><span id="s-rate-bar"></span></div>
     </article>
-    <!-- 各模型的成功调用次数,按次数降序。和「调用日志」不同口径:那边是逐条
-         时间线(最近 200 条),这边是开机至今的累计分布。 -->
     <article class="stat">
-      <h3>调用统计</h3>
-      <ul class="mstats" id="s-models" aria-label="各模型成功调用次数,按次数降序"></ul>
-      <!-- 初始 hidden,由 renderModelStats() 决定露不露:写死不 hidden 会在
-           首帧闪一下「还没有成功的调用」,哪怕其实有一千次 -->
-      <p class="empty mini" id="s-models-empty" hidden>还没有成功的调用</p>
+      <h3>运行时长</h3>
+      <p class="big" id="s-up">—</p>
+      <p class="sub" id="s-up-sub">最后请求 —</p>
     </article>
   </section>
 

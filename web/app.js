@@ -92,7 +92,7 @@ function renderStats() {
     + ` · 缓存写 ${fmtTokens(t.cacheWriteTokens)}`;
 
   $('s-up').textContent = fmtUptime(Date.now() - (S.usage.startTime || Date.now()));
-  // 不再写「主用 X」:同一张卡的「调用统计」格已经把全部模型按次数列出来了
+  // 不再写「主用 X」:同一张卡的「模型统计」格已经把全部模型按次数列出来了
   $('s-up-sub').textContent = S.usage.lastRequest
     ? `最后请求 ${fmtClock(S.usage.lastRequest)}`
     : '还没有请求';
@@ -101,7 +101,7 @@ function renderStats() {
 }
 
 /**
- * 调用统计格:各模型的**成功**调用次数,按次数降序(排序和过滤都在
+ * 模型统计格:各模型的**成功**调用次数,按次数降序(排序和过滤都在
  * core.js 的 rankBreakdown 里)。
  *
  * 口径和「调用日志」刻意不同:那张表是最近 200 条的时间线,翻得到「这一次

@@ -234,7 +234,7 @@ t('rankBreakdown 按成功次数降序并截断', () => {
 });
 
 t('rankBreakdown 排的是成功数而不是请求数', () => {
-  // 「调用统计」那格问的是「哪个模型真在干活」。按 requests 排的话,一个每次
+  // 「模型统计」那格问的是「哪个模型真在干活」。按 requests 排的话,一个每次
   // 都撞 429 的模型会凭失败次数占住榜首
   const r = rankBreakdown({
     busy: { requests: 500, success: 3 },      // 打得最多,几乎全失败
@@ -253,7 +253,7 @@ t('rankBreakdown 丢掉零成功的模型', () => {
 });
 
 t('rankBreakdown limit=0 不截断', () => {
-  // 调用统计那格全量显示(模型是个位数量级),截到 5 会悄悄少几行
+  // 模型统计那格全量显示(模型是个位数量级),截到 5 会悄悄少几行
   const map = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`m${i}`, { success: i + 1 }]));
   assert.equal(rankBreakdown(map, 0).length, 8);
   assert.equal(rankBreakdown(map).length, 5, '默认仍截断到 5');
@@ -608,7 +608,7 @@ t('概览四格在一张卡内 2×2,DOM 顺序就是视觉顺序', () => {
   assert.doesNotMatch(sec, /class="card stat"/, '内部小卡片不该再叠一层 .card');
 
   // 两列 grid 逐行填充,所以 DOM 顺序 == 左上→右上→左下→右下。
-  // 需求把 Token 放左上、运行时长右上、请求总数左下、调用统计右下 ——
+  // 需求把 Token 放左上、模型统计右上、请求总数左下、运行时长右下 ——
   // 用 grid-area 显式定位能达到同样效果,但 Tab 顺序会和看到的不一致。
   // 取每格的**首个** h3:请求总数那格里还有个「成功率」小标题,平铺着数
   // 会把它算成第五格
@@ -616,8 +616,8 @@ t('概览四格在一张卡内 2×2,DOM 顺序就是视觉顺序', () => {
   assert.match(stats, /grid-template-columns:\s*repeat\(2,/, '概览内部应是两列');
   const tiles = [...sec.matchAll(/<article class="stat">([\s\S]*?)<\/article>/g)].map((m) => m[1]);
   const order = tiles.map((tile) => tile.match(/<h3[^>]*>([^<]+)<\/h3>/)?.[1]);
-  assert.deepEqual(order, ['Token 消耗', '运行时长', '请求总数', '调用统计'],
-    'DOM 顺序决定视觉和 Tab 顺序:左上 Token、右上 运行时长、左下 请求总数、右下 调用统计');
+  assert.deepEqual(order, ['Token 消耗', '模型统计', '请求总数', '运行时长'],
+    'DOM 顺序决定视觉和 Tab 顺序:左上 Token、右上 模型统计、左下 请求总数、右下 运行时长');
 
   // 成功率并进请求总数那格 —— 不是自己一格,而是那一格里的第二列
   const reqTile = tiles.find((tile) => tile.includes('请求总数')) || '';
