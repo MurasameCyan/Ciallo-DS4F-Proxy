@@ -80,10 +80,11 @@ const topEffort = (model) => (MAX_CAPABLE.has(String(model ?? '').trim()) ? 'max
 /**
  * thinking.budget_tokens → 档位。
  *
- * Anthropic 协议里没有 reasoning_effort,客户端表达思考强度只有 budget_tokens
- * 这一个旋钮,而 Claude Code 把它绑在关键词上:think≈4000、think hard≈10000、
- * ultrathink=31999(协议下限 1024)。所以「想更用力」这件事客户端已经说清楚了,
- * 只是说的是另一种语言 —— 翻过来就不用再加开关。
+ * Anthropic 协议里没有 reasoning_effort,老客户端表达思考强度只有 budget_tokens
+ * 这一个旋钮(新写法见 reasoningEffort 的 output_config.effort),而 Claude Code
+ * 把它绑在关键词上:think≈4000、think hard≈10000、ultrathink=31999(协议下限
+ * 1024)。所以「想更用力」这件事客户端已经说清楚了,只是说的是另一种语言 ——
+ * 翻过来就不用再加开关。
  *
  * 边界取在这几个关键词之间,而不是均分区间:ultrathink 要落到顶档,
  * think hard 落到 high(DS4F 的默认档),这样用户敲的词和拿到的强度是对得上的。
@@ -101,22 +102,35 @@ const BUDGET_TIERS = [
  * 从客户端请求里读出思考强度,读不到就返回 ''(调用方据此不发这个字段,
  * 随上游自己的默认 —— DS4F 是 high)。
  *
- * 三种写法都认:OpenAI 的 reasoning_effort、Responses 风格的 reasoning.effort、
- * Anthropic 的 thinking.budget_tokens。前两种是客户端明说的,但「顶档」这件事
- * 客户端只知道自己在说 xhigh 或 max,不知道这个模型的顶到底叫什么 —— 所以
- * xhigh/max 统一折到 topEffort(model),其余档位原样放行(不认就被上游丢,
- * 那是上游自己的事,至少不会比它说的更强或更弱)。
+ * 四种写法都认,按优先级:
+ *   reasoning_effort         OpenAI 顶层
+ *   reasoning.effort         Responses 风格
+ *   output_config.effort     Anthropic 现行写法 ← 现在的 Claude Code 走这条
+ *   thinking.budget_tokens   Anthropic 旧写法
+ *
+ * output_config.effort 这一条是必需的,不是补全:budget_tokens 在新模型上已经
+ * 被 Anthropic 弃用(部分模型直接 400),客户端选「最多」发出来的是
+ * output_config:{effort:'max'} 加 thinking:{type:'adaptive'} —— 而 adaptive
+ * 不等于 enabled,于是旧实现在这儿两条都读不到、返回 ''、面板强度栏是空的。
+ * 现象就是「客户端选了 max,到后台强度直接没显示」。
+ *
+ * 前三种是客户端明说的,但「顶档」这件事客户端只知道自己在说 xhigh 或 max,
+ * 不知道这个模型的顶到底叫什么 —— 所以 xhigh/max 统一折到 topEffort(model),
+ * 其余档位原样放行(不认就被上游丢,那是上游自己的事,至少不会比它说的更强或更弱)。
  * budget_tokens 那种写法本身就不区分 xhigh/max,翻译时直接给顶档。
  */
 export function reasoningEffort(req, model = '') {
-  const raw = req?.reasoning_effort ?? req?.reasoning?.effort;
+  const raw = req?.reasoning_effort ?? req?.reasoning?.effort ?? req?.output_config?.effort;
   const want = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (EFFORTS.has(want)) return TOP.has(want) ? topEffort(model) : want;
 
-  // disabled 时不发字段:DS4F 关不掉思考,硬塞个最低档也是被上游丢掉,
-  // 不如让它走默认 —— 至少行为是可预期的
-  if (req?.thinking?.type !== 'enabled') return '';
-  const budget = Number(req.thinking.budget_tokens);
+  // 明确关掉思考时不发字段:DS4F 关不掉思考,硬塞个最低档也是被上游丢掉,
+  // 不如让它走默认 —— 至少行为是可预期的。
+  // adaptive 一并放行到下面:它自己不带强度(「你自己决定用多少」),但客户端
+  // 有可能 adaptive 和 budget_tokens 一起发,那个 budget 还是该读出来。
+  const type = req?.thinking?.type;
+  if (type !== 'enabled' && type !== 'adaptive') return '';
+  const budget = Number(req?.thinking?.budget_tokens);
   if (!Number.isFinite(budget) || budget <= 0) return '';
   const tier = BUDGET_TIERS.find(([max]) => budget <= max)?.[1];
   return tier ?? topEffort(model);

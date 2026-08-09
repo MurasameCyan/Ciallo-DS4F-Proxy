@@ -615,8 +615,9 @@ export class Gateway {
     body.model = model;
 
     /**
-     * 思考强度。reasoningEffort 从客户端的三种写法(reasoning_effort /
-     * reasoning.effort / thinking.budget_tokens)统一转成这个模型认的档位或 ''。
+     * 思考强度。reasoningEffort 从客户端的四种写法(reasoning_effort /
+     * reasoning.effort / output_config.effort / thinking.budget_tokens)统一转成
+     * 这个模型认的档位或 ''。
      *
      * 空值不发字段 —— 随上游自己的默认(DS4F 是 high);有值就覆盖掉 body 里
      * 原有的,这样 OpenAI 路径带着的乱值(客户端写了个 foo)和会被上游丢掉的

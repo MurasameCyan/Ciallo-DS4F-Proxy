@@ -54,11 +54,15 @@ const STREAM_CHUNKS = [
   { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } },
 ];
 // 只替掉真正出网的两个方法,轮换/冷却/方言分发全部走真代码
-gw.forward = async () => ({
-  model: 'm',
-  choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '2' } }],
-  usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
-});
+let sent = null;                 // 最后一次真发给上游的 body,用来断言透传结果
+gw.forward = async (body) => {
+  sent = body;
+  return {
+    model: 'm',
+    choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '2' } }],
+    usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+  };
+};
 gw.forwardStream = async (res, body, dialect) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
   const sink = dialect.sink(res, body.model);
@@ -112,6 +116,44 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
   body.includes('data: {') && body.includes('[DONE]') && !body.includes('event: ')
     ? ok('OpenAI 流式原样透传(没被 Anthropic 那套改写)')
     : no(`OpenAI 流式被改写: ${body.slice(0, 150)}`);
+}
+
+// ── 思考强度真的出站了吗(回归「客户端选 max,后台强度是空的」)──
+// 前面几组只证明纯函数算得对,这组证明算出来的档位确实进了发给上游的 body。
+// 现在的 Claude Code 把强度放在 output_config.effort,不是 thinking.budget_tokens。
+{
+  const ask = async (extra) => {
+    sent = null;
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: MODEL, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }], ...extra }),
+    });
+    return sent;
+  };
+
+  const cc = await ask({ thinking: { type: 'adaptive' }, output_config: { effort: 'max' } });
+  cc?.reasoning_effort === 'max'
+    ? ok('Anthropic:output_config.effort=max 出站成 reasoning_effort=max')
+    : no(`output_config.effort 没出站:reasoning_effort=${JSON.stringify(cc?.reasoning_effort)}`);
+  !('output_config' in (cc ?? {})) && !('thinking' in (cc ?? {}))
+    ? ok('Anthropic:output_config / thinking 不往上游发')
+    : no('OpenAI 不认的字段漏出去了');
+
+  const xh = await ask({ output_config: { effort: 'xhigh' } });
+  xh?.reasoning_effort === 'max'
+    ? ok('Anthropic:xhigh 折到模型顶档(原样发会被上游丢成默认)')
+    : no(`xhigh 没折档:${JSON.stringify(xh?.reasoning_effort)}`);
+
+  const ut = await ask({ thinking: { type: 'enabled', budget_tokens: 31999 } });
+  ut?.reasoning_effort === 'max'
+    ? ok('Anthropic:旧写法 ultrathink 仍然出站成顶档')
+    : no(`budget_tokens 回归了:${JSON.stringify(ut?.reasoning_effort)}`);
+
+  const none = await ask({});
+  !('reasoning_effort' in (none ?? {}))
+    ? ok('Anthropic:没说强度时不发这个字段,随上游默认')
+    : no(`凭空多了 reasoning_effort=${JSON.stringify(none?.reasoning_effort)}`);
 }
 
 // ── Anthropic 流式:事件顺序 + 内容完整性 ────────────────

@@ -501,6 +501,49 @@ t('thinking 没开或 budget 非法时不发字段,交给上游默认', () => {
   assert.equal(reasoningEffort({ thinking: { type: 'enabled', budget_tokens: 0 } }, DS4F), '');
 });
 
+t('output_config.effort 要认 —— 现在的 Claude Code 就发这个', () => {
+  // 这条是回归测试:漏读这个字段时,客户端选「最多」在后台显示成空强度,
+  // 看起来像"透传没生效",实际是四种写法里唯一在用的那种没被读
+  const oc = (effort, m = DS4F) => reasoningEffort({ output_config: { effort } }, m);
+  assert.equal(oc('max'), 'max');
+  assert.equal(oc('xhigh'), 'max', 'xhigh 是 Claude Code 的默认档,不能被丢掉');
+  assert.equal(oc('medium'), 'medium');
+  assert.equal(oc('xhigh', NORTH), 'high');
+  assert.equal(oc('max', NORTH), 'high');
+  assert.equal(oc('foo'), '', '乱值仍然当没给');
+});
+
+t('thinking.adaptive 不等于关掉思考', () => {
+  // 新模型上 budget_tokens 已弃用,CC 发的是 adaptive + output_config.effort
+  assert.equal(reasoningEffort({
+    thinking: { type: 'adaptive' }, output_config: { effort: 'max' },
+  }, DS4F), 'max');
+  // adaptive 自己不带强度,那就随上游默认 —— 但如果还捎了 budget 就得读出来
+  assert.equal(reasoningEffort({ thinking: { type: 'adaptive' } }, DS4F), '');
+  assert.equal(reasoningEffort({ thinking: { type: 'adaptive', budget_tokens: 31999 } }, DS4F), 'max');
+});
+
+t('三种显式写法的优先级:reasoning_effort > reasoning.effort > output_config.effort', () => {
+  assert.equal(reasoningEffort({
+    reasoning_effort: 'low', reasoning: { effort: 'medium' }, output_config: { effort: 'max' },
+  }, DS4F), 'low');
+  assert.equal(reasoningEffort({
+    reasoning: { effort: 'medium' }, output_config: { effort: 'max' },
+  }, DS4F), 'medium');
+});
+
+t('anthropicToOpenAI 带上 output_config 的档位,但不把 output_config 本身发给上游', () => {
+  const out = anthropicToOpenAI({
+    model: DS4F,
+    messages: [{ role: 'user', content: 'hi' }],
+    thinking: { type: 'adaptive' },
+    output_config: { effort: 'max' },
+  });
+  assert.equal(out.reasoning_effort, 'max');
+  assert.ok(!('output_config' in out), 'OpenAI 那边不认这个字段');
+  assert.ok(!('thinking' in out));
+});
+
 t('显式档位优先于 budget —— 两个都给时不能被翻译覆盖', () => {
   assert.equal(reasoningEffort({
     reasoning_effort: 'low', thinking: { type: 'enabled', budget_tokens: 31999 },
