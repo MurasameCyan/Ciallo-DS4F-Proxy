@@ -194,12 +194,26 @@ export function anthropicBase(origin) {
   return baseOrigin(origin);
 }
 
-/** byModel / byDay 这种 { key: {requests,...} } 映射 -> 按请求数降序的数组 */
+/**
+ * byModel / byDay 这种 { key: {requests,...} } 映射 -> 按成功次数降序的数组。
+ *
+ * 排序和显示都用 success 而不是 requests:面板上那格叫「调用统计」,一个模型
+ * 每次都 429 却排在榜首没有意义 —— 「哪个模型真的在为我干活」才是要看的。
+ * requests/totalTokens 一并带出来,调用方要总量时不用再翻原始映射。
+ * 一次都没成功过的直接不出现:列一行 0 只是占位,列表要留给有量的那几个。
+ * limit = 0 表示不截断(调用统计那格全量显示,自己滚动)。
+ */
 export function rankBreakdown(map, limit = 5) {
-  return Object.entries(map || {})
-    .map(([key, v]) => ({ key, requests: Number(v?.requests) || 0, totalTokens: Number(v?.totalTokens) || 0 }))
-    .sort((a, b) => b.requests - a.requests || a.key.localeCompare(b.key))
-    .slice(0, limit);
+  const rows = Object.entries(map || {})
+    .map(([key, v]) => ({
+      key,
+      success: Number(v?.success) || 0,
+      requests: Number(v?.requests) || 0,
+      totalTokens: Number(v?.totalTokens) || 0,
+    }))
+    .filter((r) => r.success > 0)
+    .sort((a, b) => b.success - a.success || a.key.localeCompare(b.key));
+  return limit > 0 ? rows.slice(0, limit) : rows;
 }
 
 /**

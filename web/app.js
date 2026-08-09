@@ -80,8 +80,10 @@ function renderStats() {
   $('s-req').textContent = fmtCount(t.requests);
   $('s-req-sub').textContent = `成功 ${fmtCount(t.success)} · 失败 ${fmtCount(t.fail)}`;
 
+  // 成功率并进这一格。文案带上「成功率」二字 —— 这个 span 同时是下面进度条的
+  // 可访问名,只有一个百分数的话读屏念出来不知道是什么的百分比
   const rate = successRate(t);
-  $('s-rate').textContent = fmtPercent(rate);
+  $('s-rate').textContent = `成功率 ${fmtPercent(rate)}`;
   $('s-rate-bar').style.width = `${(rate ?? 0) * 100}%`;
 
   $('s-tok').textContent = fmtTokens(t.totalTokens);
@@ -91,10 +93,36 @@ function renderStats() {
     + ` · 缓存写 ${fmtTokens(t.cacheWriteTokens)}`;
 
   $('s-up').textContent = fmtUptime(Date.now() - (S.usage.startTime || Date.now()));
-  const top = rankBreakdown(S.usage.byModel, 1)[0];
+  // 不再写「主用 X」:同一张卡的「调用统计」格已经把全部模型按次数列出来了
   $('s-up-sub').textContent = S.usage.lastRequest
-    ? `最后请求 ${fmtClock(S.usage.lastRequest)}${top ? ` · 主用 ${top.key}` : ''}`
+    ? `最后请求 ${fmtClock(S.usage.lastRequest)}`
     : '还没有请求';
+
+  renderModelStats();
+}
+
+/**
+ * 调用统计格:各模型的**成功**调用次数,按次数降序(排序和过滤都在
+ * core.js 的 rankBreakdown 里)。
+ *
+ * 口径和「调用日志」刻意不同:那张表是最近 200 条的时间线,翻得到「这一次
+ * 发生了什么」;这一格是开机至今的累计分布,回答「总体在用哪个模型」。
+ * 逐条日志被环形缓冲截断后,早期的调用只在这个累计数里还留着。
+ */
+function renderModelStats() {
+  const rows = rankBreakdown(S.usage?.byModel, 0);
+  $('s-models-empty').hidden = rows.length > 0;
+
+  // 全量重建。模型是个位数量级,重建比 diff 简单且看不出差别
+  $('s-models').replaceChildren(...rows.map((r) => {
+    const li = document.createElement('li');
+    const nm = tag('nm', r.key);
+    nm.title = r.key;              // 窄档会省略号截断,悬停看全名
+    const n = document.createElement('b');
+    n.textContent = fmtCount(r.success);
+    li.append(nm, n);
+    return li;
+  }));
 }
 
 function renderNodes() {

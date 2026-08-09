@@ -181,7 +181,6 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 }
 
 .grid { display: grid; gap: 16px; }
-.stats { grid-template-columns: repeat(2, 1fr); }  /* 2×2,占三列里的第一格 */
 .span2 { grid-column: span 2; }
 /* 通栏。用 1/-1 而不是 span 3:它在单列断点下也是「整行」,不用再写一条覆盖 */
 .span3 { grid-column: 1 / -1; }
@@ -195,15 +194,10 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   /* 单列。此时行高不再由邻居撑起,.nodes 自己的 basis 兜底 */
   #main { grid-template-columns: minmax(0, 1fr); }
   .span2 { grid-column: auto; }
-  .stats { grid-template-columns: repeat(4, 1fr); }
-}
-@media (max-width: 900px) {
-  .stats { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 660px) {
   /* 页头只剩品牌 + 构建标识那一组,窄到放不下时让它整组折到第二行 */
   .top { flex-wrap: wrap; }
-  .stats { grid-template-columns: 1fr; }
   #main { padding: 16px 14px 40px; }
   .card-head .hint { margin-left: 0; text-align: left; }
 }
@@ -229,10 +223,37 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 /* ── 概览数字 ─────────────────────────────────────────── */
 
-/* 卡片声明为查询容器:大数字按卡片自身宽度缩放(见 .big 的 clamp)。
-   用容器查询而非媒体查询 —— 同一张卡在三列布局被 340px 侧栏挤窄、在单列布局
-   却很宽,宽度不是视口的简单函数,只有卡片自己知道该缩多少。 */
-.stat { container-type: inline-size; }
+/* 一张卡内 2×2 四格:左上 Token、右上 运行时长、左下 请求总数、右下 调用统计。
+   四个数原来是四张独立卡片,合成一张之后页面顶部少了三道边框和三处 16px 内边距,
+   同一组数读起来是一块而不是四块。
+   行高不写死也不 stretch 到等高 —— 让 grid 默认的 stretch 生效,同一行两格
+   底边齐平,调用统计那格因此能撑满右下角。 */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* 四格叠成一列。2×2 在 ~330px 卡内宽下每格内容只剩 136px,Token 那串副行
+   («输入…输出…推理…缓存读…缓存写…») 会折成四行,竖着排反而更矮。
+   这条必须紧跟上面的基础规则 —— 写在文件前面的 @media 里会被后出现的
+   基础规则以同等特异性覆盖掉,断点看着生效其实没生效。 */
+@media (max-width: 660px) {
+  .stats { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* 每格声明为查询容器:大数字按**格子**自身宽度缩放(见 .big 的 clamp)。
+   用容器查询而非媒体查询 —— 同一格在三列布局被 340px 侧栏挤窄、在单列布局
+   却很宽,宽度不是视口的简单函数,只有格子自己知道该缩多少。 */
+.stat {
+  container-type: inline-size;
+  min-width: 0;
+  /* 小卡片的样子:用现成的 --card-2(语义就是「比卡片浅一层」,浅色模式自动翻转),
+     四格之间靠底色区分而不再加边框 —— 卡中卡套边框会把顶部堆成一片框线 */
+  padding: 11px 12px 12px;
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+}
 .stat h3 {
   font-size: 11px; font-weight: 500; letter-spacing: .07em;
   text-transform: uppercase; color: var(--fg-2);
@@ -243,14 +264,40 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
      但 nowrap 会让它在最窄的三列档(首列被 340px 侧栏挤到 ~121px)横向溢出
      框外,于是按卡片宽度缩字号 —— 宽屏保持 27px,窄到放不下时线性缩小。
      ponytail: 上限是「365 天 23 时」这类超长串在最窄档仍可能溢出,真到那步
-     得截断或改 JS 量算,不为假想值买单。 */
-  font-size: clamp(18px, 16.5cqi, 27px); font-weight: 600;
+     得截断或改 JS 量算,不为假想值买单。
+     18cqi 是按格子内容宽 151px(三列布局最宽档)正好顶到 27px 定的 —— 四格
+     并进一张卡之后格子比原来的独立卡片窄 15px,系数不跟着调的话桌面档永远
+     够不到 27px,大数字会凭空小一圈。 */
+  font-size: clamp(18px, 18cqi, 27px); font-weight: 600;
   letter-spacing: -.02em;
   margin: 7px 0 5px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .stat .sub { color: var(--fg-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* 调用统计:模型名 + 成功次数,一行一个,按次数降序(排序在 core.js)。
+   不给这格设 .big —— 它是一张小排行,没有哪个数字该被单独放大。
+   不限高:模型是个位数量级(上游放出来的 free 模型就那几个),
+   ponytail: 真到几十个要限高内部滚动,照 .nstats 那套写。 */
+.mstats { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.mstats li {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; line-height: 1.45;
+}
+/* 名字吃掉剩余宽度并省略号截断,次数永远贴右边不被挤走 */
+.mstats .nm {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--fg-2);
+}
+.mstats b {
+  flex: 0 0 auto;
+  font-family: var(--mono); font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* 这格的空态在小卡片里,13px + 14px 内边距会把格子顶高半行 */
+.empty.mini { font-size: 12px; padding: 8px 0 2px; }
 
 .bar {
   height: 5px; margin-top: 9px; border-radius: 999px;

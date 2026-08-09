@@ -227,10 +227,36 @@ t('anthropicBase 是裸地址,不带 /v1(客户端自己拼 /v1/messages)', () =
   assert.equal(endpointBase('https://a.b'), `${anthropicBase('https://a.b')}/v1`);
 });
 
-t('rankBreakdown 按请求数降序并截断', () => {
-  const r = rankBreakdown({ a: { requests: 5 }, b: { requests: 90 }, c: { requests: 12 } }, 2);
+t('rankBreakdown 按成功次数降序并截断', () => {
+  const r = rankBreakdown({ a: { success: 5 }, b: { success: 90 }, c: { success: 12 } }, 2);
   assert.deepEqual(r.map((x) => x.key), ['b', 'c']);
   assert.deepEqual(rankBreakdown(null), []);
+});
+
+t('rankBreakdown 排的是成功数而不是请求数', () => {
+  // 「调用统计」那格问的是「哪个模型真在干活」。按 requests 排的话,一个每次
+  // 都撞 429 的模型会凭失败次数占住榜首
+  const r = rankBreakdown({
+    busy: { requests: 500, success: 3 },      // 打得最多,几乎全失败
+    good: { requests: 20, success: 19 },
+  });
+  assert.deepEqual(r.map((x) => x.key), ['good', 'busy']);
+  assert.equal(r[0].success, 19);
+  assert.equal(r[0].requests, 20, 'requests 仍要带出来,调用方要总量时不用翻原映射');
+});
+
+t('rankBreakdown 丢掉零成功的模型', () => {
+  // 全失败的模型列一行 0 只是占位,那格宽度要留给真有量的
+  assert.deepEqual(rankBreakdown({ dead: { requests: 12, success: 0 } }), []);
+  // 旧 usage.json 的桶可能没有 success 字段,不能因此把它当成 0 次成功之外的东西
+  assert.deepEqual(rankBreakdown({ old: { requests: 9 } }), []);
+});
+
+t('rankBreakdown limit=0 不截断', () => {
+  // 调用统计那格全量显示(模型是个位数量级),截到 5 会悄悄少几行
+  const map = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`m${i}`, { success: i + 1 }]));
+  assert.equal(rankBreakdown(map, 0).length, 8);
+  assert.equal(rankBreakdown(map).length, 5, '默认仍截断到 5');
 });
 
 t('hasNewer 只在两个 hash 都有且不同时才亮', () => {
@@ -553,6 +579,30 @@ t('概览大数字按卡片宽度缩放,窄三列档不溢出框', () => {
     '大数字字号应随卡片宽度 clamp,固定 27px 会在最窄三列档溢出框外');
   assert.match(big, /white-space:\s*nowrap/,
     'nowrap 仍要保留,否则窄档带空格的值会断成两行把卡片顶高');
+});
+
+t('概览四格在一张卡内 2×2,DOM 顺序就是视觉顺序', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+
+  // 四格必须在同一张卡里(整合的全部意义),而不是各自一张 .card
+  const sec = html.match(/<section class="card stats"[\s\S]*?<\/section>/)?.[0] || '';
+  assert.ok(sec, '概览应是一张 .card.stats,不再是 .grid.stats 套四张卡');
+  assert.doesNotMatch(sec, /class="card stat"/, '内部小卡片不该再叠一层 .card');
+
+  // 两列 grid 逐行填充,所以 DOM 顺序 == 左上→右上→左下→右下。
+  // 需求把 Token 放左上、运行时长右上、请求总数左下、调用统计右下 ——
+  // 用 grid-area 显式定位能达到同样效果,但 Tab 顺序会和看到的不一致
+  const stats = css.match(/^\.stats\s*\{([^}]*)\}/m)?.[1] || '';
+  assert.match(stats, /grid-template-columns:\s*repeat\(2,/, '概览内部应是两列');
+  const order = [...sec.matchAll(/<h3>([^<]+)<\/h3>/g)].map((m) => m[1]);
+  assert.deepEqual(order, ['Token 消耗', '运行时长', '请求总数', '调用统计'],
+    'DOM 顺序决定视觉和 Tab 顺序:左上 Token、右上 运行时长、左下 请求总数、右下 调用统计');
+
+  // 成功率并进请求总数那格:进度条的可访问名要指向带「成功率」字样的元素,
+  // 指向卡片标题会把 98% 念成请求数
+  assert.match(sec, /aria-labelledby="s-rate"/, '进度条要有可访问名');
+  assert.doesNotMatch(sec, /<h3>成功率<\/h3>/, '成功率不再单独占一格');
 });
 
 t('OpenCode 请求头开启状态使用绿色标签', () => {

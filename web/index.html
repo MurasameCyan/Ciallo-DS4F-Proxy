@@ -56,26 +56,38 @@
 <main id="main">
 
   <!-- ── 概览 ───────────────────────────────────────────── -->
-  <section class="grid stats" aria-label="用量概览">
-    <article class="card stat">
-      <h3>请求总数</h3>
-      <p class="big" id="s-req">—</p>
-      <p class="sub" id="s-req-sub">成功 — · 失败 —</p>
-    </article>
-    <article class="card stat">
-      <h3>成功率</h3>
-      <p class="big" id="s-rate">—</p>
-      <div class="bar" role="img" aria-labelledby="s-rate"><span id="s-rate-bar"></span></div>
-    </article>
-    <article class="card stat">
+  <!-- 一张卡内 2×2 四格。DOM 顺序 == 视觉顺序(两列 grid 逐行填充),
+       所以 Tab 和读屏顺序也就是 左上→右上→左下→右下,不用 grid 显式定位。 -->
+  <section class="card stats" aria-label="用量概览">
+    <article class="stat">
       <h3>Token 消耗</h3>
       <p class="big" id="s-tok">—</p>
       <p class="sub" id="s-tok-sub">输入 — · 输出 — · 推理 — · 缓存读 — · 缓存写 —</p>
     </article>
-    <article class="card stat">
+    <article class="stat">
       <h3>运行时长</h3>
       <p class="big" id="s-up">—</p>
       <p class="sub" id="s-up-sub">最后请求 —</p>
+    </article>
+    <!-- 成功率并进这一格:它就是「成功 N / 总数 N」的另一种写法,原来单独占一格
+         等于把同一组数拆开摆两处。百分比落在副行,进度条留下 —— 那条是唯一
+         不用读数字就能看出健康度的东西。 -->
+    <article class="stat">
+      <h3>请求总数</h3>
+      <p class="big" id="s-req">—</p>
+      <p class="sub"><span id="s-req-sub">成功 — · 失败 —</span> · <span id="s-rate">成功率 —</span></p>
+      <!-- 条形的可访问名取自 #s-rate(含「成功率」二字),不是卡片标题:
+           标题现在是「请求总数」,单挂标题会把 98% 读成请求数 -->
+      <div class="bar" role="img" aria-labelledby="s-rate"><span id="s-rate-bar"></span></div>
+    </article>
+    <!-- 各模型的成功调用次数,按次数降序。和「调用日志」不同口径:那边是逐条
+         时间线(最近 200 条),这边是开机至今的累计分布。 -->
+    <article class="stat">
+      <h3>调用统计</h3>
+      <ul class="mstats" id="s-models" aria-label="各模型成功调用次数,按次数降序"></ul>
+      <!-- 初始 hidden,由 renderModelStats() 决定露不露:写死不 hidden 会在
+           首帧闪一下「还没有成功的调用」,哪怕其实有一千次 -->
+      <p class="empty mini" id="s-models-empty" hidden>还没有成功的调用</p>
     </article>
   </section>
 
