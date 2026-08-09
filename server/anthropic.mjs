@@ -50,6 +50,78 @@ export function toolsToOpenAI(tools) {
   return out.length ? out : undefined;
 }
 
+/**
+ * 思考强度的合法档位。客户端能说的全集,不代表每个模型都认。
+ * 挡掉明显不是档位的字符串,免得把乱输入原样送出去换一个 400。
+ */
+export const EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+/** 客户端表达「顶档」的两种说法。它们要落到模型实际认的最高档,而不是原样发出去 */
+const TOP = new Set(['xhigh', 'max']);
+
+/**
+ * 认 max 这一档的模型。
+ *
+ * 这张表必须存在,因为 zen 对不认的档位是**丢字段**而不是降到最近一档:
+ * DS4F 的 thinkingLevelMap 里 off/minimal/low/medium/xhigh 全是 null,只有
+ * high/max 有值 —— 客户端选「极高(xhigh)」原样发过去会被丢掉、回落到默认 high,
+ * 于是「极高」比「最多」还弱。而 north-mini-code-free 反过来:它只到 high,
+ * 连 max 都是 null,所以也不能无脑把顶档都发成 max。
+ *
+ * ponytail: 上限是这张表得手工维护,而 zen 的免费清单换得挺勤。不在表里的模型
+ * 按 high 处理 —— 那是各家最普遍支持的顶档,宁可少一档也不会被丢成默认值。
+ * 哪天某个免费模型也支持 max 了,往这儿加一行就行。
+ */
+const MAX_CAPABLE = new Set(['deepseek-v4-flash-free']);
+
+/** 这个模型实际认的最高档 */
+const topEffort = (model) => (MAX_CAPABLE.has(String(model ?? '').trim()) ? 'max' : 'high');
+
+/**
+ * thinking.budget_tokens → 档位。
+ *
+ * Anthropic 协议里没有 reasoning_effort,客户端表达思考强度只有 budget_tokens
+ * 这一个旋钮,而 Claude Code 把它绑在关键词上:think≈4000、think hard≈10000、
+ * ultrathink=31999(协议下限 1024)。所以「想更用力」这件事客户端已经说清楚了,
+ * 只是说的是另一种语言 —— 翻过来就不用再加开关。
+ *
+ * 边界取在这几个关键词之间,而不是均分区间:ultrathink 要落到顶档,
+ * think hard 落到 high(DS4F 的默认档),这样用户敲的词和拿到的强度是对得上的。
+ *
+ * 表里只列到 high,顶档交给 topEffort(model) 定 —— budget_tokens 这种写法
+ * 本身不区分 xhigh 和 max,能表达的最强就是「顶」。
+ */
+const BUDGET_TIERS = [
+  [2_048, 'low'],
+  [8_000, 'medium'],
+  [16_000, 'high'],
+];
+
+/**
+ * 从客户端请求里读出思考强度,读不到就返回 ''(调用方据此不发这个字段,
+ * 随上游自己的默认 —— DS4F 是 high)。
+ *
+ * 三种写法都认:OpenAI 的 reasoning_effort、Responses 风格的 reasoning.effort、
+ * Anthropic 的 thinking.budget_tokens。前两种是客户端明说的,但「顶档」这件事
+ * 客户端只知道自己在说 xhigh 或 max,不知道这个模型的顶到底叫什么 —— 所以
+ * xhigh/max 统一折到 topEffort(model),其余档位原样放行(不认就被上游丢,
+ * 那是上游自己的事,至少不会比它说的更强或更弱)。
+ * budget_tokens 那种写法本身就不区分 xhigh/max,翻译时直接给顶档。
+ */
+export function reasoningEffort(req, model = '') {
+  const raw = req?.reasoning_effort ?? req?.reasoning?.effort;
+  const want = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (EFFORTS.has(want)) return TOP.has(want) ? topEffort(model) : want;
+
+  // disabled 时不发字段:DS4F 关不掉思考,硬塞个最低档也是被上游丢掉,
+  // 不如让它走默认 —— 至少行为是可预期的
+  if (req?.thinking?.type !== 'enabled') return '';
+  const budget = Number(req.thinking.budget_tokens);
+  if (!Number.isFinite(budget) || budget <= 0) return '';
+  const tier = BUDGET_TIERS.find(([max]) => budget <= max)?.[1];
+  return tier ?? topEffort(model);
+}
+
 /** {type:'any'} 是「必须调工具但随便哪个」,对上 OpenAI 的 'required' */
 export function toolChoiceToOpenAI(tc) {
   if (!tc || typeof tc !== 'object') return undefined;
@@ -147,6 +219,8 @@ export function anthropicToOpenAI(req) {
   if (tools) out.tools = tools;
   const tc = toolChoiceToOpenAI(req.tool_choice);
   if (tc !== undefined) out.tool_choice = tc;
+  const effort = reasoningEffort(req, req.model);
+  if (effort) out.reasoning_effort = effort;
   // top_k 没有 OpenAI 对应字段,刻意丢掉而不是硬塞(上游会 400)
   return out;
 }

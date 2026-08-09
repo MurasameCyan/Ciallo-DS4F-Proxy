@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import {
   flattenText, toolsToOpenAI, toolChoiceToOpenAI, anthropicToOpenAI,
   openAIToAnthropic, anthropicError, errTypeFor, mapStop, AnthropicStream,
+  reasoningEffort,
 } from '../server/anthropic.mjs';
 
 let n = 0;
@@ -450,6 +451,73 @@ t('推理中途上游报错也能关掉思考块', () => {
   st.fail('upstream died');
   assert.ok(names().includes('content_block_stop'), '开着的思考块必须关,否则客户端等到超时');
   assert.equal(names().at(-1), 'message_stop');
+});
+
+// ── 思考强度 ────────────────────────────────────────────
+
+const DS4F = 'deepseek-v4-flash-free';
+const NORTH = 'north-mini-code-free';
+
+t('客户端显式给的档位直接采信,大小写和空格不影响', () => {
+  assert.equal(reasoningEffort({ reasoning_effort: 'max' }, DS4F), 'max');
+  assert.equal(reasoningEffort({ reasoning_effort: ' MAX ' }, DS4F), 'max');
+  assert.equal(reasoningEffort({ reasoning: { effort: 'high' } }, DS4F), 'high');
+});
+
+t('xhigh 折到模型顶档 —— 原样发会被上游丢成默认,反而比 high 弱', () => {
+  assert.equal(reasoningEffort({ reasoning_effort: 'xhigh' }, DS4F), 'max');
+  // north-mini 的 thinkingLevelMap 里连 max 都是 null,顶档只到 high
+  assert.equal(reasoningEffort({ reasoning_effort: 'xhigh' }, NORTH), 'high');
+  assert.equal(reasoningEffort({ reasoning_effort: 'max' }, NORTH), 'high');
+});
+
+t('中低档原样放行,不因模型而变', () => {
+  for (const lv of ['minimal', 'low', 'medium', 'high']) {
+    assert.equal(reasoningEffort({ reasoning_effort: lv }, DS4F), lv);
+    assert.equal(reasoningEffort({ reasoning_effort: lv }, NORTH), lv);
+  }
+});
+
+t('不是档位的字符串当没给 —— 原样透传会让上游 400', () => {
+  assert.equal(reasoningEffort({ reasoning_effort: 'foo' }, DS4F), '');
+  assert.equal(reasoningEffort({ reasoning_effort: 9 }, DS4F), '');
+  assert.equal(reasoningEffort({}, DS4F), '');
+  assert.equal(reasoningEffort(null, DS4F), '');
+});
+
+t('Claude Code 的 budget_tokens 按关键词档位翻成 effort', () => {
+  const budget = (n, m = DS4F) => reasoningEffort({ thinking: { type: 'enabled', budget_tokens: n } }, m);
+  assert.equal(budget(1024), 'low');       // 协议下限
+  assert.equal(budget(4000), 'medium');    // think
+  assert.equal(budget(10000), 'high');     // think hard
+  assert.equal(budget(31999), 'max');      // ultrathink —— 本次改动的目的
+  // 顶档同样按模型收敛,不是无脑 max
+  assert.equal(budget(31999, NORTH), 'high');
+});
+
+t('thinking 没开或 budget 非法时不发字段,交给上游默认', () => {
+  assert.equal(reasoningEffort({ thinking: { type: 'disabled', budget_tokens: 31999 } }, DS4F), '');
+  assert.equal(reasoningEffort({ thinking: { type: 'enabled' } }, DS4F), '');
+  assert.equal(reasoningEffort({ thinking: { type: 'enabled', budget_tokens: 0 } }, DS4F), '');
+});
+
+t('显式档位优先于 budget —— 两个都给时不能被翻译覆盖', () => {
+  assert.equal(reasoningEffort({
+    reasoning_effort: 'low', thinking: { type: 'enabled', budget_tokens: 31999 },
+  }, DS4F), 'low');
+});
+
+t('anthropicToOpenAI 把 ultrathink 带成 reasoning_effort', () => {
+  const out = anthropicToOpenAI({
+    model: DS4F,
+    messages: [{ role: 'user', content: 'hi' }],
+    thinking: { type: 'enabled', budget_tokens: 31999 },
+  });
+  assert.equal(out.reasoning_effort, 'max');
+  // 没给思考参数时不能凭空多一个字段
+  assert.ok(!('reasoning_effort' in anthropicToOpenAI({
+    model: DS4F, messages: [{ role: 'user', content: 'hi' }],
+  })));
 });
 
 // ── flattenText 边界 ────────────────────────────────────

@@ -16,6 +16,7 @@ import { MihomoAgent } from './proxy.mjs';
 import { LAST_NODE_FILE, USAGE_FILE, MIXED_PORT, CTRL_PORT, POOL_NAME } from './config.mjs';
 import {
   anthropicToOpenAI, openAIToAnthropic, anthropicError, errTypeFor, AnthropicStream, flattenText,
+  reasoningEffort,
 } from './anthropic.mjs';
 import { safeEqual } from './auth.mjs';
 
@@ -602,6 +603,21 @@ export class Gateway {
         `Model not available: ${model} —— 只接受 /v1/models 里的免费模型`, 'invalid_model');
     }
     body.model = model;
+
+    /**
+     * 思考强度。reasoningEffort 从客户端的三种写法(reasoning_effort /
+     * reasoning.effort / thinking.budget_tokens)统一转成这个模型认的档位或 ''。
+     *
+     * 空值不发字段 —— 随上游自己的默认(DS4F 是 high);有值就覆盖掉 body 里
+     * 原有的,这样 OpenAI 路径带着的乱值(客户端写了个 foo)和会被上游丢掉的
+     * 顶档别名(xhigh)都在这儿收敛掉。Anthropic 路径的 body 已经转换过一遍,
+     * 这里用的是同一个函数、同一个 model,结果一致。
+     *
+     * 必须放在 body.model 定案之后:顶档叫 max 还是 high 取决于模型。
+     */
+    const effort = reasoningEffort(inbound, model);
+    if (effort) body.reasoning_effort = effort;
+    else delete body.reasoning_effort;
 
     // 身份头在这儿构造一次,再传给下面每一次尝试 —— 换节点重试时 request/session ID
     // 必须还是同一个,否则上游看到的是几个互不相干的新会话
