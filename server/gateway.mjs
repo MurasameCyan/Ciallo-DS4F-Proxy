@@ -202,6 +202,11 @@ const blankNode = () => ({
   // 面板按这个倒序排:哪个节点现在正在用,比哪个节点历史上跑得多有用。
   // 0 而不是 null —— 旧桶归一化后直接参与比较,不用在前端兜 null
   lastAt: 0,
+  // 最近一次尝试发出去的模型和思考强度。只留最近一次而不按模型分桶:面板本来
+  // 就按 lastAt 倒序显示「这个节点刚才在跑什么」,历史分布是 byModel 的活。
+  // effort 为 '' = 没发这个字段,随上游默认 —— 和「发了 high」是两回事,
+  // 排查「客户端设了 max 却没生效」时区别就在这儿。
+  lastModel: '', lastEffort: '',
 });
 
 /**
@@ -390,8 +395,9 @@ export class UsageTracker {
    * result ∈ success | rateLimited | timeout | upstreamError —— 互斥,只加一个。
    * 不写 lastRequest,那是客户端口径的字段;也不 save,由调用方那次 record 顺手落盘
    * (一次客户端请求最多写一次文件,而不是每换一个节点写一次)。
+   * call 是这次尝试实际发出的 { model, effort },只记进 lastModel/lastEffort。
    */
-  recordAttempt(node, result, usage = null, timing = null) {
+  recordAttempt(node, result, usage = null, timing = null, call = null) {
     if (!node) return;
     // 先验参再建桶:名字写错的时候不该在面板上留下一个凭空多出来的节点行
     if (!NODE_OUTCOMES.includes(result)) throw new Error(`未知的节点尝试结果: ${result}`);
@@ -400,6 +406,10 @@ export class UsageTracker {
     b[result]++;
     // 成功失败都算「打过」:一直被限流的节点正是最该排在眼前的那个
     b.lastAt = Date.now();
+    if (call) {
+      b.lastModel = String(call.model ?? '').trim();
+      b.lastEffort = String(call.effort ?? '').trim();
+    }
     // timing 只有成功那次会传。ttfb 测不到就不记样本(比如流式开了 200 却一个
     // chunk 都没来),记 0 会把平均值稀释成一个谁都没经历过的数
     if (timing) {
@@ -631,7 +641,7 @@ export class Gateway {
     }
     const cur = await this.ensureNode(nodes, res, dialect, deadline);
     if (!cur) return;   // ensureNode 已经回过错误了
-    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity);
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort);
   }
 
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
@@ -681,12 +691,13 @@ export class Gateway {
    * 所以下面每条 `continue`(还要再试)之前只有 recordAttempt,
    * 每条 `return`(定案了)才有 record。
    */
-  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity, identity = null) {
+  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity, identity = null, effort = '') {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
     let switches = 0;
     const left = () => deadline - Date.now();
+    const call = { model: body.model, effort };
 
     // 次数和时间两个上限,谁先到都停。次数防「48 个节点挨个试」,
     // 时间防「每次都慢但都没超时」—— 只有次数上限的话后者能拖到几十分钟。
@@ -716,18 +727,19 @@ export class Gateway {
           // 只给成功那次记耗时:中断的那次总耗时量的是「断在第几秒」,
           // 不是这个节点跑完一次要多久,混进平均值里读不出任何东西
           this.usage.recordAttempt(cur, result.ok ? 'success' : 'upstreamError', result.usage,
-            result.ok ? { ttfb: result.ttfb, total: dt } : null);
+            result.ok ? { ttfb: result.ttfb, total: dt } : null, call);
           this.usage.record(body.model, result.usage, result.ok);
           this.logger(result.ok ? 'ok' : 'error',
-            `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}" ${dt}ms`);
+            `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}" ${dt}ms effort=${effort || '默认'}`);
           return;
         }
         this.lockedNode = cur;
         this.cooldown.clear(cur);
         this.saveLastNode(cur);
-        this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt });
+        this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
         this.usage.record(body.model, result.usage, true);
-        this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`);
+        this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`
+          + ` effort=${effort || '默认'}`);
         return dialect.respond(res, result, body.model);
       } catch (e) {
         const status = e.status || 0;
@@ -735,7 +747,7 @@ export class Gateway {
         // 流已经开始吐了就不能重试:头都发出去了,换节点等于给客户端拼接两半响应。
         // 收尾由 forwardStream 里的 sink 负责(它才拿得到那个 sink),这里只记账。
         if (e.notStarted === false) {
-          this.usage.recordAttempt(cur, 'upstreamError');
+          this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
           this.usage.record(body.model, null, false);
           this.logger('error', `[stream-mid] node="${cur}" 中断: ${e.body || e.message}`);
           try { res.end(); } catch {}
@@ -744,7 +756,7 @@ export class Gateway {
 
         if (status === 429) {
           this.cooldown.mark429(cur);
-          this.usage.recordAttempt(cur, 'rateLimited');
+          this.usage.recordAttempt(cur, 'rateLimited', null, null, call);
           this.logger('warn', `[429] node="${cur}" 限流,冷却 ${COOLDOWN_MS / 1000}s`);
           tried.add(cur);
           netRetry = 0;
@@ -781,7 +793,7 @@ export class Gateway {
 
         if (status === 0) {
           // 超时/连接失败:每次都是真发出去过的一次尝试,所以重试前先记一笔
-          this.usage.recordAttempt(cur, 'timeout');
+          this.usage.recordAttempt(cur, 'timeout', null, null, call);
           if (++netRetry <= MAX_NET_RETRY) {
             this.logger('warn', `[net-retry ${netRetry}/${MAX_NET_RETRY}] node="${cur}": ${e.body || e.message}`);
             await sleep(1000);
@@ -815,7 +827,7 @@ export class Gateway {
         }
 
         // 400/500 之类:换节点也是同样结果,直接把上游的话原样带回去
-        this.usage.recordAttempt(cur, 'upstreamError');
+        this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
         this.usage.record(body.model, null, false);
         this.logger('error', `[chat] HTTP ${status}: ${String(e.body).slice(0, 300)}`);
         if (dialect === OPENAI) {

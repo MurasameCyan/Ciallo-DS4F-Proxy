@@ -187,6 +187,11 @@ function renderNodeStats() {
     main.className = 'nstat-main';
     main.append(
       nm,
+      // 最近一次这个节点发出去的模型和思考强度,紧跟节点名 —— 排查「客户端设了
+      // max 却没生效」时要的就是这两个数,而它们必须挨着看才对得上。
+      // 强度 '—' = 没发这个字段(随上游默认),和显式发了 high 是两回事。
+      num('', '模型', r.lastModel || '—'),
+      num('', '强度', r.lastEffort || '—'),
       num('', '尝试', fmtCount(r.requests)),
       num('', '成功率', fmtPercent(r.rate)),
       // 只有成功的尝试才有耗时,所以没成功过的节点这两项是 '—' 而不是 0

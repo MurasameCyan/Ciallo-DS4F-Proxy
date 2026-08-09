@@ -257,6 +257,9 @@ export function nodeStats(byNode) {
       'cacheReadTokens', 'cacheWriteTokens']) row[k] = n(k);
     // undefined 要保留给 cacheRate 做旧桶兼容；强制成 false 会把历史非零缓存误判成无数据。
     row.hasCacheData = v?.hasCacheData;
+    // 最近一次这个节点发出去的模型和思考强度。旧桶没这两个字段 → ''(前端显示 —)
+    row.lastModel = String(v?.lastModel ?? '').trim();
+    row.lastEffort = String(v?.lastEffort ?? '').trim();
     row.rate = successRate(row);     // 字段名对得上,直接复用总览那个
     row.cache = cacheRate(row);
     row.ttfb = avgMs(n('ttfbMs'), n('ttfbCount'));

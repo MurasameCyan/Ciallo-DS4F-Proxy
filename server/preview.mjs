@@ -74,11 +74,13 @@ state.usage.byModel['mimo-v2.5-free'] = { requests: 73, totalTokens: 163_650 };
 // 最后一个没有成功样本所以两项都是 —,ms/s/m 和空值一屏内都能看到。
 // lastAt 刻意和尝试数反着来(跑得最多的那个反而最久没打过):面板按最近调用
 // 倒序,两种顺序一致的话预览就证明不了排的是时间而不是次数。
+// lastModel/lastEffort 也凑齐几种:最长的模型名(布局最容易被挤坏的那个)、
+// 显式 max、没发字段的 ''(显示 —),外加一个完全没这两个字段的旧桶。
 for (const [name, v] of [
-  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true, ttfbMs: 1_099_080, ttfbCount: 774, durationMs: 6_656_400, durationCount: 774, lastAt: Date.now() - 42_000 }],
-  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true, ttfbMs: 1_004_400, ttfbCount: 372, durationMs: 5_282_400, durationCount: 372, lastAt: Date.now() - 5_000 }],
-  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true, ttfbMs: 145_080, ttfbCount: 186, durationMs: 12_852_000, durationCount: 189, lastAt: Date.now() - 900 }],
-  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false, ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0, lastAt: Date.now() - 3600_000 }],
+  [NODES[2], { requests: 812, success: 774, rateLimited: 26, timeout: 8, upstreamError: 4, promptTokens: 1_902_441, completionTokens: 664_120, reasoningTokens: 281_004, totalTokens: 2_566_561, cacheReadTokens: 741_233, cacheWriteTokens: 96_410, hasCacheData: true, ttfbMs: 1_099_080, ttfbCount: 774, durationMs: 6_656_400, durationCount: 774, lastAt: Date.now() - 42_000, lastModel: 'deepseek-v4-flash-free', lastEffort: 'max' }],
+  [NODES[0], { requests: 418, success: 372, rateLimited: 39, timeout: 5, upstreamError: 2, promptTokens: 742_118, completionTokens: 261_337, reasoningTokens: 108_442, totalTokens: 1_003_455, cacheReadTokens: 88_004, cacheWriteTokens: 12_770, hasCacheData: true, ttfbMs: 1_004_400, ttfbCount: 372, durationMs: 5_282_400, durationCount: 372, lastAt: Date.now() - 5_000, lastModel: 'deepseek-v4-flash-free', lastEffort: 'max' }],
+  [NODES[6], { requests: 231, success: 189, rateLimited: 33, timeout: 7, upstreamError: 2, promptTokens: 196_743, completionTokens: 60_984, reasoningTokens: 23_441, totalTokens: 257_727, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: true, ttfbMs: 145_080, ttfbCount: 186, durationMs: 12_852_000, durationCount: 189, lastAt: Date.now() - 900, lastModel: 'north-mini-code-free', lastEffort: 'high' }],
+  [NODES[9], { requests: 58, success: 0, rateLimited: 0, timeout: 55, upstreamError: 3, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false, ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0, lastAt: Date.now() - 3600_000, lastModel: 'big-pickle', lastEffort: '' }],
 ]) state.usage.byNode[name] = v;
 
 const clients = new Set();
@@ -165,9 +167,13 @@ function simulate() {
     promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0,
     cacheReadTokens: 0, cacheWriteTokens: 0, hasCacheData: false,
     ttfbMs: 0, ttfbCount: 0, durationMs: 0, durationCount: 0, lastAt: 0,
+    lastModel: '', lastEffort: '',
   });
   nb.requests++;
   nb.lastAt = Date.now();       // 面板按这个倒序,预览里也得跟着动才看得出重排
+  // 真实网关每次尝试都会覆盖这两个,预览不写的话 tick 一下就把行洗成 —
+  nb.lastModel = 'deepseek-v4-flash-free';
+  nb.lastEffort = 'max';
 
   if (Math.random() < 0.12) {
     u.fail++;

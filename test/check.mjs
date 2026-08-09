@@ -299,6 +299,20 @@ t('nodeStats 跳过一次都没试过的节点', () => {
   assert.equal(totals.timeout, 1);
 });
 
+t('nodeStats 带出最近一次的模型和思考强度,旧桶缺字段归一成空串', () => {
+  const { rows } = nodeStats({
+    A: { requests: 1, success: 1, lastAt: 2, lastModel: ' deepseek-v4-flash-free ', lastEffort: ' max ' },
+    B: { requests: 1, success: 1, lastAt: 1 },   // 加这两个字段之前落盘的桶
+  });
+  const [a, b] = rows;
+  // 两头空格来自落盘数据,渲染前就该修掉,否则面板上是「模型  ds4f 」
+  assert.equal(a.lastModel, 'deepseek-v4-flash-free');
+  assert.equal(a.lastEffort, 'max');
+  // 旧桶不能变成 'undefined' 字符串 —— 前端靠 || '—' 兜底,那要求这里是空串
+  assert.equal(b.lastModel, '');
+  assert.equal(b.lastEffort, '');
+});
+
 t('nodeStats 合计只加四类结果和尝试数,token 不进合计', () => {
   const { totals } = nodeStats({
     A: { requests: 3, success: 1, rateLimited: 1, timeout: 1, promptTokens: 900 },

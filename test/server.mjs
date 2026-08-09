@@ -236,6 +236,28 @@ await t('recordAttempt 记下这次尝试的时间(面板靠它把最近调用�
   assert.ok(u.getStats().byNode.B.lastAt > 0, '不带 timing 的尝试也要记时间');
 });
 
+await t('recordAttempt 记下这次尝试发出的模型和思考强度(面板靠它核对 max 有没有真发出去)', () => {
+  const u = new UsageTracker(path.join(TMP, 'lastcall.json'), () => {});
+  u.recordAttempt('A', 'success', null, { ttfb: 100, total: 200 },
+    { model: 'deepseek-v4-flash-free', effort: 'max' });
+  const a = u.getStats().byNode.A;
+  assert.equal(a.lastModel, 'deepseek-v4-flash-free');
+  assert.equal(a.lastEffort, 'max');
+
+  // 没发 reasoning_effort(随上游默认)和显式发了 high 是两回事,得能区分出来
+  u.recordAttempt('A', 'success', null, null, { model: 'big-pickle', effort: '' });
+  assert.equal(u.getStats().byNode.A.lastEffort, '', '空强度表示没发这个字段');
+  assert.equal(u.getStats().byNode.A.lastModel, 'big-pickle', '每次尝试都覆盖成最近一次');
+
+  // 429 这种没 usage/timing 的尝试同样要留下模型和强度,否则限流行看不出在跑什么
+  u.recordAttempt('B', 'rateLimited', null, null, { model: 'm', effort: 'high' });
+  assert.equal(u.getStats().byNode.B.lastEffort, 'high');
+
+  // 不传 call 时不能把已有的值抹掉
+  u.recordAttempt('B', 'timeout');
+  assert.equal(u.getStats().byNode.B.lastModel, 'm', '不传 call 应保留上次的值');
+});
+
 await t('缓存字段明确返回 0 与完全缺失能区分', () => {
   const u = new UsageTracker(path.join(TMP, 'cache-presence.json'), () => {});
   u.recordAttempt('missing', 'success', { prompt_tokens: 10 });
