@@ -532,12 +532,24 @@ input[readonly] { color: var(--fg-2); }
    上边距的话开关会贴在按钮上;下边距归零,让卡里那排按钮的 13px 说话。 */
 .btn.wide + .field { margin: 13px 0 0; }
 
-.models { display: flex; flex-wrap: wrap; gap: 6px; }
+/* 两列定宽栅格,不再按内容宽度流式排。原来那版是 flex-wrap:名字长短不一,
+   每行挤进几个全看运气,读起来是一团胶囊;两列固定下来,扫的时候眼睛只走两条线。 */
+.models { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .models li {
   font-family: var(--mono); font-size: 11px;
   padding: 3px 8px; border-radius: 999px;
   border: 1px solid var(--line-2); color: var(--fg-2);
+  /* 网格项默认 min-width:auto,不肯缩到内容宽度以下 —— 不归零的话长名字
+     会把自己那一列撑开,两列就不等宽了 */
+  min-width: 0;
+  /* 装不下的自己左右滚,不用省略号:模型名要照着填进客户端,
+     `nemotron-3.5-lightning…` 这种截断看不出是哪个,复制也复制不全。 */
+  overflow-x: auto; white-space: nowrap;
+  /* 胶囊连边框才 21px 高,横滚动条摆进去字就没地方了。滚动条藏了但滚动照旧,
+     溢出的那几个另外给 tabindex + title(见 app.js 的 renderModels)。 */
+  scrollbar-width: none;
 }
+.models li::-webkit-scrollbar { display: none; }
 
 /* ── 按钮 ─────────────────────────────────────────────── */
 

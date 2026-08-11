@@ -405,6 +405,14 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
       return json(res, r);
     }
 
+    // 手动同步免费模型清单。平时开机拉一次、之后每天一次(见 MODELS_TTL_MS),
+    // 这个按钮是给「上游刚上线了新模型,不想等到明天」用的。放 POST 上和
+    // /api/nodes/test 一致:它会出站,不该被 GET 的缓存或预取碰上。
+    if (path === '/api/models/sync' && m === 'POST') {
+      const r = await gateway.refreshModels();   // 失败会抛,交给下面统一的 500
+      return json(res, r);
+    }
+
     if (path === '/api/usage' && m === 'GET') return json(res, gateway.usage.getStats());
 
     if (path === '/api/usage/reset' && m === 'POST') {
@@ -540,8 +548,10 @@ async function main() {
   // —— 没拉到之前用的是 FREE_MODELS 兜底,退化成旧行为而不是失败。
   // 之后每天一次(MODELS_TTL_MS),搭面板轮询的车走,不另起定时器。
   gateway.refreshModels()
-    .then((m) => log('info', `[gateway] 免费模型 ${m.length} 个,客户端选哪个转发哪个`))
-    .catch(() => {});   // refreshModels 自己不 reject,这里只是防御
+    .then((r) => log('info', `[gateway] 免费模型 ${r.models.length} 个,客户端选哪个转发哪个`))
+    // 拉不到就用兜底那份跑,refreshModels 已经记过一行 warn 了。
+    // 开机失败不该让进程起不来 —— 面板和 /v1 照常可用,过一天自己再拉
+    .catch(() => {});
 
   if (creds.generated) {
     // 打在日志里而不是静默放行。docker logs 看一眼就有,

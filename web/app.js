@@ -271,12 +271,27 @@ function renderConn() {
 function renderModels() {
   const list = Array.isArray(S.status.models) ? S.status.models : [];
   const ul = $('models');
-  // 列表几周才变一次,但重建 8 个 <li> 的代价比比对差异还小
+  // 内容没变就不重建。以前是每轮无条件重建(8 个 <li> 比 diff 还便宜),但下面
+  // 要读 scrollWidth 量溢出,那会强制同步重排 —— 2 秒一次地重排一整格不值得,
+  // 而这个清单几周才变一次
+  const key = list.join(' ');
+  if (ul.dataset.key === key) return;
+  ul.dataset.key = key;
+
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
     li.textContent = modelLabel(m);
     return li;
   }));
+
+  // 装不下的那几个:横向滚动条是藏起来的(胶囊只有 21px 高,摆得下条就摆不下字),
+  // 所以得另给键盘和读屏一条路 —— tabindex 让方向键能滚它,title 让悬停/读屏
+  // 拿到全名。只给真的溢出的加:全都能塞下时白占一串 Tab 停留点。
+  for (const li of ul.children) {
+    if (li.scrollWidth <= li.clientWidth + 1) continue;
+    li.tabIndex = 0;
+    li.title = li.textContent;
+  }
 }
 
 function renderBuild() {
@@ -427,6 +442,19 @@ function wire() {
     if (!confirm('重置 API Key?正在用旧 Key 的客户端会全部收到 401,需要重新填。')) return;
     run(e.target, '重置 Key', () => api('/regen-key', { method: 'POST' }));
   };
+
+  // 同步模型:立刻去上游拉一遍免费清单(平时开机一次 + 每天一次)。
+  // toast 报「变了什么」而不只是「成了」—— 多数时候清单几周都不变,只说
+  // 「同步完成」的话看不出到底拉到了没有,还是又拿旧的糊过去了。
+  $('btn-sync').onclick = (e) => run(e.target, '同步模型', async () => {
+    const r = await api('/models/sync', { method: 'POST' });
+    const n = r?.models?.length ?? 0;
+    const diff = [
+      r?.added?.length ? `新增 ${r.added.join(', ')}` : '',
+      r?.gone?.length ? `下线 ${r.gone.join(', ')}` : '',
+    ].filter(Boolean).join(',');
+    return diff ? `共 ${n} 个,${diff}` : `共 ${n} 个,没有变化`;
+  });
 
   $('btn-speed').onclick = (e) => run(e.target, '测延迟', async () => {
     const r = await api('/nodes/test', { method: 'POST' });

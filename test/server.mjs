@@ -772,7 +772,12 @@ await t('拉到清单就换成上游那份,新增了什么记一行日志', asyn
   const g = new Gateway(load(), (lv, m) => lines.push(m));
   g.upstreamGet = async () => ({ data: [{ id: 'a-free' }, { id: 'big-pickle' }, { id: 'claude-x' }] });
   assert.deepEqual(g.freeModels(), FREE_MODELS, '第一次调用不等出站,先给兜底那份');
-  assert.deepEqual(await g.refreshModels(), ['a-free', 'big-pickle']);
+  const r = await g.refreshModels();
+  assert.deepEqual(r.models, ['a-free', 'big-pickle']);
+  // added/gone 是给「同步模型」那颗按钮的 toast 用的:清单几周才变一次,
+  // 只说「同步完成」看不出到底拉到了没有
+  assert.ok(r.added.includes('a-free'), '兜底里没有 a-free,它算新增');
+  assert.ok(r.gone.includes('deepseek-v4-flash-free'), '兜底里有、上游没给的算下线');
   assert.deepEqual(g.freeModels(), ['a-free', 'big-pickle']);
   assert.ok(lines.some((m) => m.includes('a-free')), '上游新上线一个免费模型,日志里得看得见');
 });
@@ -785,7 +790,9 @@ await t('拉失败或拉到空时继续用上一份,面板那一列不会变空'
   for (const stub of stubs) {
     const g = new Gateway(load(), () => {});
     g.upstreamGet = stub;
-    await g.refreshModels();
+    // 失败要往外抛:手动那条路(POST /api/models/sync)得把原因报给用户,
+    // 自动那两条(开机 / freeModels 的后台刷新)自己 catch 掉
+    await assert.rejects(g.refreshModels());
     assert.deepEqual(g.freeModels(), FREE_MODELS, '前端已经没有本地常量兜底了,这里空了面板就空');
   }
 });
@@ -799,7 +806,7 @@ await t('拉清单先直连,直连不通才回落到代理', async () => {
     if (agent === null) throw new Error('ECONNREFUSED');   // 直连被墙
     return { data: [{ id: 'a-free' }] };
   };
-  assert.deepEqual(await g.refreshModels(), ['a-free']);
+  assert.deepEqual((await g.refreshModels()).models, ['a-free']);
   assert.deepEqual(seen, [null, 'PROXY'], '顺序不能反 —— 直连省一次经节点的出站,且内核没起来时它是唯一的路');
 
   // 直连能通就不该再走代理:免费额度按出口 IP 算,白占一次节点出站没意义
@@ -809,7 +816,7 @@ await t('拉清单先直连,直连不通才回落到代理', async () => {
     only.push(agent);
     return { data: [{ id: 'b-free' }] };
   };
-  assert.deepEqual(await g2.refreshModels(), ['b-free']);
+  assert.deepEqual((await g2.refreshModels()).models, ['b-free']);
   assert.deepEqual(only, [null], '直连成功就到此为止');
 });
 
@@ -817,9 +824,21 @@ await t('直连和代理都不通时继续用上一份', async () => {
   const g = new Gateway(load(), () => {});
   let calls = 0;
   g.upstreamGet = async () => { calls++; throw new Error('down'); };
-  await g.refreshModels();
+  await assert.rejects(g.refreshModels());
   assert.equal(calls, 2, '两条路都试过了');
   assert.deepEqual(g.freeModels(), FREE_MODELS);
+});
+
+await t('拉失败也推进 modelsAt,否则面板每 2 秒轮询就每 2 秒重试一次出站', async () => {
+  let calls = 0;
+  const g = new Gateway(load(), () => {});
+  g.upstreamGet = async () => { calls++; throw new Error('down'); };
+  await assert.rejects(g.refreshModels());
+  assert.equal(calls, 2);
+  // freeModels 是同步返回缓存 + TTL 内不再刷新。失败时不推进时间戳的话,
+  // 这两次调用会各自再开两次出站
+  g.freeModels(); g.freeModels();
+  assert.equal(calls, 2, 'TTL 没到就不该再试');
 });
 
 await t('兜底清单和实测上下文表对得上,不能只补一处', async () => {
@@ -1693,6 +1712,37 @@ await t('POST /api/nodes/test 触发测延迟并回摘要', async () => {
   const j = await r.json();
   assert.equal(j.tested, 3, 'getAllNodes 被前面的测试替过,这里测的是它给的 3 个');
   assert.equal(typeof j.ms, 'number');
+});
+
+await t('POST /api/models/sync 现拉一遍清单并回变更明细', async () => {
+  gateway.models = ['old-free'];
+  gateway.modelsAt = 0;
+  gateway.upstreamGet = async () => ({ data: [{ id: 'old-free' }, { id: 'new-free' }] });
+
+  const r = await fetch(`${base}/api/models/sync`, { method: 'POST', headers: { authorization: auth } });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.deepEqual(j.models, ['old-free', 'new-free']);
+  assert.deepEqual(j.added, ['new-free'], 'toast 要说出新增了哪个,不然看不出这次到底拉到了没有');
+  assert.deepEqual(j.gone, []);
+});
+
+await t('拉不到时 /api/models/sync 回 500 而不是假装成功', async () => {
+  gateway.models = ['old-free'];
+  gateway.modelsAt = 0;
+  gateway.upstreamGet = async () => { throw new Error('ECONNREFUSED'); };
+
+  const r = await fetch(`${base}/api/models/sync`, { method: 'POST', headers: { authorization: auth } });
+  assert.equal(r.status, 500, '手动点的按钮必须把失败报出来 —— 回 200 + 旧清单看着像同步成功了');
+  const j = await r.json();
+  assert.match(j.error, /ECONNREFUSED/);
+  assert.deepEqual(gateway.freeModels(), ['old-free'], '失败不改清单');
+});
+
+await t('GET /api/models/sync 不算数(会出站的都是 POST)', async () => {
+  const r = await fetch(`${base}/api/models/sync`, { headers: { authorization: auth } });
+  assert.equal(r.status, 404, '浏览器预取或缓存不该触发一次出站');
+  await r.text();
 });
 
 await t('POST /api/usage/reset 清零并落盘', async () => {

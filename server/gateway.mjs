@@ -601,16 +601,20 @@ export class Gateway {
         // 空结果不接受:上游改了形状或返回了个错误页时,旧清单比空列表有用
         if (!free.length) throw new Error('返回里没有免费模型');
         const added = free.filter((m) => !this.models.includes(m));
+        const gone = this.models.filter((m) => !free.includes(m));
         this.models = free;
         this.modelsAt = Date.now();
         if (added.length) this.logger('info', `[models] 免费清单 ${free.length} 个,新增 ${added.join(', ')}`);
-        return free;
+        if (gone.length) this.logger('info', `[models] 免费清单 ${free.length} 个,下线 ${gone.join(', ')}`);
+        return { models: free, added, gone };
       })
       .catch((e) => {
-        // 只记一次(TTL 内不会重试),继续用上一次的清单
+        // 拉不到不改 models,继续用上一份。这里**往外抛** —— 「同步模型」按钮
+        // 要能把失败报给用户,而自动那条路(freeModels / 开机)自己 catch 掉。
+        // 但 modelsAt 照样推进:否则面板每 2 秒轮一次就会每 2 秒重试一次出站。
         this.modelsAt = Date.now();
         this.logger('warn', `[models] 拉免费清单失败(${e.message}),继续用上一份 ${this.models.length} 个`);
-        return this.models;
+        throw e;
       })
       .finally(() => { this.modelsFetch = null; });
     return this.modelsFetch;

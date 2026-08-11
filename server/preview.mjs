@@ -61,6 +61,9 @@ const state = {
   },
   build: '9dfba56',
   hasUpdate: false,
+  // 「同步模型」按一次翻一次面,多出/少掉一个模型。/api/status 跟着变,
+  // 所以点完能看见「可用模型」那一列真的动了,而不只是弹个 toast
+  extraModel: false,
   current: NODES[2],
   cooldowns: new Map(),          // name -> 进入冷却的时间戳
   // 假的实测延迟。故意留两个 null:那是「测过但不通」,面板要把它们
@@ -297,7 +300,7 @@ async function handleApi(req, res, path) {
       gatewayRunning: true, gatewayPort: state.cfg.port,
       mihomoRunning: true, mihomoVersion: 'v1.19.13',
       paused: false, demo: true,
-      models: DEMO_MODELS,
+      models: state.extraModel ? [...DEMO_MODELS, 'glm-5-air-free'] : DEMO_MODELS,
       build: state.build,
       buildUrl: `${REPO_URL}/commit/${state.build}`,
       repoUrl: REPO_URL,
@@ -362,6 +365,19 @@ async function handleApi(req, res, path) {
   }
 
   if (path === '/api/nodes/test' && m === 'POST') return json(res, await speedTest());
+
+  // 同步模型。假数据每点一次翻面:第一次「新增一个」、第二次翻回来变成「下线一个」,
+  // 于是 added/gone 两种 toast 文案都试得到 —— 真网关上清单几周才变一次,
+  // 光看真环境根本碰不到这两条分支
+  if (path === '/api/models/sync' && m === 'POST') {
+    await new Promise((r) => setTimeout(r, 900));
+    state.extraModel = !state.extraModel;
+    const models = state.extraModel ? [...DEMO_MODELS, 'glm-5-air-free'] : [...DEMO_MODELS];
+    const added = state.extraModel ? ['glm-5-air-free'] : [];
+    const gone = state.extraModel ? [] : ['glm-5-air-free'];
+    log('info', `[models] 免费清单 ${models.length} 个,${added.length ? `新增 ${added.join(', ')}` : `下线 ${gone.join(', ')}`}`);
+    return json(res, { models, added, gone });
+  }
 
   if (path === '/api/usage' && m === 'GET') return json(res, state.usage);
 
