@@ -15,8 +15,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 /** 公开仓库。允许用 GITHUB_REPO 覆盖(fork 出去自己发镜像的人要改这个) */
-const REPO = String(process.env.GITHUB_REPO || 'MurasameCyan/Ciallo-DS4F-Proxy')
-  .trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '') || 'MurasameCyan/Ciallo-DS4F-Proxy';
+const REPO = String(process.env.GITHUB_REPO || 'MurasameCyan/Ciallo-Zen-Proxy')
+  .trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '') || 'MurasameCyan/Ciallo-Zen-Proxy';
 
 /** 盯哪个分支。代码和 latest 镜像都出自 beta,main 只有 README,所以默认 beta */
 const REF = String(process.env.GITHUB_TRACK_REF || 'beta').trim() || 'beta';
@@ -96,7 +96,7 @@ export async function checkUpdate(fetchImpl = fetch) {
   let r;
   try {
     r = await fetchImpl(`https://api.github.com/repos/${REPO}/commits/${encodeURIComponent(REF)}`, {
-      headers: { accept: 'application/vnd.github+json', 'user-agent': 'ciallo-ds4f-proxy' },
+      headers: { accept: 'application/vnd.github+json', 'user-agent': 'ciallo-zen-proxy' },
       signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {

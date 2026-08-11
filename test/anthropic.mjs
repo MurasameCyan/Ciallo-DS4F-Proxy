@@ -185,7 +185,7 @@ t('非流式 reasoning_content 变成可在下轮回传的 thinking 块', () => 
     }],
   });
   assert.deepEqual(r.content[0], {
-    type: 'thinking', thinking: '先查配置', signature: 'ciallo-ds4f-proxy',
+    type: 'thinking', thinking: '先查配置', signature: 'ciallo-zen-proxy',
   });
   assert.equal(r.content[1].type, 'tool_use');
 });

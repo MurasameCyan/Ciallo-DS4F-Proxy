@@ -35,13 +35,33 @@ export const COOLDOWN_MS = 90 * 1000;
  * 所以改成时间驱动:超预算立刻回一个真错误。宁可让客户端看到 504,
  * 也不能让它挂到超时 —— 挂着连日志都对不上号。
  */
-export const REQUEST_DEADLINE_MS = 75_000;   // 一个请求从进来到回复的上限
-const UPSTREAM_TIMEOUT_MS = 45_000;          // 单次非流式请求的静默上限
-const STREAM_TTFB_MS = 45_000;               // 流式:等第一个字节
+export const REQUEST_DEADLINE_MS = 75_000;   // 一个请求从进来到回复的上限(小请求的基线)
+const UPSTREAM_TIMEOUT_MS = 45_000;          // 单次请求的静默上限(非流式的整段等待 / 流式的首字节)
 const STREAM_IDLE_MS = 120_000;              // 流式:开始吐了以后允许的静默
 const MAX_NODE_TRIES = 6;                    // 最多换几个节点。48 个全试一遍没意义:
                                              // 连续 6 个都 429 基本就是整体被限了
 const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开新的尝试了
+
+/**
+ * 上面两个上限都按请求体积放大。免费清单里有 6 个模型是 1M 级上下文(见 README
+ * 的模型表),那种请求体有 4-5 MiB,固定 75s / 45s 装不下:
+ *
+ *   实测直连上游,1M 上下文的 prefill 要 28-129s(同一尺寸重跑能差三倍),
+ *   网关这侧还得先把这几 MB 经 mihomo 传上去。原来 256K 就已经过不去了,
+ *   而且烧穿预算之后报的是「节点全挂」—— 把慢误判成坏,见 giveUp。
+ *
+ * 按体积连续放大而不是分档,免得 0.9 MiB(约 200K 上下文)这种刚好卡在档位下面
+ * 一点的请求一分钟都拿不到。几 KB 的小请求加出来不到一秒,行为和以前一样。
+ *
+ * ponytail: 用体积当 prefill 时间的代理指标,没真去数 token。够 1Mi 用(实测最坏
+ * 94s 加上传);要更准就得先 tokenize,那是另一件事。上限 420s / 240s 是拍的,
+ * 只求装得下实测最坏值还留一倍余量。
+ *
+ * 注意流式并不吃这个亏:实测 1M 请求的首字节也只要 7.5s(上游不等 prefill 走完
+ * 才开口),放宽对它只是保险。真正被固定预算掐死的是非流式。
+ */
+export const budgetFor = (bytes) => Math.min(420_000, REQUEST_DEADLINE_MS + Math.round((bytes / 1048576) * 75_000));
+export const silentFor = (bytes) => Math.min(240_000, UPSTREAM_TIMEOUT_MS + Math.round((bytes / 1048576) * 45_000));
 
 /**
  * 把上游的 reasoning_content 翻成 Anthropic 的 thinking 块。
@@ -629,12 +649,15 @@ export class Gateway {
   }
 
   async handleChat(req, res, dialect = OPENAI) {
-    const deadline = Date.now() + REQUEST_DEADLINE_MS;
+    const reqStart = Date.now();
     let raw = '';
     for await (const chunk of req) {
       raw += chunk;
       if (raw.length > 8e6) return dialect.fail(res, 413, 'Request too large', 'request_too_large');
     }
+    // 预算按体积算,但从请求进来的那一刻起算 —— 几 MB 的上传本身就要几秒到几十秒,
+    // 等收完才起算等于白送一段,而客户端是从发出请求就开始等的
+    const deadline = reqStart + budgetFor(raw.length);
     let inbound;
     try { inbound = JSON.parse(raw); } catch { return dialect.fail(res, 400, 'Invalid JSON', 'invalid_request_error'); }
 
@@ -743,15 +766,40 @@ export class Gateway {
     let switches = 0;
     const left = () => deadline - Date.now();
     const call = { model: body.model, effort };
+    const fails = { timeout: 0, rateLimited: 0 };
+
+    /**
+     * 终态失败的统一出口。原来三处各写一套文案,其中「Tried N nodes, all
+     * unavailable」根本不看原因 —— 大上下文 prefill 慢也被说成节点坏。实测 256K
+     * 的请求就会触发它,而那批节点是好的,拿着这句话去查节点是白费功夫。
+     *
+     * 现在说法由实际计数决定:有超时就报超时,并把体积带上(体积大到几 MiB 时
+     * 「慢」几乎总是真原因);真的一个节点都切不动,才叫 all_nodes_unavailable。
+     * forceTimeout 给「预算烧穿」用 —— 那本身就是超时,和试了几次无关。
+     */
+    const giveUp = (note, forceTimeout = false) => {
+      this.usage.record(body.model, null, false);
+      // 只在失败路径上序列化:成功路径不该为一句错误文案付几 MiB 的代价
+      const mib = JSON.stringify(body).length / 1048576;
+      this.logger('error',
+        `[chat] ${note}(超时 ${fails.timeout} 次 / 限流 ${fails.rateLimited} 次,体积 ${mib.toFixed(1)} MiB)`);
+      if (forceTimeout || fails.timeout) {
+        const hint = mib >= 1
+          ? ` (request is ${mib.toFixed(1)} MiB — large-context prefill is slow, not a node fault)` : '';
+        return dialect.fail(res, 504, `Upstream timed out after ${fails.timeout} attempt(s)${hint}`, 'timeout');
+      }
+      if (fails.rateLimited) {
+        return dialect.fail(res, 429, 'All nodes rate-limited', 'all_nodes_429', { cooldown: this.cooldown.summary() });
+      }
+      return dialect.fail(res, 503, 'No usable upstream node', 'all_nodes_unavailable');
+    };
 
     // 次数和时间两个上限,谁先到都停。次数防「48 个节点挨个试」,
     // 时间防「每次都慢但都没超时」—— 只有次数上限的话后者能拖到几十分钟。
     while (switches <= MAX_NODE_TRIES) {
       if (left() < MIN_TRY_MS) {
         // 一个字节都还没发出去,所以只记客户端那一笔,不记节点尝试
-        this.usage.record(body.model, null, false);
-        this.logger('error', `[chat] 超出 ${REQUEST_DEADLINE_MS / 1000}s 预算,放弃(换过 ${switches} 个节点)`);
-        return dialect.fail(res, 504, `Upstream did not respond within ${REQUEST_DEADLINE_MS / 1000}s`, 'timeout');
+        return giveUp(`预算烧穿,放弃(换过 ${switches} 个节点)`, true);
       }
       const t0 = Date.now();
       try {
@@ -802,6 +850,7 @@ export class Gateway {
         if (status === 429) {
           this.cooldown.mark429(cur);
           this.usage.recordAttempt(cur, 'rateLimited', null, null, call);
+          fails.rateLimited++;
           this.logger('warn', `[429] node="${cur}" 限流,冷却 ${COOLDOWN_MS / 1000}s`);
           tried.add(cur);
           netRetry = 0;
@@ -823,8 +872,7 @@ export class Gateway {
             tried.add(next);
             const fallback = this.cooldown.pickAvailable(nodes, tried);
             if (!fallback) {
-              this.usage.record(body.model, null, false);
-              return dialect.fail(res, 503, 'No switchable upstream node', 'all_nodes_unavailable');
+              return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
             switches++;
             if (await this.switchNode(fallback)) cur = fallback;
@@ -839,6 +887,7 @@ export class Gateway {
         if (status === 0) {
           // 超时/连接失败:每次都是真发出去过的一次尝试,所以重试前先记一笔
           this.usage.recordAttempt(cur, 'timeout', null, null, call);
+          fails.timeout++;
           if (++netRetry <= MAX_NET_RETRY) {
             this.logger('warn', `[net-retry ${netRetry}/${MAX_NET_RETRY}] node="${cur}": ${e.body || e.message}`);
             await sleep(1000);
@@ -849,8 +898,7 @@ export class Gateway {
           this.logger('warn', `[timeout] node="${cur}" 重试 ${MAX_NET_RETRY} 次仍失败,换下一个`);
           const next = this.cooldown.pickAvailable(nodes, tried);
           if (!next) {
-            this.usage.record(body.model, null, false);
-            return dialect.fail(res, 504, 'All nodes timeout', 'timeout');
+            return giveUp('所有节点都超时,没有可换的了', true);
           }
           switches++;
           if (await this.switchNode(next)) cur = next;
@@ -858,8 +906,7 @@ export class Gateway {
             tried.add(next);
             const fallback = this.cooldown.pickAvailable(nodes, tried);
             if (!fallback) {
-              this.usage.record(body.model, null, false);
-              return dialect.fail(res, 503, 'No switchable upstream node', 'all_nodes_unavailable');
+              return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
             switches++;
             if (await this.switchNode(fallback)) cur = fallback;
@@ -887,10 +934,7 @@ export class Gateway {
         return dialect.fail(res, status, msg, errTypeFor(status));
       }
     }
-    this.usage.record(body.model, null, false);
-    this.logger('error', `[chat] 换过 ${MAX_NODE_TRIES} 个节点仍未成功`);
-    return dialect.fail(res, 503,
-      `Tried ${MAX_NODE_TRIES} nodes, all unavailable`, 'all_nodes_unavailable');
+    return giveUp(`换过 ${MAX_NODE_TRIES} 个节点仍未成功`);
   }
   // ── 出站 ──────────────────────────────────────────────
 
@@ -925,7 +969,7 @@ export class Gateway {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: false });
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
-      const timeout = Math.max(1_000, Math.min(UPSTREAM_TIMEOUT_MS, budget));
+      const timeout = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       const t0 = Date.now();
       const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity }), (resp) => {
         let data = '';
@@ -961,7 +1005,7 @@ export class Gateway {
   forwardStream(res, body, dialect = OPENAI, budget = Infinity, identity = null) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
-      const ttfb = Math.max(1_000, Math.min(STREAM_TTFB_MS, budget));
+      const ttfb = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
 
       // 头一旦发出去,这个请求就不能重试了 —— 换节点重发等于把两半响应拼给
       // 客户端。所以所有失败路径都得先看这个标志:started 之前 reject 让上层

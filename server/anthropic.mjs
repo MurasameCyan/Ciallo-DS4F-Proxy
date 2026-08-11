@@ -264,7 +264,7 @@ export function openAIToAnthropic(oai, fallbackModel = '') {
 
   const reasoning = str(msg.reasoning_content) || str(msg.reasoning);
   if (reasoning) content.push({
-    type: 'thinking', thinking: reasoning, signature: 'ciallo-ds4f-proxy',
+    type: 'thinking', thinking: reasoning, signature: 'ciallo-zen-proxy',
   });
   if (typeof msg.content === 'string' && msg.content) content.push({ type: 'text', text: msg.content });
   for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
@@ -453,7 +453,7 @@ export class AnthropicStream {
     if (this.thinkIndex < 0) return;
     this.emit('content_block_delta', {
       type: 'content_block_delta', index: this.thinkIndex,
-      delta: { type: 'signature_delta', signature: 'ciallo-ds4f-proxy' },
+      delta: { type: 'signature_delta', signature: 'ciallo-zen-proxy' },
     });
     this.blockStop(this.thinkIndex);
     this.thinkIndex = -1;

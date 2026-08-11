@@ -23,7 +23,7 @@ const COOLDOWN_MS = 90_000;
 // 和 gateway.mjs 的同名常量对齐。这里不 import 它:预览刻意不依赖真网关代码,
 // 否则改坏了 gateway 连预览都起不来,而预览正是用来对界面的
 const CALL_LOG_LIMIT = 200;
-const REPO_URL = 'https://github.com/MurasameCyan/Ciallo-DS4F-Proxy';
+const REPO_URL = 'https://github.com/MurasameCyan/Ciallo-Zen-Proxy';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -439,7 +439,7 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`\n  Ciallo DS4F Proxy · UI 预览\n  http://localhost:${PORT}\n\n  演示数据,每 3 秒模拟一次请求。Ctrl+C 退出。\n`);
+  console.log(`\n  Ciallo Zen Proxy · UI 预览\n  http://localhost:${PORT}\n\n  演示数据,每 3 秒模拟一次请求。Ctrl+C 退出。\n`);
   log('ok', '[gateway] 监听 127.0.0.1:' + state.cfg.port);
   log('ok', `[mihomo] 已启动,${NODES.length} 个节点`);
   log('info', `[gateway] 免费模型 8 个,客户端选哪个转发哪个`);

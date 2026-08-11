@@ -30,7 +30,7 @@ delete process.env.API_KEY;
 
 const {
   NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
-  identityHeaders, OPENAI, ANTHROPIC, CALL_LOG_LIMIT,
+  identityHeaders, OPENAI, ANTHROPIC, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -597,6 +597,45 @@ await t('换节点失败时继续找下一个,不能回头再打刚限流的节�
   assert.deepEqual(switched, ['B', 'C']);
   assert.deepEqual(g.tries, ['A', 'C']);
   assert.equal(g.usage.getStats().byNode.C.success, 1);
+});
+
+await t('全员超时报的是超时,不能报「节点全挂」', async () => {
+  // 回归:大上下文 prefill 慢会把每次尝试都拖成超时,而原来的出口不看原因,
+  // 一律回 503 all_nodes_unavailable —— 照那句话去查节点是白费功夫。
+  const g = retryGateway('sm8.json', () => {
+    throw Object.assign(new Error('socket hang up'), { status: 0 });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 504);
+  assert.match(res.body, /timed out/);
+  assert.ok(!res.body.includes('all_nodes_unavailable'), '超时不是「节点不可用」');
+  assert.equal(g.usage.getStats().byNode.A.timeout, 3, '首发 + 2 次重试');
+});
+
+await t('预算已经没了就直接回超时,一个节点都不试', async () => {
+  const g = retryGateway('sm9.json', () => { throw new Error('不该出站'); });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 1_000);
+
+  assert.equal(res.code, 504);
+  assert.deepEqual(g.tries, [], '剩不到一次尝试的时间了,发出去只是白等');
+  assert.equal(g.usage.getStats().total.fail, 1);
+  assert.equal(g.usage.getStats().byNode.A, undefined, '没发出去就不算节点的一次尝试');
+});
+
+await t('时间预算按请求体积放大,大到 1Mi 也装得下', () => {
+  assert.ok(budgetFor(2_000) - REQUEST_DEADLINE_MS < 1_000, '几 KB 的小请求最多加出不到一秒,行为和以前一样');
+  assert.ok(budgetFor(4.3 * 1048576) > 350_000, '1M 上下文实测最坏 129s prefill,预算得装得下');
+  assert.ok(silentFor(4.3 * 1048576) > 220_000);
+  assert.equal(budgetFor(999 * 1048576), 420_000, '再大也得有个顶,不能挂到天荒地老');
+  assert.equal(silentFor(999 * 1048576), 240_000);
+  // 连续放大,不分档 —— 分档会让刚卡在档位下面的请求白等
+  assert.ok(budgetFor(0.9 * 1048576) > budgetFor(0.8 * 1048576));
+  assert.ok(silentFor(0.9 * 1048576) > silentFor(0.8 * 1048576));
 });
 
 // ── 节点延迟与排序 ──────────────────────────────────────

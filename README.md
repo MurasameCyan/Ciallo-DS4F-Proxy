@@ -1,4 +1,4 @@
-# Ciallo DS4F Proxy
+# Ciallo Zen Proxy
 
 来都来了 不点个⭐再走吗~?
 
@@ -12,7 +12,7 @@
    Anthropic                       429 就换一个
 ```
 
-> **代码在 [`beta`](https://github.com/MurasameCyan/Ciallo-DS4F-Proxy/tree/beta) 分支。**
+> **代码在 [`beta`](https://github.com/MurasameCyan/Ciallo-Zen-Proxy/tree/beta) 分支。**
 > `main` 只放这份说明。镜像由 `beta` 的推送构建,标签仍然是 `:latest`,所以 compose 不用改。
 
 ---
@@ -22,8 +22,8 @@
 不需要自己 build,镜像 GitHub Actions 已经推到 GHCR(amd64 + arm64)。
 
 ```bash
-curl -O https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/beta/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/MurasameCyan/Ciallo-DS4F-Proxy/beta/.env.example
+curl -O https://raw.githubusercontent.com/MurasameCyan/Ciallo-Zen-Proxy/beta/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/MurasameCyan/Ciallo-Zen-Proxy/beta/.env.example
 
 # 编辑 .env,至少把 PANEL_PASS 填上
 docker compose up -d
@@ -46,7 +46,7 @@ docker compose up -d
 | `NODE_TEST_URL` | | 延迟探针地址,默认 `https://opencode.ai/`(HEAD 站点根路径,不碰 `/zen/v1`,不花额度)。这条请求是走节点发出去的,你本机连不上不影响 |
 | `NODE_TEST_TIMEOUT_MS` | | 单次探测超时,默认 `5000`,取值夹在 1000–8000 之间。超时算不可用 |
 | `SHOW_THINKING` | | 设成 `0` 关掉推理内容转发(见下文「推理内容」) |
-| `GITHUB_REPO` | | 「检查更新」跟哪个仓库比,默认 `MurasameCyan/Ciallo-DS4F-Proxy`。改成自己的 fork 就查自己的 |
+| `GITHUB_REPO` | | 「检查更新」跟哪个仓库比,默认 `MurasameCyan/Ciallo-Zen-Proxy`。改成自己的 fork 就查自己的 |
 | `GITHUB_TRACK_REF` | | 跟哪个分支比,默认 `beta`(`latest` 镜像就是从它出的) |
 
 compose 默认只绑 `127.0.0.1:9527`。想让同网段其它机器连,把端口改成 `"9527:9527"` —— 那等于把面板一起暴露到局域网,`PANEL_PASS` 必须是强密码。
@@ -60,6 +60,27 @@ compose 默认只绑 `127.0.0.1:9527`。想让同网段其它机器连,把端口
 **模型名必须填对。** 网关只接受当前 `/v1/models` 列出的免费模型,并把你选择的模型原样发给上游；缺少 `model`、模型名为空、填了未知或非免费模型都会在出站前返回 400,不会消耗任何节点尝试。
 
 这份清单是**现拉的**:网关经节点去 `GET https://opencode.ai/zen/v1/models`,从 60 多个模型里挑出免费的(`-free` 后缀,外加 `big-pickle` 这个没后缀的例外),缓存 30 分钟。不写死是因为写死过一次就漏了 —— 上游后来上线 `longcat-2.0-free`,而代码里那份列表没人记得改。拉不到就继续用上一份(冷启动时是代码里的兜底常量),清单不会变空。面板模型列表与 `/v1/models` 使用同一份缓存。
+
+### 上下文上限
+
+面板「可用模型」里名字后面的 `[1M]` 就是这一列。上游的 `/zen/v1/models` 一个字节的元数据都不给,所以这些是**实测值** —— 发一个必然超限的请求,让上游自己的参数校验器把上限报在错误原文里。2026-08-11 十个模型全量测过一遍。
+
+| 模型 | 上下文 | 实测上限(token) |
+| --- | --- | --- |
+| `big-pickle` | **1M** | 1,048,576 |
+| `deepseek-v4-flash-free` | **1M** | 1,048,576 |
+| `mimo-v2.5-free` | **1M** | 1,048,576 |
+| `longcat-2.0-free` | **1M** | 1,048,580 |
+| `nemotron-3-ultra-free` | **1M** | 1,000,000 |
+| `nemotron-3.5-lightning-free` | **1M** | 1,000,000 |
+| `ling-3.0-flash-free` | **262K** | 262,144 |
+| `ling-3.0-tiny-free` | **262K** | 262,144 |
+| `laguna-s-2.1-free` | **262K** | 262,144 |
+| `north-mini-code-free` | **256K** | 256,000 |
+
+`1M` 那一档里既有 2²⁰(1,048,576)也有整一百万,都按 `1M` 标 —— 后缀是给人看规模的,差 4.8% 不值得写成 `1.05M` 和 `1M` 两种。要精确值就看右边那列。
+
+这个数是 messages 加 completion 的合计,不是单给输入的。第三方模型库对这些值至少错了四个(models.dev 给 `deepseek-v4-flash-free` 写的是 200000,真值 1048576),所以别照抄。表在 `web/core.js` 的 `MODEL_CTX` 里手写着,新模型上线不会自动长出来 —— 查不到就只显示模型名,不影响清单本身。上游改窗口大小也得手动重测。
 
 ### OpenAI 协议
 
@@ -134,7 +155,11 @@ openai-compatibility:
 
 **上游认得的档位每个模型不一样,所以按模型折。** 上游对认不出的档位是**直接丢字段**而不是降级,于是「发了个它不认的档位」和「什么都没发」结果一样 —— 这正是 `xhigh` 一度静默失效的原因(那是 Claude Code 的默认档)。网关的做法是把 `xhigh` 和 `max` 都视为「要最高档」,再按模型落地:`deepseek-v4-flash-free` 折成 `max`,其余模型折成 `high`。客户端明确关掉思考时不发这个字段 —— DS4F 关不掉思考,硬塞个最低档也会被上游丢掉,不如让它走默认,至少行为可预期。面板的调用日志里逐条记着实际发出去的档位,`—` 表示没发这个字段(随上游默认),和显式发了 `high` 是两回事。
 
-**超时预算。** 一个请求从进来到回复上限 75 秒,剩不到 8 秒就不再开新尝试,直接回 504。不这么管的话,轮换会把单个请求拖到客户端自己超时,报出来的错和真实原因完全对不上。**流式没有总时长上限** —— 只要上游还在吐(哪怕吐的全是推理),就一直转发;彻底没动静 120 秒才判定断流。
+**超时预算按请求体积放大。** 小请求的基线还是 75 秒(从进来到回复),剩不到 8 秒就不再开新尝试,直接回 504;每多 1 MiB 请求体就多给 75 秒,顶到 420 秒。单次出站的静默上限同理,45 秒起、每 MiB 加 45 秒、顶到 240 秒。不这么管的话,轮换会把单个请求拖到客户端自己超时,报出来的错和真实原因完全对不上。**流式没有总时长上限** —— 只要上游还在吐(哪怕吐的全是推理),就一直转发;彻底没动静 120 秒才判定断流。
+
+放大是为了装下 1M 级上下文。实测直连上游,1M 上下文的 prefill 要 28–129 秒(同一尺寸重跑能差三倍),网关这侧还得先把 4–5 MiB 的请求体经节点传上去 —— 原来固定 75 秒的预算连 256K 都过不去。按体积连续放大而不是分档,免得 0.9 MiB 这种刚好卡在档位下面一点的请求白等。体积只是 prefill 时间的代理指标(没真去数 token),够 1Mi 用。流式其实不吃这个亏:实测 1M 请求的首字节也只要 7.5 秒(上游不等 prefill 走完才开口),真正被固定预算掐死的是非流式。
+
+**超时不再报成「节点全挂」。** 三处终态失败合到一个出口,说法由实际计数决定:有过超时就回 504 并说明试了几次,请求体到 1 MiB 以上时额外点明「大上下文 prefill 慢,不是节点故障」;全被限流回 429;真的一个节点都切不动才回 503 `all_nodes_unavailable`。原来那句 `Tried 6 nodes, all unavailable` 根本不看原因 —— 256K 的请求就能触发它,而那批节点是好的,照着这句话去查节点是白费功夫。
 
 **流开始后不重试。** 头一旦发出去,响应就定型了;这时候再换节点重发等于把两半响应拼给客户端。所以 `writeHead` 之后的任何失败都只做收尾 —— Anthropic 那边会补一个合法的 `error` + `message_stop`,客户端不会挂到超时。
 
@@ -226,8 +251,8 @@ API Key 屏幕上永远是掩码,只有「重置」和「复制」两个动作 �
 零 npm 依赖,Node ≥ 20。代码全在 `beta` 分支:
 
 ```bash
-git clone -b beta https://github.com/MurasameCyan/Ciallo-DS4F-Proxy.git
-cd Ciallo-DS4F-Proxy
+git clone -b beta https://github.com/MurasameCyan/Ciallo-Zen-Proxy.git
+cd Ciallo-Zen-Proxy
 
 npm test              # check(前端纯函数)+ anthropic(转换层)+ server(路由鉴权)+ e2e(整条链路)
 npm run preview       # 不起内核,只看 UI
@@ -260,7 +285,7 @@ server/
 
 ## 镜像
 
-`ghcr.io/murasamecyan/ciallo-ds4f-proxy:latest`,多架构(`linux/amd64` + `linux/arm64`)。
+`ghcr.io/murasamecyan/ciallo-zen-proxy:latest`,多架构(`linux/amd64` + `linux/arm64`)。
 
 | 标签 | 来源 |
 | --- | --- |
@@ -272,7 +297,7 @@ server/
 **自己构建**记得带 `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`,不然面板上的构建 hash 是 `unknown`(CI 里传的是 `github.sha`)。
 
 **`docker compose pull` 报 `unauthorized`?** 不是构建失败。GHCR 新建的包默认私有,而且**不跟随仓库可见性** —— 仓库公开了包照样是私有的。仓库 owner 打开
-`https://github.com/users/MurasameCyan/packages/container/ciallo-ds4f-proxy/settings`
+`https://github.com/users/MurasameCyan/packages/container/ciallo-zen-proxy/settings`
 → Danger Zone → Change visibility → Public,点一次,之后每次推送都继承。这个没有 API,只能手点。
 
 **想手动重建?** 往 `beta` 推一个空提交(`git commit --allow-empty -m rebuild && git push`)。Actions 页面上没有「Run workflow」按钮 —— `workflow_dispatch` 要求 workflow 文件在**默认分支**上,而默认分支是只有 README 的 `main`。`push` 触发不受影响,它用的是被推分支上的那份文件。

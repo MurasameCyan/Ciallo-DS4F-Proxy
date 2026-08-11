@@ -10,6 +10,7 @@ import {
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown, COOLDOWN_MS,
   fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
+  modelLabel,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -262,6 +263,9 @@ function renderConn() {
  * 可用模型。服务端从上游 /zen/v1/models 现拉(缓存 30 分钟),这里只负责贴。
  * 写死在前端的那份漏过一个新上线的免费模型,所以不再留本地常量做兜底 ——
  * 兜底在服务端,前端拿到什么就显示什么。
+ *
+ * 名字后面的 `[1M]` 是上下文上限,来自 core.js 里那张实测表;上游不给这个元数据,
+ * 表里查不到就只显示模型名(新模型上线时就是这样)。
  */
 function renderModels() {
   const list = Array.isArray(S.status.models) ? S.status.models : [];
@@ -269,7 +273,7 @@ function renderModels() {
   // 列表几周才变一次,但重建 8 个 <li> 的代价比比对差异还小
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
-    li.textContent = m;
+    li.textContent = modelLabel(m);
     return li;
   }));
 }

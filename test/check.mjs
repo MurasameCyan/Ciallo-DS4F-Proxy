@@ -13,6 +13,7 @@ import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown,
   fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, callLog, configPayload, updateHours,
+  modelLabel, MODEL_CTX,
 } from '../web/core.js';
 
 let n = 0;
@@ -225,6 +226,24 @@ t('anthropicBase 是裸地址,不带 /v1(客户端自己拼 /v1/messages)', () =
   assert.equal(anthropicBase(null), 'http://localhost:9527');
   // 两个协议同源,只差末尾那段 /v1
   assert.equal(endpointBase('https://a.b'), `${anthropicBase('https://a.b')}/v1`);
+});
+
+t('modelLabel 给模型名带上下文后缀,表里没有的原样返回', () => {
+  assert.equal(modelLabel('deepseek-v4-flash-free'), 'deepseek-v4-flash-free[1M]');
+  assert.equal(modelLabel('ling-3.0-flash-free'), 'ling-3.0-flash-free[262K]');
+  assert.equal(modelLabel('north-mini-code-free'), 'north-mini-code-free[256K]');
+  // 新模型上线时表里查不到,只显示名字 —— 不能显示 "[undefined]" 也不能漏掉模型
+  assert.equal(modelLabel('brand-new-free'), 'brand-new-free');
+  assert.equal(modelLabel(null), '');
+  // 1M 那一档三种真值都得压成 "1M":2²⁰、2²⁰+4、整一百万。后缀是给人看规模的,
+  // 差 4.8% 不值得写成 "1.05M" 和 "1M" 两种(maximumFractionDigits:0 负责这件事)
+  assert.equal(modelLabel('longcat-2.0-free'), 'longcat-2.0-free[1M]');
+  assert.equal(modelLabel('nemotron-3-ultra-free'), 'nemotron-3-ultra-free[1M]');
+  // 后缀只有 K 和 M 两种单位,不能冒出 "1048576" 或 "1.0M" 这类写法
+  for (const id of Object.keys(MODEL_CTX)) {
+    assert.match(modelLabel(id), /\[\d+[KM]\]$/, `${id} 的后缀得是纯数字加 K/M`);
+  }
+  assert.ok(Object.values(MODEL_CTX).every((v) => Number.isInteger(v) && v > 0), '上下文得是正整数');
 });
 
 t('rankBreakdown 按成功次数降序并截断', () => {

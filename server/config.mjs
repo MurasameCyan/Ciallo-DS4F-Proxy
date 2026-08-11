@@ -101,7 +101,7 @@ export function buildMihomoYaml(subscriptionUrl) {
   if (!subscriptionUrl) throw new Error('订阅地址为空');
   const url = JSON.stringify(String(subscriptionUrl));
 
-  return `# 由 Ciallo DS4F Proxy 自动生成,手改会在下次保存配置时被覆盖。
+  return `# 由 Ciallo Zen Proxy 自动生成,手改会在下次保存配置时被覆盖。
 mixed-port: ${MIXED_PORT}
 allow-lan: false
 mode: rule
