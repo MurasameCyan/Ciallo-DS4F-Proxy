@@ -231,19 +231,19 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 /* ── 概览数字 ─────────────────────────────────────────── */
 
 /* 一张卡内 2×2 四格:左上 Token、右上 模型统计、左下 请求总数、右下 运行时长。
-   四个数原来是四张独立卡片,合成一张之后页面顶部少了三道边框和三处 16px 内边距,
-   同一组数读起来是一块而不是四块。
+   四个格子各自独立成小卡片,与接入/配置卡片的小卡片样式一致。
    行高不写死也不 stretch 到等高 —— 让 grid 默认的 stretch 生效,同一行两格
    底边齐平,模型统计那格因此能撑满右上角。 */
 .stats {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+.stats .stat {
   padding: 11px 12px 12px;
   border-radius: var(--r-sm);
   background: var(--card-2);
 }
-/* 卡头已移到 .stats 外层,不再需要特殊处理 */
 
 /* 接入卡片的小卡片容器 */
 .conn-box {
