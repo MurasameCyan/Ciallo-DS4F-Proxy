@@ -486,6 +486,8 @@ details[open] > .nstat-summary { margin-bottom: 13px; }
    padding),否则这一行会比别的 .lbl 高出 7px,输入框跟着往下掉。 */
 .lbl.row { display: flex; align-items: center; gap: 10px; }
 .lbl.row .pill { margin-left: auto; padding: 2px 9px 2px 7px; font-size: 11px; }
+/* Key 掩码贴在标签右端:它不是输入项,只用来认「是哪把 key」 */
+.lbl.row .hint { margin-left: auto; font-family: var(--mono); font-size: 11px; font-style: normal; }
 
 input[type=text], input[type=url], input[type=number], input[type=password] {
   width: 100%; padding: 9px 11px;
@@ -502,8 +504,11 @@ input[readonly] { color: var(--fg-2); }
 
 .copyrow { display: flex; gap: 7px; }
 .copyrow input { flex: 1; min-width: 0; }
-/* 接入地址那行:两颗协议按钮各占一半,和上面 input 的 flex:1 一个意思 */
-.copyrow.proto .btn { flex: 1; min-width: 0; }
+/* 接入那行:四颗按钮平分一排。窄侧栏(340px)一排放不下四颗 12px 的按钮,
+   所以允许换行 —— 换成两行两颗,而不是把文字挤成省略号。flex-basis 给
+   一个够放「Anthropic 地址」的下限,免得换行后两颗宽度不一样。 */
+.copyrow.btns { flex-wrap: wrap; }
+.copyrow.btns .btn { flex: 1 1 96px; min-width: 0; white-space: nowrap; }
 
 .err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
 

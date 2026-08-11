@@ -42,6 +42,17 @@ const NODES = [
   '🇺🇸 圣何塞 02 · GIA', '🇰🇷 首尔 01', '🇬🇧 伦敦 01',
 ];
 
+/**
+ * 真网关这一份是从上游 /zen/v1/models 现拉的(一天一次)。这里写死 2026-08-11
+ * 实测拉到的 11 个 —— 预览要照出最长的那一列,少列几个就看不出模型区块够不够高。
+ * hy3-free 没有上下文后缀是对的:它免费额度耗尽,量不到上限(见 core.js 的 MODEL_CTX)。
+ */
+const DEMO_MODELS = [
+  'big-pickle', 'deepseek-v4-flash-free', 'hy3-free', 'laguna-s-2.1-free',
+  'ling-3.0-flash-free', 'ling-3.0-tiny-free', 'longcat-2.0-free', 'mimo-v2.5-free',
+  'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'north-mini-code-free',
+];
+
 const state = {
   cfg: {
     subscriptionUrl: 'https://demo.example.com/subscribe?token=preview',
@@ -286,12 +297,7 @@ async function handleApi(req, res, path) {
       gatewayRunning: true, gatewayPort: state.cfg.port,
       mihomoRunning: true, mihomoVersion: 'v1.19.13',
       paused: false, demo: true,
-      // 真网关这一份是从上游 /zen/v1/models 现拉的(缓存 30 分钟)。
-      // 这里写死一份形状一样的,longcat 那个就是「实时」才会出现的
-      models: [
-        'deepseek-v4-flash-free', 'big-pickle', 'mimo-v2.5-free', 'laguna-s-2.1-free',
-        'ling-3.0-flash-free', 'north-mini-code-free', 'nemotron-3-ultra-free', 'longcat-2.0-free',
-      ],
+      models: DEMO_MODELS,
       build: state.build,
       buildUrl: `${REPO_URL}/commit/${state.build}`,
       repoUrl: REPO_URL,
@@ -442,7 +448,9 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`\n  Ciallo Zen Proxy · UI 预览\n  http://localhost:${PORT}\n\n  演示数据,每 3 秒模拟一次请求。Ctrl+C 退出。\n`);
   log('ok', '[gateway] 监听 127.0.0.1:' + state.cfg.port);
   log('ok', `[mihomo] 已启动,${NODES.length} 个节点`);
-  log('info', `[gateway] 免费模型 8 个,客户端选哪个转发哪个`);
+  // 数出来而不是写死:DEMO_MODELS 改了这句会跟着变(写死过一次,清单加到
+  // 11 个之后这里还在说 8 个)
+  log('info', `[gateway] 免费模型 ${DEMO_MODELS.length} 个,客户端选哪个转发哪个`);
 });
 
 setInterval(simulate, 3000);

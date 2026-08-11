@@ -122,12 +122,17 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
 // 前面几组只证明纯函数算得对,这组证明算出来的档位确实进了发给上游的 body。
 // 现在的 Claude Code 把强度放在 output_config.effort,不是 thinking.budget_tokens。
 {
+  // 这几组断言的是「顶档折成 max」,所以模型必须写死成唯一支持 max 的那个
+  // (见 anthropic.mjs 的 MAX_CAPABLE),不能跟着 FREE_MODELS[0] 走 ——
+  // 那份常量按字母排序过一次,第一个就从 ds4f 变成了 big-pickle,
+  // 而 big-pickle 的顶档是 high,三组断言集体报假故障。
+  const MAX_MODEL = 'deepseek-v4-flash-free';
   const ask = async (extra) => {
     sent = null;
     await fetch(`${base}/v1/messages`, {
       method: 'POST',
       headers: { 'x-api-key': 'k', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }], ...extra }),
+      body: JSON.stringify({ model: MAX_MODEL, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }], ...extra }),
     });
     return sent;
   };

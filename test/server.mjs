@@ -790,6 +790,49 @@ await t('拉失败或拉到空时继续用上一份,面板那一列不会变空'
   }
 });
 
+await t('拉清单先直连,直连不通才回落到代理', async () => {
+  const seen = [];
+  const g = new Gateway(load(), () => {});
+  // 第三个参数是 agent:传 null 才是直连,默认那次带的是 MihomoAgent
+  g.upstreamGet = async (path, timeout, agent = 'PROXY') => {
+    seen.push(agent);
+    if (agent === null) throw new Error('ECONNREFUSED');   // 直连被墙
+    return { data: [{ id: 'a-free' }] };
+  };
+  assert.deepEqual(await g.refreshModels(), ['a-free']);
+  assert.deepEqual(seen, [null, 'PROXY'], '顺序不能反 —— 直连省一次经节点的出站,且内核没起来时它是唯一的路');
+
+  // 直连能通就不该再走代理:免费额度按出口 IP 算,白占一次节点出站没意义
+  const only = [];
+  const g2 = new Gateway(load(), () => {});
+  g2.upstreamGet = async (path, timeout, agent = 'PROXY') => {
+    only.push(agent);
+    return { data: [{ id: 'b-free' }] };
+  };
+  assert.deepEqual(await g2.refreshModels(), ['b-free']);
+  assert.deepEqual(only, [null], '直连成功就到此为止');
+});
+
+await t('直连和代理都不通时继续用上一份', async () => {
+  const g = new Gateway(load(), () => {});
+  let calls = 0;
+  g.upstreamGet = async () => { calls++; throw new Error('down'); };
+  await g.refreshModels();
+  assert.equal(calls, 2, '两条路都试过了');
+  assert.deepEqual(g.freeModels(), FREE_MODELS);
+});
+
+await t('兜底清单和实测上下文表对得上,不能只补一处', async () => {
+  // 两份表都是手写的,漏一处的后果不一样:兜底少了模型 = 拉不到时面板少列;
+  // 上下文表少了 = 少个括号。所以只要求前者覆盖后者,反向允许缺(hy3-free
+  // 额度耗尽量不到上下文,见 core.js 的注释)
+  const { MODEL_CTX } = await import('../web/core.js');
+  for (const id of Object.keys(MODEL_CTX)) {
+    assert.ok(FREE_MODELS.includes(id), `${id} 有上下文数据却不在兜底清单里`);
+  }
+  assert.equal(new Set(FREE_MODELS).size, FREE_MODELS.length, '兜底清单不能有重复');
+});
+
 await t('TTL 内不重复出站,并发调用共用一次', async () => {
   let calls = 0;
   const g = new Gateway(load(), () => {});

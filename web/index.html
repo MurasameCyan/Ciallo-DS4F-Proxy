@@ -110,26 +110,19 @@
     <div class="card-head"><h2 id="h-conn">接入</h2></div>
 
     <div class="field">
-      <span class="lbl">接入地址</span>
-      <!-- 一行两颗:各复制自己协议的 base URL。不再落只读框 —— 两条地址一个框摆不下,
-           且地址现算(取当前访问地址),点按钮时才拿。OpenAI 带 /v1,
-           Anthropic 裸地址(客户端自己拼 /v1/messages)。 -->
-      <span class="copyrow proto">
-        <button type="button" class="btn tiny" data-copy-proto="openai">复制 OpenAI 协议</button>
-        <button type="button" class="btn tiny" data-copy-proto="anthropic">复制 Anthropic 协议</button>
+      <span class="lbl row">接入地址与 Key<em class="hint" id="key-mask"></em></span>
+      <!-- 四颗一排。两条地址都不落框 —— 一个框摆不下,且地址现算(取当前访问
+           地址),点按钮时才拿。OpenAI 带 /v1,Anthropic 裸地址(客户端自己拼
+           /v1/messages)。Key 同理不落框:面板本身就明文返回它,屏幕上留一串
+           完整 key 没用,掩码挪到标签右端只为「认得出是哪把」,要用就点复制
+           (复制的是真值)。省下来的两行给模型列表。 -->
+      <span class="copyrow btns">
+        <button type="button" class="btn tiny" data-copy-proto="openai">OpenAI 地址</button>
+        <button type="button" class="btn tiny" data-copy-proto="anthropic">Anthropic 地址</button>
+        <button type="button" class="btn tiny" data-copy="key" data-copy-real="key">复制 Key</button>
+        <button type="button" class="btn tiny" id="btn-regen">重置 Key</button>
       </span>
     </div>
-
-    <label class="field">
-      <span class="lbl">API Key</span>
-      <!-- 不给「显示」:面板本身就在明文返回它,但屏幕上留着一串完整 key
-           没什么用 —— 要用就「复制」(复制的是真值,不是这里的掩码)。 -->
-      <span class="copyrow">
-        <input type="text" id="f-key" readonly>
-        <button type="button" class="btn tiny" id="btn-regen">重置</button>
-        <button type="button" class="btn tiny" data-copy="f-key" data-copy-real="key">复制</button>
-      </span>
-    </label>
 
     <div class="field">
       <span class="lbl">可用模型</span>

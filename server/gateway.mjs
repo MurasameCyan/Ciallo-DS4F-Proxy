@@ -94,20 +94,35 @@ const HEALTH_TIMEOUT_MS = Math.min(Math.max(Number(process.env.NODE_TEST_TIMEOUT
  * 也不能因为一次网络抖动变空。
  *
  * 写死过一次的代价:上游后来加了 longcat-2.0-free,而这份列表没人记得改,
- * 面板于是少列一个能用的模型。所以现在它只是 fallback。
+ * 面板于是少列一个能用的模型。所以现在它只是 fallback。这份是 2026-08-11
+ * 拉到的 11 个 —— 上一版只有 7 个,拉取失败时面板就少列 4 个能用的模型,
+ * 同一个坑的第二次。
+ *
+ * 注意「在清单里」不等于「此刻能出结果」:同日实测 11 个里 4 个是坏的
+ * (hy3-free 402 免费额度耗尽、ling-3.0-flash/tiny-free 503 Endpoint is
+ * unavailable、north-mini-code-free 401),换出口 IP 重试同样失败,是上游
+ * 供应商侧的问题。这里照列不筛 —— 逐个探活要 11 次出站、慢的模型单次就
+ * 10 秒,而且坏的会自己好;真发请求时上游的错误会原样回给客户端。
  */
 export const FREE_MODELS = [
-  'deepseek-v4-flash-free',
   'big-pickle',
-  'mimo-v2.5-free',
+  'deepseek-v4-flash-free',
+  'hy3-free',
   'laguna-s-2.1-free',
   'ling-3.0-flash-free',
-  'north-mini-code-free',
+  'ling-3.0-tiny-free',
+  'longcat-2.0-free',
+  'mimo-v2.5-free',
   'nemotron-3-ultra-free',
+  'nemotron-3.5-lightning-free',
+  'north-mini-code-free',
 ];
 
-/** 免费清单的 TTL。上游几周才动一次,拉太勤没意义(还多一次经节点的出站) */
-const MODELS_TTL_MS = 30 * 60 * 1000;
+/**
+ * 免费清单的 TTL。上游几周才动一次,拉太勤没意义(还多一次出站),
+ * 所以一天一次;真正保证「不旧」的是开机那一次(见 index.mjs 的 main)。
+ */
+const MODELS_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 从上游那份「全部模型」里挑出免费的。
@@ -566,10 +581,21 @@ export class Gateway {
     return this.models;
   }
 
-  /** 去上游拉一次免费清单。并发调用共用同一个 Promise */
+  /**
+   * 去上游拉一次免费清单。并发调用共用同一个 Promise。
+   *
+   * 先直连,不通再走代理。这个端点是个公开目录,不鉴权也不按 IP 算额度
+   * (那是 completions 的事),所以直连没有坏处,还省一次经节点的出站 ——
+   * 而且内核没起来时(没配订阅、或 mihomo 挂了)直连是唯一能拉到的路。
+   * 两条都不通就继续用上一份,冷启动时那就是 FREE_MODELS。
+   */
   refreshModels() {
     if (this.modelsFetch) return this.modelsFetch;
-    this.modelsFetch = this.upstreamGet(MODELS_PATH)
+    this.modelsFetch = this.upstreamGet(MODELS_PATH, 8_000, null)
+      .catch((e) => {
+        this.logger('info', `[models] 直连拉清单失败(${e.message}),改走代理`);
+        return this.upstreamGet(MODELS_PATH);
+      })
       .then((d) => {
         const free = pickFreeModels((d?.data || []).map((m) => m?.id));
         // 空结果不接受:上游改了形状或返回了个错误页时,旧清单比空列表有用
@@ -591,15 +617,18 @@ export class Gateway {
   }
 
   /**
-   * GET 上游的公开端点(经 mihomo 出站)。目前只有模型清单用它,所以不做成
-   * 通用客户端 —— 和 forward 一样不带 Authorization,那个端点不要鉴权。
+   * GET 上游的公开端点。目前只有模型清单用它,所以不做成通用客户端 ——
+   * 和 forward 一样不带 Authorization,那个端点不要鉴权。
+   *
+   * agent 传 null 就是直连(绕开 mihomo),默认经节点走。
    */
-  upstreamGet(path, timeout = 8_000) {
+  upstreamGet(path, timeout = 8_000, agent = this.agent) {
     return new Promise((resolve, reject) => {
       const r = https.request({
         host: OPENCODE_HOST, port: 443, path, method: 'GET',
         headers: { Accept: 'application/json', 'User-Agent': 'node' },
-        agent: this.agent,
+        // 传 null/undefined 时 Node 用 globalAgent,也就是不经隧道的直连
+        agent: agent || undefined,
         timeout,
       }, (resp) => {
         let data = '';

@@ -267,7 +267,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
         mihomoRunning: version !== null,
         mihomoVersion: version,
         paused: gateway.paused,
-        // 免费模型清单。从上游现拉、缓存 30 分钟,拉不到就是兜底常量 ——
+        // 免费模型清单。从上游现拉(开机一次、之后每天一次),拉不到就是兜底常量 ——
         // 写死在前端的那份已经漏过一个新上线的免费模型
         models: gateway.freeModels(),
         // build / buildUrl / repoUrl / trackRef:面板右上角那个 hash 徽标。
@@ -536,7 +536,12 @@ async function main() {
     server.listen(cfg.port, '0.0.0.0', resolve);
   });
   log('ok', `[gateway] 监听 0.0.0.0:${cfg.port}`);
-  log('info', `[gateway] 免费模型 ${gateway.freeModels().length} 个,客户端选哪个转发哪个`);
+  // 开机立刻拉一次清单。不 await:拉取要几秒,这期间面板和 /v1 都该能用
+  // —— 没拉到之前用的是 FREE_MODELS 兜底,退化成旧行为而不是失败。
+  // 之后每天一次(MODELS_TTL_MS),搭面板轮询的车走,不另起定时器。
+  gateway.refreshModels()
+    .then((m) => log('info', `[gateway] 免费模型 ${m.length} 个,客户端选哪个转发哪个`))
+    .catch(() => {});   // refreshModels 自己不 reject,这里只是防御
 
   if (creds.generated) {
     // 打在日志里而不是静默放行。docker logs 看一眼就有,

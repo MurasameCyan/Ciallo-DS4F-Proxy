@@ -254,13 +254,14 @@ function renderCallLog() {
 }
 
 function renderConn() {
-  // 屏幕上永远是掩码;要用就点「复制」,那条路复制的是真值。
-  // 两个协议的 base URL 不落框、点按钮时现算(见下面的 data-copy-proto 绑定)
-  $('f-key').value = maskKey(S.cfg.apiKey || '');
+  // 屏幕上永远是掩码,它只用来「认得出是哪把 key」;要用就点「复制 Key」,
+  // 那条路复制的是真值。两个协议的 base URL 一样不落框,点按钮时现算
+  // (见下面的 data-copy-proto 绑定)。
+  $('key-mask').textContent = maskKey(S.cfg.apiKey || '');
 }
 
 /**
- * 可用模型。服务端从上游 /zen/v1/models 现拉(缓存 30 分钟),这里只负责贴。
+ * 可用模型。服务端从上游 /zen/v1/models 现拉(开机一次、之后每天一次),这里只负责贴。
  * 写死在前端的那份漏过一个新上线的免费模型,所以不再留本地常量做兜底 ——
  * 兜底在服务端,前端拿到什么就显示什么。
  *
@@ -470,7 +471,8 @@ function wire() {
     }
   };
 
-  // 复制:key 那栏永远复制真值,不能把掩码复制出去
+  // 复制:key 复制真值(屏幕上只有掩码,复制掩码出去等于给了个用不了的 key),
+  // 其余按 data-copy 取那个输入框的值
   for (const btn of document.querySelectorAll('[data-copy]')) {
     btn.onclick = () => copyToClipboard(
       btn.dataset.copyReal === 'key' ? (S.cfg.apiKey || '') : $(btn.dataset.copy).value);
