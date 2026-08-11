@@ -233,6 +233,11 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
+/* 卡头放在 grid 外层,独占一行 */
+.stats > .card-head {
+  grid-column: 1 / -1;
+  margin-bottom: 1px;  /* 卡头到第一行格子的间距,比其他卡片(13px)更紧凑 */
+}
 
 /* 四格叠成一列。2×2 在 ~330px 卡内宽下每格内容只剩 136px,Token 那串副行
    («输入…输出…推理…缓存读…缓存写…») 会折成四行,竖着排反而更矮。

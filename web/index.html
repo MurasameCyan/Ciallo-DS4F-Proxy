@@ -58,7 +58,8 @@
   <!-- ── 概览 ───────────────────────────────────────────── -->
   <!-- 一张卡内 2×2 四格。DOM 顺序 == 视觉顺序(两列 grid 逐行填充),
        所以 Tab 和读屏顺序也就是 左上→右上→左下→右下,不用 grid 显式定位。 -->
-  <section class="card stats" aria-label="用量概览">
+  <section class="card stats" aria-labelledby="h-overview">
+    <div class="card-head"><h2 id="h-overview">概况</h2></div>
     <article class="stat">
       <h3>Token 消耗</h3>
       <p class="big" id="s-tok">—</p>
