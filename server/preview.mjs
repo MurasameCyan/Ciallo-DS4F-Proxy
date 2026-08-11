@@ -83,9 +83,18 @@ const state = {
 // 刻意让两种名次分叉:big-pickle 请求数(168)高于 mimo(73),但成功数(51)
 // 反而更低 —— 于是预览里能看出排的是成功次数而不是请求数,写错排序键就露馅。
 // 最后一个 success=0(全失败):它不该出现在列表里,列一行 0 只是占位。
+// 条数按上游真实清单铺满(11 个 free 模型):模型统计那格限高 5 行、内部滚动,
+// 只造三四条的话列表根本不溢出,滚动和键盘可达那条路在预览里就永远试不到。
 state.usage.byModel['deepseek-v4-flash-free'] = { requests: 1043, success: 1002, fail: 41, totalTokens: 3_102_884 };
 state.usage.byModel['big-pickle'] = { requests: 168, success: 51, fail: 117, totalTokens: 561_209 };
 state.usage.byModel['mimo-v2.5-free'] = { requests: 73, success: 71, fail: 2, totalTokens: 163_650 };
+state.usage.byModel['longcat-2.0-free'] = { requests: 64, success: 60, fail: 4, totalTokens: 148_902 };
+state.usage.byModel['nemotron-3-ultra-free'] = { requests: 41, success: 38, fail: 3, totalTokens: 96_411 };
+state.usage.byModel['laguna-s-2.1-free'] = { requests: 33, success: 29, fail: 4, totalTokens: 71_004 };
+state.usage.byModel['nemotron-3.5-lightning-free'] = { requests: 27, success: 24, fail: 3, totalTokens: 52_770 };
+state.usage.byModel['ling-3.0-flash-free'] = { requests: 19, success: 15, fail: 4, totalTokens: 38_120 };
+state.usage.byModel['hy3-free'] = { requests: 14, success: 11, fail: 3, totalTokens: 26_455 };
+state.usage.byModel['ling-3.0-tiny-free'] = { requests: 9, success: 6, fail: 3, totalTokens: 12_880 };
 state.usage.byModel['glm-5-air-free'] = { requests: 12, success: 0, fail: 12, totalTokens: 0 };
 
 // 节点尝试口径。合计(1519)刻意大于上面的请求总数(1284):重试和换节点就是

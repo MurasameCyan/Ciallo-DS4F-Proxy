@@ -114,7 +114,8 @@ function renderModelStats() {
   $('s-models-empty').hidden = rows.length > 0;
 
   // 全量重建。模型是个位数量级,重建比 diff 简单且看不出差别
-  $('s-models').replaceChildren(...rows.map((r) => {
+  const ul = $('s-models');
+  ul.replaceChildren(...rows.map((r) => {
     const li = document.createElement('li');
     const nm = tag('nm', r.key);
     nm.title = r.key;              // 窄档会省略号截断,悬停看全名
@@ -123,6 +124,27 @@ function renderModelStats() {
     li.append(nm, n);
     return li;
   }));
+
+  // 行高量出来写进 --row,让 CSS 的「5 行」有准确基准。不能在 CSS 里用
+  // calc(5*1.45em):行盒 17.4px 而 li 实际 18.4px —— 次数那个 <b> 是等宽字体,
+  // baseline 对齐下它的行盒更高,把整行撑大 1px,五行差 5px 就会露出第六行的边。
+  const first = ul.firstElementChild;
+  if (first) {
+    const h = first.getBoundingClientRect().height;
+    if (h > 0) ul.style.setProperty('--row', `${h}px`);
+  }
+
+  // 这格限高 5 行、滚动条藏了(见 style.css 的 .mstats),所以装不下时得另给
+  // 键盘一条路:有 tabindex 才能聚焦、方向键才滚得动。正好装得下时不加 ——
+  // 不可滚的容器占一个 Tab 停留点是白挡路。
+  const over = ul.scrollHeight > ul.clientHeight + 1;   // +1 吸收亚像素误差
+  if (over) {
+    ul.tabIndex = 0;
+    ul.setAttribute('role', 'group');   // 可聚焦容器要有角色,否则读屏念不出这是什么
+  } else {
+    ul.removeAttribute('tabindex');
+    ul.removeAttribute('role');
+  }
 }
 
 function renderNodes() {

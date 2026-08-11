@@ -291,13 +291,26 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 
 /* 模型统计:模型名 + 成功次数,一行一个,按次数降序(排序在 core.js)。
    不给这格设 .big —— 它是一张小排行,没有哪个数字该被单独放大。
-   不限高:模型是个位数量级(上游放出来的 free 模型就那几个),
-   ponytail: 真到几十个要限高内部滚动,照 .nstats 那套写。 */
-.mstats { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
-.mstats li {
-  display: flex; align-items: baseline; gap: 8px;
+
+   限高 5 行、内部滚动:上游放出来的 free 模型现在 11 个,全列会把这格顶到
+   比同排的 Token 那格高出一截,2×2 的四格就不齐平了。限高按行数算而不是 vh ——
+   要的是「正好 5 行」,那是内容尺度,跟视口多高无关。
+   滚动条两处都关:Firefox 认 scrollbar-width,WebKit/Blink 只认伪元素,
+   少关一处就会在那一侧冒出条来。滚动本身照旧(滚轮/触摸板/方向键都能滑)。 */
+.mstats {
+  display: flex; flex-direction: column; gap: 4px; margin-top: 8px;
   font-size: 12px; line-height: 1.45;
+  /* 高度 = 5 行 + 4 个 gap。--row 由 renderModelStats 量出真实行高后写进来,
+     不能用 calc(5 * 1.45em):行盒是 17.4px,但 li 实际 18.4px —— 次数那个 <b>
+     用等宽字体,在 align-items:baseline 下它的行盒更高,把整行撑大 1px,
+     五行就差 5px、露出第六行的一条边。行高交给 JS 量,CSS 不猜。
+     兜底 18.4px 是实测值:JS 没跑到(或量不到行)时也别塌成 0。 */
+  max-height: calc(5 * var(--row, 18.4px) + 16px); overflow-y: auto;
+  scrollbar-width: none;                 /* Firefox */
+  overscroll-behavior: contain;          /* 滑到底不要接着滚整页 */
 }
+.mstats::-webkit-scrollbar { display: none; }
+.mstats li { display: flex; align-items: baseline; gap: 8px; }
 /* 名字吃掉剩余宽度并省略号截断,次数永远贴右边不被挤走 */
 .mstats .nm {
   flex: 1 1 auto; min-width: 0;
