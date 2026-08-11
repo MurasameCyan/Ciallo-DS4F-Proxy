@@ -110,24 +110,28 @@
   <section class="card" aria-labelledby="h-conn">
     <div class="card-head"><h2 id="h-conn">接入</h2></div>
 
-    <div class="field">
-      <span class="lbl row">接入地址与 Key<em class="hint" id="key-mask"></em></span>
-      <!-- 四颗一排。两条地址都不落框 —— 一个框摆不下,且地址现算(取当前访问
-           地址),点按钮时才拿。OpenAI 带 /v1,Anthropic 裸地址(客户端自己拼
-           /v1/messages)。Key 同理不落框:面板本身就明文返回它,屏幕上留一串
-           完整 key 没用,掩码挪到标签右端只为「认得出是哪把」,要用就点复制
-           (复制的是真值)。省下来的两行给模型列表。 -->
-      <span class="copyrow btns">
-        <button type="button" class="btn tiny" data-copy-proto="openai">OpenAI 地址</button>
-        <button type="button" class="btn tiny" data-copy-proto="anthropic">Anthropic 地址</button>
-        <button type="button" class="btn tiny" data-copy="key" data-copy-real="key">复制 Key</button>
-        <button type="button" class="btn tiny" id="btn-regen">重置 Key</button>
-      </span>
+    <div class="conn-box">
+      <div class="field">
+        <span class="lbl row">接入地址与 Key<em class="hint" id="key-mask"></em></span>
+        <!-- 四颗一排。两条地址都不落框 —— 一个框摆不下,且地址现算(取当前访问
+             地址),点按钮时才拿。OpenAI 带 /v1,Anthropic 裸地址(客户端自己拼
+             /v1/messages)。Key 同理不落框:面板本身就明文返回它,屏幕上留一串
+             完整 key 没用,掩码挪到标签右端只为「认得出是哪把」,要用就点复制
+             (复制的是真值)。省下来的两行给模型列表。 -->
+        <span class="copyrow btns">
+          <button type="button" class="btn tiny" data-copy-proto="openai">OpenAI 地址</button>
+          <button type="button" class="btn tiny" data-copy-proto="anthropic">Anthropic 地址</button>
+          <button type="button" class="btn tiny" data-copy="key" data-copy-real="key">复制 Key</button>
+          <button type="button" class="btn tiny" id="btn-regen">重置 Key</button>
+        </span>
+      </div>
     </div>
 
-    <div class="field">
-      <span class="lbl">可用模型</span>
-      <ul class="models" id="models"></ul>
+    <div class="conn-box">
+      <div class="field">
+        <span class="lbl">可用模型</span>
+        <ul class="models" id="models"></ul>
+      </div>
     </div>
   </section>
 
@@ -135,42 +139,44 @@
   <section class="card" aria-labelledby="h-cfg">
     <div class="card-head"><h2 id="h-cfg">配置</h2></div>
 
-    <form id="cfg-form" novalidate>
-      <!-- 状态灯收成一个,贴在「订阅地址」右端。原来三个(网关/内核/节点)里
-           网关能打开这个面板就说明活着(面板和 /v1 同一个 server),内核版本看一眼就够,
-           真会动的只有节点数 —— 内核挂了的时候借这个灯报出来(见 app.js)。
-           这里不用 <label> 包一圈:灯在 label 里会被读进输入框的名字,
-           变成「订阅地址 节点 8/12 可用」。所以 div + <label for>。 -->
-      <div class="field">
-        <span class="lbl row">
-          <label for="f-sub">订阅地址</label>
-          <span class="pill" id="pill-node" role="status" aria-live="polite">
-            <i class="dot" aria-hidden="true"></i><span data-t>节点</span>
+    <div class="cfg-box">
+      <form id="cfg-form" novalidate>
+        <!-- 状态灯收成一个,贴在「订阅地址」右端。原来三个(网关/内核/节点)里
+             网关能打开这个面板就说明活着(面板和 /v1 同一个 server),内核版本看一眼就够,
+             真会动的只有节点数 —— 内核挂了的时候借这个灯报出来(见 app.js)。
+             这里不用 <label> 包一圈:灯在 label 里会被读进输入框的名字,
+             变成「订阅地址 节点 8/12 可用」。所以 div + <label for>。 -->
+        <div class="field">
+          <span class="lbl row">
+            <label for="f-sub">订阅地址</label>
+            <span class="pill" id="pill-node" role="status" aria-live="polite">
+              <i class="dot" aria-hidden="true"></i><span data-t>节点</span>
+            </span>
           </span>
-        </span>
-        <input type="url" id="f-sub" placeholder="https://…/subscribe?token=…" autocomplete="off" spellcheck="false">
-      </div>
+          <input type="url" id="f-sub" placeholder="https://…/subscribe?token=…" autocomplete="off" spellcheck="false">
+        </div>
 
-      <label class="field" for="f-sub-hours">
-        <span class="lbl">自动更新订阅（小时）</span>
-        <input type="number" id="f-sub-hours" min="0" max="8760" step="1" inputmode="numeric">
-      </label>
-
-      <p class="err" id="cfg-err" role="alert" hidden></p>
-      <button type="submit" class="btn primary wide" id="btn-save">保存并应用</button>
-
-      <!-- 请求头实验开关。用原生 checkbox 而不是自己搭一个 div toggle:
-           键盘操作和「已选中/未选中」的读屏播报都是免费的。右边那个状态标签
-           只是给眼睛看的同一件事,所以 aria-hidden —— 不然读屏会念两遍。
-           排在按钮下方是按需求定的,它照样跟着「保存并应用」一起提交。 -->
-      <div class="field">
-        <label class="chk toggle" for="f-identity">
-          <input type="checkbox" id="f-identity">
-          <span>OpenCode 请求头</span>
-          <em class="tag" id="f-identity-state" aria-hidden="true">关闭</em>
+        <label class="field" for="f-sub-hours">
+          <span class="lbl">自动更新订阅（小时）</span>
+          <input type="number" id="f-sub-hours" min="0" max="8760" step="1" inputmode="numeric">
         </label>
-      </div>
-    </form>
+
+        <p class="err" id="cfg-err" role="alert" hidden></p>
+        <button type="submit" class="btn primary wide" id="btn-save">保存并应用</button>
+
+        <!-- 请求头实验开关。用原生 checkbox 而不是自己搭一个 div toggle:
+             键盘操作和「已选中/未选中」的读屏播报都是免费的。右边那个状态标签
+             只是给眼睛看的同一件事,所以 aria-hidden —— 不然读屏会念两遍。
+             排在按钮下方是按需求定的,它照样跟着「保存并应用」一起提交。 -->
+        <div class="field">
+          <label class="chk toggle" for="f-identity">
+            <input type="checkbox" id="f-identity">
+            <span>OpenCode 请求头</span>
+            <em class="tag" id="f-identity-state" aria-hidden="true">关闭</em>
+          </label>
+        </div>
+      </form>
+    </div>
 
     <!-- 「同步模型」不在 form 里:它和订阅地址、请求头开关无关,点它不该顺带
          提交那张表(反之表单提交也不该触发一次出站拉清单)。清单平时开机拉一次、

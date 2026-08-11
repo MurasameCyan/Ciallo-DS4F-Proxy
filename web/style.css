@@ -239,6 +239,31 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   margin-bottom: 1px;  /* 卡头到第一行格子的间距,比其他卡片(13px)更紧凑 */
 }
 
+/* 接入卡片的小卡片容器 */
+.conn-box {
+  padding: 11px 12px 12px;
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+  margin-bottom: 12px;
+}
+.conn-box:last-child {
+  margin-bottom: 0;
+}
+.conn-box .field {
+  margin-bottom: 0;  /* field 默认有 margin-bottom,小卡片内不需要 */
+}
+
+/* 配置卡片的小卡片容器 */
+.cfg-box {
+  padding: 11px 12px 12px;
+  border-radius: var(--r-sm);
+  background: var(--card-2);
+  margin-bottom: 12px;
+}
+.cfg-box .field:last-child {
+  margin-bottom: 0;  /* 表单内最后一个 field 不需要下边距 */
+}
+
 /* 四格叠成一列。2×2 在 ~330px 卡内宽下每格内容只剩 136px,Token 那串副行
    («输入…输出…推理…缓存读…缓存写…») 会折成四行,竖着排反而更矮。
    这条必须紧跟上面的基础规则 —— 写在文件前面的 @media 里会被后出现的
