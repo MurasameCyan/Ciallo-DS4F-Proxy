@@ -232,12 +232,11 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  padding: 11px 12px 12px;
+  border-radius: var(--r-sm);
+  background: var(--card-2);
 }
-/* 卡头放在 grid 外层,独占一行 */
-.stats > .card-head {
-  grid-column: 1 / -1;
-  margin-bottom: 13px;  /* 与其他卡片的 card-head margin-bottom 保持一致 */
-}
+/* 卡头已移到 .stats 外层,不再需要特殊处理 */
 
 /* 接入卡片的小卡片容器 */
 .conn-box {
@@ -279,10 +278,11 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   container-type: inline-size;
   min-width: 0;
   /* 小卡片的样子:用现成的 --card-2(语义就是「比卡片浅一层」,浅色模式自动翻转),
-     四格之间靠底色区分而不再加边框 —— 卡中卡套边框会把顶部堆成一片框线 */
-  padding: 11px 12px 12px;
-  border-radius: var(--r-sm);
-  background: var(--card-2);
+     四格之间靠底色区分而不再加边框 —— 卡中卡套边框会把顶部堆成一片框线。
+     概况卡片的四格已经在 .stats 容器上添加了统一的背景和内边距,这里不再重复 */
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
 }
 .stat h3 {
   font-size: 11px; font-weight: 500; letter-spacing: .07em;
