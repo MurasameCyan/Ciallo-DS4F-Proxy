@@ -236,7 +236,7 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 /* 卡头放在 grid 外层,独占一行 */
 .stats > .card-head {
   grid-column: 1 / -1;
-  margin-bottom: 1px;  /* 卡头到第一行格子的间距,比其他卡片(13px)更紧凑 */
+  margin-bottom: 13px;  /* 与其他卡片的 card-head margin-bottom 保持一致 */
 }
 
 /* 接入卡片的小卡片容器 */
