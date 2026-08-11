@@ -26,6 +26,27 @@ const MODELS_PATH = '/zen/v1/models';
 export const COOLDOWN_MS = 90 * 1000;
 
 /**
+ * 解析 Retry-After 响应头,返回秒数(null 表示没有或解析失败)。
+ * 格式二选一:相对秒数(120)或 HTTP-date(Tue, 13 Aug 2026 00:00:00 GMT)。
+ */
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const s = String(value).trim();
+  // 纯数字 → 相对秒数
+  if (/^\d+$/.test(s)) {
+    const sec = parseInt(s, 10);
+    return sec > 0 && sec < 86400 * 2 ? sec : null;  // 上限两天,防止解析错误
+  }
+  // HTTP-date → 转成相对秒数
+  const t = Date.parse(s);
+  if (!isNaN(t)) {
+    const sec = Math.max(0, Math.floor((t - Date.now()) / 1000));
+    return sec < 86400 * 2 ? sec : null;
+  }
+  return null;
+}
+
+/**
  * 时间预算。这几个数一起决定「最坏多久给客户端一个答复」。
  *
  * 之前没有总预算,只有 for (i <= nodes.length + 5) 这个次数上限:48 个节点
@@ -332,50 +353,104 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   return out;
 }
 
-/** 429 后把节点关小黑屋 90 秒,期间跳过它,避免连续请求撞同一个被限的出口 */
+/**
+ * 按底层供应商推断模型分组。限流实测:DS4F/big-pickle/mimo/longcat 同时被限,
+ * 而 nemotron 系照常可用 —— 上游是按供应商分别计额度的。模型清单里没有供应商
+ * 字段,只能靠命名规律推断。后续上游暴露了供应商字段就改成读那个。
+ */
+export function providerGroup(model) {
+  const m = String(model || '').toLowerCase();
+  if (m.startsWith('nemotron')) return 'nemotron';
+  if (m.startsWith('ling-')) return 'ling';
+  if (m.startsWith('laguna')) return 'laguna';
+  // DS4F / big-pickle / mimo / longcat / hy3 / north 归默认组
+  return 'default';
+}
+
+/**
+ * 429 后把节点关小黑屋,期间跳过它,避免连续请求撞同一个被限的出口。
+ *
+ * 限流按「节点 × 供应商组」分别记:同一节点上 DS4F 被限不影响 nemotron 继续用。
+ * 冷却时长优先读上游的 Retry-After(实测指向 UTC 零点的日额度重置),兜底 90s。
+ */
 export class NodeCooldown {
   constructor() {
-    this.cooldowns = new Map();   // node -> 429 时刻
+    this.cooldowns = new Map();   // "node:group" -> { until, retryAfter }
   }
-  mark429(node) { this.cooldowns.set(node, Date.now()); }
-  isCooling(node) {
-    const t = this.cooldowns.get(node);
-    if (!t) return false;
-    if (Date.now() - t < COOLDOWN_MS) return true;
-    this.cooldowns.delete(node);
+  #key(node, group = 'default') { return `${node}:${group}`; }
+
+  mark429(node, group = 'default', retryAfterSec = null) {
+    const ms = retryAfterSec != null && retryAfterSec > 0
+      ? Math.min(retryAfterSec * 1000, 24 * 3600 * 1000)  // 上限一天,防止解析错误
+      : COOLDOWN_MS;
+    this.cooldowns.set(this.#key(node, group), {
+      until: Date.now() + ms,
+      retryAfter: retryAfterSec
+    });
+  }
+
+  isCooling(node, group = 'default') {
+    const k = this.#key(node, group);
+    const c = this.cooldowns.get(k);
+    if (!c) return false;
+    if (Date.now() < c.until) return true;
+    this.cooldowns.delete(k);
     return false;
   }
-  clear(node) { this.cooldowns.delete(node); }
+
+  clear(node, group = null) {
+    if (group === null) {
+      // 清该节点所有分组
+      let n = 0;
+      for (const k of this.cooldowns.keys()) {
+        if (k.startsWith(`${node}:`)) { this.cooldowns.delete(k); n++; }
+      }
+      return n;
+    }
+    this.cooldowns.delete(this.#key(node, group));
+    return 1;
+  }
+
   clearAll() {
     const n = this.cooldowns.size;
     this.cooldowns.clear();
     return n;
   }
-  pickAvailable(nodes, exclude = null) {
+
+  pickAvailable(nodes, group = 'default', exclude = null) {
     for (const n of nodes) {
       if (exclude?.has(n)) continue;
-      if (this.isCooling(n)) continue;
+      if (this.isCooling(n, group)) continue;
       return n;
     }
     return null;
   }
-  /** 全员冷却时挑剩余最短的,返回 { node, remain }(remain 单位 ms) */
-  soonest(nodes) {
+
+  /** 全员冷却时挑该分组剩余最短的,返回 { node, remain }(remain 单位 ms) */
+  soonest(nodes, group = 'default') {
     let node = null, remain = Infinity;
     for (const n of nodes) {
-      const t = this.cooldowns.get(n);
-      if (!t) continue;
-      const left = COOLDOWN_MS - (Date.now() - t);
+      const c = this.cooldowns.get(this.#key(n, group));
+      if (!c) continue;
+      const left = c.until - Date.now();
       if (left < remain) { remain = left; node = n; }
     }
     return node ? { node, remain } : null;
   }
-  /** 供 /api/nodes 用,remain 单位秒 */
+
+  /** 供 /api/nodes 用,remain 单位秒。返回该节点所有分组的冷却状态 */
   summary() {
     const out = [];
-    for (const [node, t] of this.cooldowns) {
-      const left = COOLDOWN_MS - (Date.now() - t);
-      if (left > 0) out.push({ node, remain: Math.ceil(left / 1000) });
+    for (const [k, c] of this.cooldowns) {
+      const left = c.until - Date.now();
+      if (left <= 0) continue;
+      const [node, group] = k.split(':');
+      out.push({
+        node,
+        group,
+        remain: Math.ceil(left / 1000),
+        retryAfter: c.retryAfter
+      });
     }
     return out;
   }
@@ -740,7 +815,7 @@ export class Gateway {
     if (nodes.length === 0) {
       return dialect.fail(res, 503, '没有可用节点 —— 检查订阅地址和 mihomo 状态', 'no_nodes');
     }
-    const cur = await this.ensureNode(nodes, res, dialect, deadline);
+    const cur = await this.ensureNode(nodes, res, dialect, deadline, model);
     if (!cur) return;   // ensureNode 已经回过错误了
     return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort);
   }
@@ -751,14 +826,15 @@ export class Gateway {
   }
 
   /** 选定本次要用的节点并让 mihomo 切过去;返回节点名,失败返回 null(已响应) */
-  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity) {
+  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity, model = null) {
+    const group = providerGroup(model);
     let cur = this.lockedNode;
-    if (cur && !this.cooldown.isCooling(cur) && nodes.includes(cur)) return cur;
+    if (cur && !this.cooldown.isCooling(cur, group) && nodes.includes(cur)) return cur;
 
-    cur = this.cooldown.pickAvailable(nodes);
+    cur = this.cooldown.pickAvailable(nodes, group);
     if (!cur) {
       // 全员冷却:等剩余最短的那个恢复,而不是直接失败
-      const s = this.cooldown.soonest(nodes);
+      const s = this.cooldown.soonest(nodes, group);
       if (s && s.remain > 0) {
         // 但不能等过预算。挂到客户端自己超时的话,它显示的是自己的兜底文案
         // (「模型不存在」那种),真实原因一个字都传不到 —— 宁可立刻回 429,
@@ -771,13 +847,13 @@ export class Gateway {
         this.logger('warn', `[cooldown] 所有节点冷却中,等 ${s.node} 恢复(剩 ${Math.ceil(s.remain / 1000)}s)`);
         await sleep(s.remain + 1000);
         cur = s.node;
-        this.cooldown.clear(cur);
+        this.cooldown.clear(cur, group);
       } else {
         cur = nodes[0];
       }
     }
     if ((await this.getCurrentNode()) !== cur && !(await this.switchNode(cur))) {
-      this.cooldown.mark429(cur);
+      this.cooldown.mark429(cur, group);
       dialect.fail(res, 503, 'Switch node failed', 'api_error');
       return null;
     }
@@ -881,14 +957,17 @@ export class Gateway {
         }
 
         if (status === 429) {
-          this.cooldown.mark429(cur);
+          const group = providerGroup(body.model);
+          const retryAfter = e.retryAfter ?? null;
+          this.cooldown.mark429(cur, group, retryAfter);
           this.usage.recordAttempt(cur, 'rateLimited', null, null, call);
           fails.rateLimited++;
-          this.logger('warn', `[429] node="${cur}" 限流,冷却 ${COOLDOWN_MS / 1000}s`);
+          const coolSec = retryAfter ?? Math.ceil(COOLDOWN_MS / 1000);
+          this.logger('warn', `[429] node="${cur}" model="${body.model}" group="${group}" 限流,冷却 ${coolSec}s${retryAfter ? ' (Retry-After)' : ''}`);
           tried.add(cur);
           netRetry = 0;
 
-          const next = this.cooldown.pickAvailable(nodes, tried);
+          const next = this.cooldown.pickAvailable(nodes, group, tried);
           if (!next) {
             const s = this.cooldown.summary();
             this.usage.record(body.model, null, false);
@@ -903,7 +982,7 @@ export class Gateway {
           if (await this.switchNode(next)) cur = next;
           else {
             tried.add(next);
-            const fallback = this.cooldown.pickAvailable(nodes, tried);
+            const fallback = this.cooldown.pickAvailable(nodes, group, tried);
             if (!fallback) {
               return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
@@ -929,7 +1008,7 @@ export class Gateway {
           tried.add(cur);
           netRetry = 0;
           this.logger('warn', `[timeout] node="${cur}" 重试 ${MAX_NET_RETRY} 次仍失败,换下一个`);
-          const next = this.cooldown.pickAvailable(nodes, tried);
+          const next = this.cooldown.pickAvailable(nodes, providerGroup(body.model), tried);
           if (!next) {
             return giveUp('所有节点都超时,没有可换的了', true);
           }
@@ -937,7 +1016,7 @@ export class Gateway {
           if (await this.switchNode(next)) cur = next;
           else {
             tried.add(next);
-            const fallback = this.cooldown.pickAvailable(nodes, tried);
+            const fallback = this.cooldown.pickAvailable(nodes, providerGroup(body.model), tried);
             if (!fallback) {
               return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
@@ -1011,7 +1090,10 @@ export class Gateway {
         let ttfb = 0;
         resp.on('data', (c) => { ttfb ||= Date.now() - t0; data += c; });
         resp.on('end', () => {
-          if (resp.statusCode !== 200) return reject({ status: resp.statusCode, body: data });
+          if (resp.statusCode !== 200) {
+            const retryAfter = parseRetryAfter(resp.headers['retry-after']);
+            return reject({ status: resp.statusCode, body: data, retryAfter });
+          }
           try {
             // 不可枚举:这个对象会被 OPENAI.respond 原样 JSON.stringify 给客户端,
             // 普通属性会当成上游字段泄出去
@@ -1062,7 +1144,10 @@ export class Gateway {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
           resp.on('data', (c) => (data += c));
-          resp.on('end', () => finish(() => reject({ status: resp.statusCode, body: data, notStarted: true })));
+          resp.on('end', () => {
+            const retryAfter = parseRetryAfter(resp.headers['retry-after']);
+            finish(() => reject({ status: resp.statusCode, body: data, notStarted: true, retryAfter }));
+          });
           return;
         }
         res.writeHead(200, {

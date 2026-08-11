@@ -48,43 +48,61 @@ const NODES = ['A', 'B', 'C'];
 
 await t('429 的节点进冷却,pickAvailable 跳过它', () => {
   const c = new NodeCooldown();
-  c.mark429('A');
-  assert.equal(c.isCooling('A'), true);
-  assert.equal(c.pickAvailable(NODES), 'B');
-  assert.equal(c.pickAvailable(NODES, new Set(['B'])), 'C');
+  c.mark429('A', 'default');
+  assert.equal(c.isCooling('A', 'default'), true);
+  assert.equal(c.pickAvailable(NODES, 'default'), 'B');
+  assert.equal(c.pickAvailable(NODES, 'default', new Set(['B'])), 'C');
+});
+
+await t('不同供应商组独立冷却', () => {
+  const c = new NodeCooldown();
+  c.mark429('A', 'deepseek');
+  assert.equal(c.isCooling('A', 'deepseek'), true);
+  assert.equal(c.isCooling('A', 'nemotron'), false);
+  assert.equal(c.pickAvailable(NODES, 'deepseek'), 'B');
+  assert.equal(c.pickAvailable(NODES, 'nemotron'), 'A');
 });
 
 await t('冷却过期后自动放行,不用等谁来清', () => {
   const c = new NodeCooldown();
-  c.cooldowns.set('A', Date.now() - COOLDOWN_MS - 1);
-  assert.equal(c.isCooling('A'), false);
-  assert.equal(c.cooldowns.has('A'), false, '过期项应就地删掉,否则 summary 会一直带着它');
-  assert.equal(c.pickAvailable(NODES), 'A');
+  c.cooldowns.set('A:default', { until: Date.now() - COOLDOWN_MS - 1, retryAfter: null });
+  assert.equal(c.isCooling('A', 'default'), false);
+  assert.equal(c.cooldowns.has('A:default'), false, '过期项应就地删掉,否则 summary 会一直带着它');
+  assert.equal(c.pickAvailable(NODES, 'default'), 'A');
 });
 
 await t('全员冷却时 soonest 给出剩余最短的那个', () => {
   const c = new NodeCooldown();
-  c.cooldowns.set('A', Date.now() - 10_000);   // 剩 80s
-  c.cooldowns.set('B', Date.now() - 80_000);   // 剩 10s
-  c.cooldowns.set('C', Date.now() - 40_000);
-  assert.equal(c.pickAvailable(NODES), null);
-  assert.equal(c.soonest(NODES).node, 'B');
-  assert.equal(c.soonest([]), null, '没节点时不能返回半个对象');
+  c.cooldowns.set('A:default', { until: Date.now() - 10_000 + COOLDOWN_MS, retryAfter: null });   // 剩 80s
+  c.cooldowns.set('B:default', { until: Date.now() - 80_000 + COOLDOWN_MS, retryAfter: null });   // 剩 10s
+  c.cooldowns.set('C:default', { until: Date.now() - 40_000 + COOLDOWN_MS, retryAfter: null });
+  assert.equal(c.pickAvailable(NODES, 'default'), null);
+  assert.equal(c.soonest(NODES, 'default').node, 'B');
+  assert.equal(c.soonest([], 'default'), null, '没节点时不能返回半个对象');
 });
 
 await t('summary 的 remain 是秒,且不含已过期项', () => {
   const c = new NodeCooldown();
-  c.mark429('A');
-  c.cooldowns.set('B', Date.now() - COOLDOWN_MS - 1);
+  c.mark429('A', 'default');
+  c.cooldowns.set('B:default', { until: Date.now() - COOLDOWN_MS - 1, retryAfter: null });
   const s = c.summary();
   assert.equal(s.length, 1);
   assert.equal(s[0].node, 'A');
   assert.ok(s[0].remain > 85 && s[0].remain <= 90, `remain 应是秒级 90 左右,得到 ${s[0].remain}`);
 });
 
+await t('Retry-After 覆盖默认冷却时长', () => {
+  const c = new NodeCooldown();
+  c.mark429('A', 'default', 30);  // 30s
+  const entry = c.cooldowns.get('A:default');
+  const expected = Date.now() + 30_000;
+  assert.ok(Math.abs(entry.until - expected) < 100, `应是 now+30s,差了 ${entry.until - expected}ms`);
+  assert.equal(entry.retryAfter, 30);
+});
+
 await t('clearAll 返回清掉的个数(面板要显示)', () => {
   const c = new NodeCooldown();
-  c.mark429('A'); c.mark429('B');
+  c.mark429('A', 'default'); c.mark429('B', 'nemotron');
   assert.equal(c.clearAll(), 2);
   assert.equal(c.cooldowns.size, 0);
 });
