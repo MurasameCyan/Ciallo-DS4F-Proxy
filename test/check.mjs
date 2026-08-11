@@ -622,8 +622,10 @@ t('概览四格在一张卡内 2×2,DOM 顺序就是视觉顺序', () => {
   const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
 
   // 四格必须在同一张卡里(整合的全部意义),而不是各自一张 .card
-  const sec = html.match(/<section class="card stats"[\s\S]*?<\/section>/)?.[0] || '';
-  assert.ok(sec, '概览应是一张 .card.stats,不再是 .grid.stats 套四张卡');
+  // 现在结构是 <section class="card"> ... <div class="stats"> ... </div> </section>
+  const sec = html.match(/<section class="card"[^>]*aria-labelledby="h-overview"[\s\S]*?<\/section>/)?.[0] || '';
+  assert.ok(sec, '概览应是一张 .card,内含 .stats 容器');
+  assert.ok(sec.includes('<div class="stats">'), '概览卡片内应有 .stats 容器');
   assert.doesNotMatch(sec, /class="card stat"/, '内部小卡片不该再叠一层 .card');
 
   // 两列 grid 逐行填充,所以 DOM 顺序 == 左上→右上→左下→右下。
