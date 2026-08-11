@@ -509,6 +509,9 @@ input[readonly] { color: var(--fg-2); }
    一个够放「Anthropic 地址」的下限,免得换行后两颗宽度不一样。 */
 .copyrow.btns { flex-wrap: wrap; }
 .copyrow.btns .btn { flex: 1 1 96px; min-width: 0; white-space: nowrap; }
+/* 复制 Key / 重置 Key 两颗做小，给地址按钮腾空间 */
+.copyrow.btns .btn:nth-child(3),
+.copyrow.btns .btn:nth-child(4) { flex: 0 1 auto; }
 
 .err { color: var(--rose); font-size: 12px; margin-bottom: 10px; }
 
