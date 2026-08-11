@@ -178,6 +178,13 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 340px;
   gap: 16px;
+  /* 右侧列(接入 + 配置)的行高由内容决定,但两张卡等高 */
+  grid-auto-rows: auto;
+}
+/* 右侧列(第三列)的卡片内部使用 flex 布局,让最后一个小卡片撑满剩余空间 */
+#main > .card:nth-child(2) {
+  display: flex;
+  flex-direction: column;
 }
 
 .grid { display: grid; gap: 16px; }
@@ -247,6 +254,18 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 }
 .conn-box:last-child {
   margin-bottom: 0;
+  /* 「可用模型」小卡片高度自动增长,保持底边与概况小卡片齐平 */
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.conn-box:last-child .field {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.conn-box:last-child .models {
+  flex: 1;
 }
 .conn-box .field {
   margin-bottom: 0;  /* field 默认有 margin-bottom,小卡片内不需要 */
