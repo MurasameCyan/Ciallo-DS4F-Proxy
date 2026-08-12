@@ -89,7 +89,7 @@ await t('summary 的 remain 是秒,且不含已过期项', () => {
   const s = c.summary();
   assert.equal(s.length, 1);
   assert.equal(s[0].node, 'A');
-  assert.ok(s[0].remain > 295 && s[0].remain <= 300, `remain 应是秒级 300 左右,得到 ${s[0].remain}`);
+  assert.ok(s[0].remain > 55 && s[0].remain <= 60, `remain 应是秒级 60 左右,得到 ${s[0].remain}`);
 });
 
 await t('Retry-After 覆盖默认冷却时长', () => {
@@ -101,14 +101,25 @@ await t('Retry-After 覆盖默认冷却时长', () => {
   assert.equal(entry.retryAfter, 30);
 });
 
-await t('无 Retry-After 时兜底冷却 5 分钟(不是 90s)', () => {
+await t('无 Retry-After 时兜底冷却 60 秒(不是 5 分钟)', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default');   // 不带 Retry-After,走兜底
   const entry = c.cooldowns.get('A:default');
-  assert.equal(COOLDOWN_MS, 5 * 60 * 1000, '无 Retry-After 的兜底应为 5 分钟');
+  assert.equal(COOLDOWN_MS, 60 * 1000, '无 Retry-After 的兜底应为 60 秒');
   assert.ok(Math.abs(entry.until - (Date.now() + COOLDOWN_MS)) < 100,
     `应是 now+COOLDOWN_MS,差了 ${entry.until - (Date.now() + COOLDOWN_MS)}ms`);
   assert.equal(entry.retryAfter, null, '兜底不该伪造一个 Retry-After 数值');
+});
+
+await t('冷却过期即删,但 lastMarked 记着最近限流时刻(供 rankNodes 排队尾)', () => {
+  const c = new NodeCooldown();
+  c.mark429('A', 'default');
+  c.cooldowns.delete('A:default');    // 模拟解冻后过期项被清
+  assert.equal(c.isCooling('A', 'default'), false, '解冻了就不算在冷却');
+  assert.ok(c.recentMark('A') > 0, '但 lastMarked 记得它刚限流过,好让它排到队尾');
+  assert.equal(c.recentMark('Z'), 0, '没限流过的是 0,享受最前优先级');
+  c.clear('A', 'default');
+  assert.equal(c.recentMark('A'), 0, '成功(clear)后归零,恢复正常优先级');
 });
 
 await t('clearAll 返回清掉的个数(面板要显示)', () => {
@@ -721,6 +732,16 @@ await t('rankNodes 按延迟排序并剔除不通的', async () => {
   await g.testNodes();
   assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['C', 'A'], '快的在前,B 直接不在表里');
   assert.deepEqual(g.excludedNodes(['A', 'B', 'C']), ['B']);
+});
+
+await t('限流过的节点在 rankNodes 里让到队尾,不凭低延迟插回队首', async () => {
+  const g = fakeGateway({ A: 300, B: 80, C: 150 });
+  await g.testNodes();
+  assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['B', 'C', 'A'], '基线:纯延迟序 B<C<A');
+  g.cooldown.mark429('B', 'default');          // 最快的 B 撞了限流
+  g.cooldown.cooldowns.delete('B:default');    // 模拟已解冻(冷却过期清掉,lastMarked 还在)
+  assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['C', 'A', 'B'],
+    'B 刚限流过,即便解冻也排到没限流的 C/A 后面,不靠低延迟插队');
 });
 
 await t('没测过时 rankNodes 原样返回(退化成订阅顺序,不是空表)', () => {

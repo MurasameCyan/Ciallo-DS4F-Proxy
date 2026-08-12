@@ -23,11 +23,11 @@ import { safeEqual } from './auth.mjs';
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
 const MODELS_PATH = '/zen/v1/models';
-// 429 但上游没给 Retry-After 时的兜底冷却。实测这类限流是持续的(按出口 IP 的
-// 日额度,90s 后重打依然 429),90s 太短会让节点反复「解冻→重打→再冻」,配合客户端
-// 重发就是没完没了的高频轮换刷屏。拉到 5 分钟:轮完一圈全池子仍在冷却,ensureNode
-// 直接秒回 429 不再空转。带 Retry-After 的仍按上游给的时长走(见 mark429)。
-export const COOLDOWN_MS = 5 * 60 * 1000;
+// 429 但上游没给 Retry-After 时的兜底冷却。配套「解冻排队尾」(见 rankNodes):
+// 解冻的节点不再凭低延迟插回队首,而是排到没限流过的节点后面,所以短冷却不会再
+// 造成「解冻→立刻重打→再冻」的高频刷屏。60s 足够躲开一阵限流窗口,又能在其余
+// 节点也不行时较快回来重试。带 Retry-After 的仍按上游给的时长走(见 mark429)。
+export const COOLDOWN_MS = 60 * 1000;
 
 /**
  * 解析 Retry-After 响应头,返回秒数(null 表示没有或解析失败)。
@@ -375,11 +375,14 @@ export function providerGroup(model) {
  * 429 后把节点关小黑屋,期间跳过它,避免连续请求撞同一个被限的出口。
  *
  * 限流按「节点 × 供应商组」分别记:同一节点上 DS4F 被限不影响 nemotron 继续用。
- * 冷却时长优先读上游的 Retry-After(实测指向 UTC 零点的日额度重置),兜底 90s。
+ * 冷却时长优先读上游的 Retry-After(实测指向 UTC 零点的日额度重置),没给就兜底 COOLDOWN_MS。
  */
 export class NodeCooldown {
   constructor() {
-    this.cooldowns = new Map();   // "node:group" -> { until, retryAfter }
+    this.cooldowns = new Map();   // "node:group" -> { until, retryAfter };过期即删,summary 才干净
+    // "node:group" -> 最近一次被限流的时刻。冷却过期会把上面那条删掉,但这条留着,
+    // rankNodes 靠它把刚解冻的节点排到可用节点最后(见 recentMark)。只有 clear/clearAll 清。
+    this.lastMarked = new Map();
   }
   #key(node, group = 'default') { return `${node}:${group}`; }
 
@@ -387,10 +390,9 @@ export class NodeCooldown {
     const ms = retryAfterSec != null && retryAfterSec > 0
       ? Math.min(retryAfterSec * 1000, 24 * 3600 * 1000)  // 上限一天,防止解析错误
       : COOLDOWN_MS;
-    this.cooldowns.set(this.#key(node, group), {
-      until: Date.now() + ms,
-      retryAfter: retryAfterSec
-    });
+    const key = this.#key(node, group);
+    this.cooldowns.set(key, { until: Date.now() + ms, retryAfter: retryAfterSec });
+    this.lastMarked.set(key, Date.now());
   }
 
   isCooling(node, group = 'default') {
@@ -404,21 +406,40 @@ export class NodeCooldown {
 
   clear(node, group = null) {
     if (group === null) {
-      // 清该节点所有分组
+      // 清该节点所有分组(冷却记录和「最近限流时刻」一起清,恢复它的正常优先级)
       let n = 0;
-      for (const k of this.cooldowns.keys()) {
+      for (const k of [...this.cooldowns.keys()]) {
         if (k.startsWith(`${node}:`)) { this.cooldowns.delete(k); n++; }
+      }
+      for (const k of [...this.lastMarked.keys()]) {
+        if (k.startsWith(`${node}:`)) this.lastMarked.delete(k);
       }
       return n;
     }
-    this.cooldowns.delete(this.#key(node, group));
+    const key = this.#key(node, group);
+    this.cooldowns.delete(key);
+    this.lastMarked.delete(key);
     return 1;
   }
 
   clearAll() {
     const n = this.cooldowns.size;
     this.cooldowns.clear();
+    this.lastMarked.clear();
     return n;
+  }
+
+  /**
+   * 该节点最近一次(任意分组)被限流的时刻,含已解冻的;没限流过返回 0。
+   * rankNodes 拿它把刚限流/解冻的节点排到可用节点最后 —— 否则延迟最低的那个
+   * 一解冻就凭低延迟插回队首、又被打,后面的节点永远轮不到。成功(clear)后归零。
+   */
+  recentMark(node) {
+    let ts = 0;
+    for (const [k, t] of this.lastMarked) {
+      if (k.startsWith(`${node}:`)) ts = Math.max(ts, t);
+    }
+    return ts;
   }
 
   pickAvailable(nodes, group = 'default', exclude = null) {
@@ -437,6 +458,7 @@ export class NodeCooldown {
       const c = this.cooldowns.get(this.#key(n, group));
       if (!c) continue;
       const left = c.until - Date.now();
+      if (left <= 0) continue;   // 已解冻的不算「在冷却」(过期项通常已被删,这里防御一下)
       if (left < remain) { remain = left; node = n; }
     }
     return node ? { node, remain } : null;
@@ -1340,8 +1362,10 @@ export class Gateway {
   }
 
   /**
-   * 按实测延迟排序、剔除不通的。网关挑节点就是取这个数组的第一个可用项,
-   * 所以「排序」和「优先级」在这里是同一件事。
+   * 排序 = 优先级:网关挑节点就是取这个数组的第一个可用项。两级键:
+   *  1. 最近被限流的时刻(recentMark,没限流过=0 最优先)—— 把刚限流/解冻的节点
+   *     让到队尾,免得延迟最低的那个一解冻就插回队首、又被打,后面的节点饿死;
+   *  2. 实测延迟。没被限流过的节点之间,还是快的在前。
    *
    * 两条兜底:
    *  - 没测过的节点(测完之后机场新加的)保留,排在测过的后面而不是当死的扔掉;
@@ -1356,7 +1380,9 @@ export class Gateway {
     const untested = nodes.filter((n) => !this.delay.has(n));
     const alive = nodes.filter((n) => this.delay.get(n) != null);
     if (!alive.length && !untested.length) return nodes;
-    alive.sort((a, b) => this.delay.get(a) - this.delay.get(b));
+    alive.sort((a, b) =>
+      (this.cooldown.recentMark(a) - this.cooldown.recentMark(b))
+      || (this.delay.get(a) - this.delay.get(b)));
     return [...alive, ...untested];
   }
 

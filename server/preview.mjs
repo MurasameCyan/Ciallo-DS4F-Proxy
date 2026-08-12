@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const PORT = Number(process.env.PORT) || 5173;
-const COOLDOWN_MS = 300_000;
+const COOLDOWN_MS = 60_000;
 // 和 gateway.mjs 的同名常量对齐。这里不 import 它:预览刻意不依赖真网关代码,
 // 否则改坏了 gateway 连预览都起不来,而预览正是用来对界面的
 const CALL_LOG_LIMIT = 200;
@@ -66,6 +66,9 @@ const state = {
   extraModel: false,
   current: NODES[2],
   cooldowns: new Map(),          // name -> 进入冷却的时间戳
+  // name -> 最近一次限流时刻。解冻(cooldowns 删了)也留着,ranked() 靠它把刚解冻的
+  // 节点排到「待用」段最后,演示网关的「解冻排队尾」,不让它凭低延迟插回队首
+  lastLimited: new Map(),
   // 假的实测延迟。故意留两个 null:那是「测过但不通」,面板要把它们
   // 单独标出来而不是静默消失 —— 不然看起来像订阅少了节点。
   delay: new Map(NODES.map((n, i) => [n, i === 4 || i === 9 ? null : 90 + i * 37 + (i % 3) * 24])),
@@ -156,14 +159,17 @@ function coolingList() {
 }
 
 function available() {
-  return NODES.filter((n) => !state.cooldowns.has(n) && state.delay.get(n) != null);
+  return ranked().filter((n) => !state.cooldowns.has(n));
 }
 
-/** 真网关的 rankNodes:延迟低的在前,测不通的不在表里 */
+/** 真网关的 rankNodes:最近限流过的让到队尾(没限流过=0 最优先),其余按延迟低的在前,测不通的不在表里 */
 function ranked() {
   return NODES.filter((n) => state.delay.get(n) != null)
-    .sort((a, b) => state.delay.get(a) - state.delay.get(b));
+    .sort((a, b) => (recentMark(a) - recentMark(b)) || (state.delay.get(a) - state.delay.get(b)));
 }
+
+/** 节点最近一次被限流的时刻;没限流过是 0。对齐网关 NodeCooldown.recentMark */
+function recentMark(n) { return state.lastLimited.get(n) || 0; }
 
 function excluded() {
   return NODES.filter((n) => state.delay.has(n) && state.delay.get(n) == null);
@@ -233,7 +239,8 @@ function simulate() {
     u.fail++;
     nb.rateLimited++;
     state.cooldowns.set(state.current, Date.now());
-    log('warn', `[429] ${state.current} 限流,冷却 300s`);
+    state.lastLimited.set(state.current, Date.now());   // 记着它刚限流过,解冻后排到队尾
+    log('warn', `[429] ${state.current} 限流,冷却 60s`);
     // 当场换,别把 current 留在冷却节点上等下一 tick —— 那几秒里 /api/nodes
     // 会报一个自己正在冷却的 current,面板读到的是个自相矛盾的状态
     const next = available()[0];
@@ -423,6 +430,7 @@ async function handleApi(req, res, path) {
     log('warn', '===== 手动重置开始 =====');
     const n = state.cooldowns.size;
     state.cooldowns.clear();
+    state.lastLimited.clear();     // 重置连「最近限流」一起忘掉,节点恢复按延迟排
     state.current = NODES[0];
     await new Promise((r) => setTimeout(r, 700));
     log('ok', `[reset] 清空 ${n} 个冷却记录`);
