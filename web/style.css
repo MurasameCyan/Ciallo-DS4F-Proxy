@@ -603,8 +603,11 @@ input[readonly] { color: var(--fg-2); }
 .btn.wide + .field { margin: 13px 0 0; }
 
 /* 两列定宽栅格,不再按内容宽度流式排。原来那版是 flex-wrap:名字长短不一,
-   每行挤进几个全看运气,读起来是一团胶囊;两列固定下来,扫的时候眼睛只走两条线。 */
-.models { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+   每行挤进几个全看运气,读起来是一团胶囊;两列固定下来,扫的时候眼睛只走两条线。
+   align-content:start —— 这格被 .conn-box:last-child 的 flex:1 撑高(为和概况小卡片
+   底边齐平),grid 默认会把多出来的高度摊给各行,21px 的胶囊被拉成竖椭圆。和 .nodes
+   同一个道理:撑不满就顶到上边,余量留在底部,行高交回给内容。 */
+.models { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-content: start; }
 .models li {
   font-family: var(--mono); font-size: 11px;
   padding: 3px 8px; border-radius: 999px;
