@@ -232,6 +232,8 @@ t('modelLabel 给模型名带上下文后缀,表里没有的原样返回', () =>
   assert.equal(modelLabel('deepseek-v4-flash-free'), 'deepseek-v4-flash-free[1M]');
   assert.equal(modelLabel('ling-3.0-flash-free'), 'ling-3.0-flash-free[262K]');
   assert.equal(modelLabel('north-mini-code-free'), 'north-mini-code-free[256K]');
+  // hy3-free 的数是从 prompt_tokens 封顶推的(它静默截断,不报超限),196608 -> "197K"
+  assert.equal(modelLabel('hy3-free'), 'hy3-free[197K]');
   // 新模型上线时表里查不到,只显示名字 —— 不能显示 "[undefined]" 也不能漏掉模型
   assert.equal(modelLabel('brand-new-free'), 'brand-new-free');
   assert.equal(modelLabel(null), '');

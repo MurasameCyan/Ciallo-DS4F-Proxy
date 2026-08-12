@@ -45,7 +45,7 @@ const NODES = [
 /**
  * 真网关这一份是从上游 /zen/v1/models 现拉的(一天一次)。这里写死 2026-08-11
  * 实测拉到的 11 个 —— 预览要照出最长的那一列,少列几个就看不出模型区块够不够高。
- * hy3-free 没有上下文后缀是对的:它免费额度耗尽,量不到上限(见 core.js 的 MODEL_CTX)。
+ * 11 个现在都有上下文后缀(hy3-free 的 197K 是 2026-08-12 补测的,见 core.js 的 MODEL_CTX)。
  */
 const DEMO_MODELS = [
   'big-pickle', 'deepseek-v4-flash-free', 'hy3-free', 'laguna-s-2.1-free',

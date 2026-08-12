@@ -861,8 +861,8 @@ await t('拉失败也推进 modelsAt,否则面板每 2 秒轮询就每 2 秒重�
 
 await t('兜底清单和实测上下文表对得上,不能只补一处', async () => {
   // 两份表都是手写的,漏一处的后果不一样:兜底少了模型 = 拉不到时面板少列;
-  // 上下文表少了 = 少个括号。所以只要求前者覆盖后者,反向允许缺(hy3-free
-  // 额度耗尽量不到上下文,见 core.js 的注释)
+  // 上下文表少了 = 少个括号。所以只要求前者覆盖后者,反向允许缺 —— 上游新上一个
+  // 模型时它会先进兜底清单,上下文得单独实测一次才有数(见 core.js 的注释)
   const { MODEL_CTX } = await import('../web/core.js');
   for (const id of Object.keys(MODEL_CTX)) {
     assert.ok(FREE_MODELS.includes(id), `${id} 有上下文数据却不在兜底清单里`);
