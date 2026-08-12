@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const PORT = Number(process.env.PORT) || 5173;
-const COOLDOWN_MS = 90_000;
+const COOLDOWN_MS = 300_000;
 // 和 gateway.mjs 的同名常量对齐。这里不 import 它:预览刻意不依赖真网关代码,
 // 否则改坏了 gateway 连预览都起不来,而预览正是用来对界面的
 const CALL_LOG_LIMIT = 200;
@@ -233,7 +233,7 @@ function simulate() {
     u.fail++;
     nb.rateLimited++;
     state.cooldowns.set(state.current, Date.now());
-    log('warn', `[429] ${state.current} 限流,冷却 90s`);
+    log('warn', `[429] ${state.current} 限流,冷却 300s`);
     // 当场换,别把 current 留在冷却节点上等下一 tick —— 那几秒里 /api/nodes
     // 会报一个自己正在冷却的 current,面板读到的是个自相矛盾的状态
     const next = available()[0];

@@ -5,8 +5,8 @@
  * 界面里凡是「算出来的东西」都放这儿,app.js 只负责把结果贴到 DOM 上。
  */
 
-/** 节点 429 后的冷却窗口,与网关侧 COOLDOWN_MS 一致 */
-export const COOLDOWN_MS = 90_000;
+/** 节点 429 后的兜底冷却窗口,与网关侧 COOLDOWN_MS 一致(无 Retry-After 时 5 分钟) */
+export const COOLDOWN_MS = 300_000;
 
 /** 日志环形缓冲上限,与网关侧 MAX_LOG 一致 */
 export const MAX_LOG = 500;

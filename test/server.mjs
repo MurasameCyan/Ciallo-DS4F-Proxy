@@ -73,9 +73,10 @@ await t('冷却过期后自动放行,不用等谁来清', () => {
 
 await t('全员冷却时 soonest 给出剩余最短的那个', () => {
   const c = new NodeCooldown();
-  c.cooldowns.set('A:default', { until: Date.now() - 10_000 + COOLDOWN_MS, retryAfter: null });   // 剩 80s
-  c.cooldowns.set('B:default', { until: Date.now() - 80_000 + COOLDOWN_MS, retryAfter: null });   // 剩 10s
-  c.cooldowns.set('C:default', { until: Date.now() - 40_000 + COOLDOWN_MS, retryAfter: null });
+  // 用绝对剩余量构造,只看相对关系(B<C<A),不绑死 COOLDOWN_MS 的具体值
+  c.cooldowns.set('A:default', { until: Date.now() + 290_000, retryAfter: null });   // 剩 290s
+  c.cooldowns.set('B:default', { until: Date.now() + 220_000, retryAfter: null });   // 剩 220s(最短)
+  c.cooldowns.set('C:default', { until: Date.now() + 260_000, retryAfter: null });   // 剩 260s
   assert.equal(c.pickAvailable(NODES, 'default'), null);
   assert.equal(c.soonest(NODES, 'default').node, 'B');
   assert.equal(c.soonest([], 'default'), null, '没节点时不能返回半个对象');
@@ -88,7 +89,7 @@ await t('summary 的 remain 是秒,且不含已过期项', () => {
   const s = c.summary();
   assert.equal(s.length, 1);
   assert.equal(s[0].node, 'A');
-  assert.ok(s[0].remain > 85 && s[0].remain <= 90, `remain 应是秒级 90 左右,得到 ${s[0].remain}`);
+  assert.ok(s[0].remain > 295 && s[0].remain <= 300, `remain 应是秒级 300 左右,得到 ${s[0].remain}`);
 });
 
 await t('Retry-After 覆盖默认冷却时长', () => {
@@ -98,6 +99,16 @@ await t('Retry-After 覆盖默认冷却时长', () => {
   const expected = Date.now() + 30_000;
   assert.ok(Math.abs(entry.until - expected) < 100, `应是 now+30s,差了 ${entry.until - expected}ms`);
   assert.equal(entry.retryAfter, 30);
+});
+
+await t('无 Retry-After 时兜底冷却 5 分钟(不是 90s)', () => {
+  const c = new NodeCooldown();
+  c.mark429('A', 'default');   // 不带 Retry-After,走兜底
+  const entry = c.cooldowns.get('A:default');
+  assert.equal(COOLDOWN_MS, 5 * 60 * 1000, '无 Retry-After 的兜底应为 5 分钟');
+  assert.ok(Math.abs(entry.until - (Date.now() + COOLDOWN_MS)) < 100,
+    `应是 now+COOLDOWN_MS,差了 ${entry.until - (Date.now() + COOLDOWN_MS)}ms`);
+  assert.equal(entry.retryAfter, null, '兜底不该伪造一个 Retry-After 数值');
 });
 
 await t('clearAll 返回清掉的个数(面板要显示)', () => {

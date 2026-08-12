@@ -1,7 +1,7 @@
 /**
  * gateway.mjs —— OpenAI 兼容网关 + 节点轮换状态机。
  *
- * 从 desktop-app/gateway.js 移植。行为(冷却 90s、锁定节点、429 换人、
+ * 从 desktop-app/gateway.js 移植。行为(冷却、锁定节点、429 换人、
  * 网络错误只重试当前节点)刻意保持一致,唯一实质改动是出站真的走 mihomo 了
  * —— 详见 proxy.mjs 顶部那段 bug 说明。
  *
@@ -23,7 +23,11 @@ import { safeEqual } from './auth.mjs';
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
 const MODELS_PATH = '/zen/v1/models';
-export const COOLDOWN_MS = 90 * 1000;
+// 429 但上游没给 Retry-After 时的兜底冷却。实测这类限流是持续的(按出口 IP 的
+// 日额度,90s 后重打依然 429),90s 太短会让节点反复「解冻→重打→再冻」,配合客户端
+// 重发就是没完没了的高频轮换刷屏。拉到 5 分钟:轮完一圈全池子仍在冷却,ensureNode
+// 直接秒回 429 不再空转。带 Retry-After 的仍按上游给的时长走(见 mark429)。
+export const COOLDOWN_MS = 5 * 60 * 1000;
 
 /**
  * 解析 Retry-After 响应头,返回秒数(null 表示没有或解析失败)。
@@ -973,7 +977,7 @@ export class Gateway {
             this.usage.record(body.model, null, false);
             this.logger('error', `[chat] 全部节点冷却中: ${s.length} 个`);
             return dialect.fail(res, 429,
-              `All nodes rate-limited, retry in ~${s[0]?.remain || 90}s`, 'all_nodes_429', { cooldown: s });
+              `All nodes rate-limited, retry in ~${s[0]?.remain || Math.ceil(COOLDOWN_MS / 1000)}s`, 'all_nodes_429', { cooldown: s });
           }
           // 换之前喘 2 秒:重置后一口气把所有节点扫成 429 就是这么来的,
           // 上游限流是按窗口算的,给它一点恢复时间
