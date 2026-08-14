@@ -30,7 +30,7 @@ delete process.env.API_KEY;
 
 const {
   NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
-  identityHeaders, OPENAI, ANTHROPIC, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
+  identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -1252,6 +1252,113 @@ await t('本地 hash 不明时不谎报「有新版本」', async () => {
   process.env.GIT_COMMIT = 'a'.repeat(40);
 });
 
+// ── Responses 方言(近乎透传,但有两处非做不可的薄处理)──────────
+
+await t('readUsage 两套命名都认:Responses 的 input/output_tokens 归一到 prompt/completion', () => {
+  const r = readUsage({ input_tokens: 12, output_tokens: 5, total_tokens: 17 });
+  assert.equal(r.promptTokens, 12, 'input_tokens 要落到 promptTokens,否则面板显示 0');
+  assert.equal(r.completionTokens, 5);
+  assert.equal(r.totalTokens, 17);
+});
+
+await t('readUsage:上游明确报的 0 不能被另一套命名顶掉', () => {
+  // prompt_tokens 存在且为 0(?? 只在 null/undefined 时才回落),不能被 input_tokens 覆盖
+  const r = readUsage({ prompt_tokens: 0, input_tokens: 99, completion_tokens: 3 });
+  assert.equal(r.promptTokens, 0, '?? 语义:显式 0 是有意义的值');
+  assert.equal(r.completionTokens, 3);
+});
+
+await t('readUsage:Responses 的 reasoning/cache 明细字段也认', () => {
+  const r = readUsage({
+    input_tokens: 10, output_tokens: 8,
+    output_tokens_details: { reasoning_tokens: 6 },
+    input_tokens_details: { cached_tokens: 4 },
+  });
+  assert.equal(r.reasoningTokens, 6, 'output_tokens_details.reasoning_tokens 要认');
+  assert.equal(r.cacheReadTokens, 4, 'input_tokens_details.cached_tokens 要认');
+  assert.equal(r.hasCacheData, true);
+});
+
+await t('RESPONSES.validate:input 数组或非空字符串放行,缺了才 400', () => {
+  assert.equal(RESPONSES.validate({ input: [{ role: 'user', content: 'hi' }] }), null);
+  assert.equal(RESPONSES.validate({ input: 'hi' }), null, 'OpenAI SDK 允许字符串 input');
+  assert.equal(typeof RESPONSES.validate({ input: [] }), 'string', '空数组要挡');
+  assert.equal(typeof RESPONSES.validate({ input: '  ' }), 'string', '空白字符串要挡');
+  assert.equal(typeof RESPONSES.validate({}), 'string', '缺 input 要挡');
+  // messages 不是 Responses 的字段,给了也不算数
+  assert.equal(typeof RESPONSES.validate({ messages: [{ role: 'user', content: 'x' }] }), 'string');
+});
+
+await t('RESPONSES.toUpstream:字符串 input 补成上游要的数组,数组原样透传', () => {
+  const wrapped = RESPONSES.toUpstream({ model: 'm', input: 'hi' });
+  assert.deepEqual(wrapped.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+    '纯字符串上游会 400 Empty input messages,必须补成数组');
+  const arr = [{ role: 'user', content: [{ type: 'input_text', text: 'a' }] }];
+  assert.equal(RESPONSES.toUpstream({ model: 'm', input: arr }).input, arr, '数组不动它');
+});
+
+await t('RESPONSES.applyEffort:走嵌套 reasoning.effort,不碰顶层 reasoning_effort', () => {
+  const body = { model: 'm', input: [] };
+  RESPONSES.applyEffort(body, 'high');
+  assert.deepEqual(body.reasoning, { effort: 'high' }, 'Responses 认嵌套字段,塞顶层上游会忽略');
+  assert.ok(!('reasoning_effort' in body), '别注入 chat 那套顶层字段');
+
+  // 保留客户端已带的其它 reasoning 字段(如 summary),只改 effort
+  const withSummary = { model: 'm', input: [], reasoning: { summary: 'auto' } };
+  RESPONSES.applyEffort(withSummary, 'medium');
+  assert.deepEqual(withSummary.reasoning, { summary: 'auto', effort: 'medium' });
+
+  // 空档位:删掉 effort;删到空对象就把 reasoning 整个去掉,不发空壳
+  const empty = { model: 'm', input: [], reasoning: { effort: 'low' } };
+  RESPONSES.applyEffort(empty, '');
+  assert.ok(!('reasoning' in empty), 'reasoning 只剩空对象时整个删掉');
+  const keep = { model: 'm', input: [], reasoning: { summary: 'auto', effort: 'low' } };
+  RESPONSES.applyEffort(keep, '');
+  assert.deepEqual(keep.reasoning, { summary: 'auto' }, '还有别的字段就只删 effort');
+});
+
+/** 把 sink 的转发结果收集成字符串,断言用(sink 只用到 res.write/end) */
+function collectSink(dialect) {
+  const out = { chunks: [], ended: false };
+  const res = { write: (c) => { out.chunks.push(String(c)); return true; }, end: () => { out.ended = true; } };
+  return { sink: dialect.sink(res), out, text: () => out.chunks.join('') };
+}
+
+await t('responsesSink:response.* 事件原样透传,收尾漏出的 chat.completion.chunk 吞掉', () => {
+  const { sink, text } = collectSink(RESPONSES);
+  sink.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'hi' })}\n\n`);
+  sink.write(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'r', usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`);
+  // 漏块型模型(deepseek/hy3)收尾会漏这个原始 chat 块,严格 Responses 客户端会解析报错
+  sink.write(`data: ${JSON.stringify({ object: 'chat.completion.chunk', usage: { prompt_tokens: 1, completion_tokens: 1 } })}\n\n`);
+  sink.write('data: [DONE]\n\n');
+  sink.end();
+
+  const s = text();
+  assert.ok(s.includes('response.output_text.delta'), '正文事件必须转发');
+  assert.ok(s.includes('response.completed'), 'completed 必须转发');
+  assert.ok(!s.includes('chat.completion.chunk'), '漏出来的 chat 杂块必须吞掉');
+  assert.ok(s.includes('[DONE]'), '[DONE] 原样透传');
+});
+
+await t('responsesSink:半个事件跨 chunk 到达时不丢内容、也不误伤', () => {
+  const { sink, text } = collectSink(RESPONSES);
+  const line = `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'xyz' })}\n\n`;
+  sink.write(line.slice(0, 15));      // 断在中间
+  sink.write(line.slice(15));
+  sink.end();
+  assert.ok(text().includes('"delta":"xyz"'), '缓冲区必须留住半行等下一块');
+  assert.ok(text().includes('response.output_text.delta'));
+});
+
+await t('responsesSink:chat 杂块跨 chunk 到达也照样吞掉', () => {
+  const { sink, text } = collectSink(RESPONSES);
+  const junk = `data: ${JSON.stringify({ object: 'chat.completion.chunk', usage: { prompt_tokens: 2 } })}\n\n`;
+  sink.write(junk.slice(0, 30));
+  sink.write(junk.slice(30));
+  sink.end();
+  assert.ok(!text().includes('chat.completion.chunk'), '分片重组后仍要认出并吞掉');
+});
+
 // ── 把真 server 拉起来打一遍 ────────────────────────────
 
 const cfg = load();
@@ -1458,6 +1565,49 @@ await t('没节点时 chat 返回 503 而不是挂住', async () => {
   });
   assert.equal(r.status, 503);
   assert.equal((await r.json()).error.type, 'no_nodes');
+});
+
+// ── Responses 路由(POST /v1/responses)──────────────────
+
+await t('没节点时 /v1/responses 也回 503,证明路由接上了、input 校验放行', async () => {
+  const r = await fetch(`${base}/v1/responses`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: FREE_MODELS[0], input: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 503);
+  assert.equal((await r.json()).error.type, 'no_nodes', '错误体是 OpenAI 同形 {error:{type}}');
+});
+
+await t('/v1/responses 缺 input:400,而不是打到上游', async () => {
+  const r = await fetch(`${base}/v1/responses`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: FREE_MODELS[0] }),
+  });
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error.type, 'invalid_request_error');
+});
+
+await t('/v1/responses 模型不在免费清单:400 invalid_model', async () => {
+  const r = await fetch(`${base}/v1/responses`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${cfg.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5-turbo-ultra', input: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 400);
+  const j = await r.json();
+  assert.equal(j.error.type, 'invalid_model');
+  assert.match(j.error.message, /gpt-5-turbo-ultra/);
+});
+
+await t('/v1/responses 认 Bearer,不带 Key 是 401(OpenAI 形状的错误体)', async () => {
+  const r = await fetch(`${base}/v1/responses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: FREE_MODELS[0], input: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(r.status, 401);
+  assert.equal((await r.json()).error.type, 'authentication_error');
 });
 
 // ── 严格模型透传 ────────────────────────────────────────

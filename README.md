@@ -2,7 +2,7 @@
 
 来都来了 不点个⭐再走吗~?
 
-把 [opencode zen](https://opencode.ai) 的免费模型包成一个本地网关,同时支持 **OpenAI** 和 **Anthropic** 两种协议。
+把 [opencode zen](https://opencode.ai) 的免费模型包成一个本地网关,同时支持 **OpenAI**(Chat Completions、Responses)和 **Anthropic** 协议。
 
 出口走你自己的机场节点(内置 mihomo 解析订阅),撞到 429 自动换下一个节点 —— 因为免费额度是**按出口 IP 计**的,换 IP 就等于换额度池。
 
@@ -106,6 +106,22 @@ curl http://127.0.0.1:9527/v1/chat/completions \
 
 Cherry Studio / Chatbox / LobeChat / 任何填得了 Base URL 的客户端,照常填 `http://127.0.0.1:9527/v1` + Key。
 
+### OpenAI Responses 协议
+
+```bash
+curl http://127.0.0.1:9527/v1/responses \
+  -H "Authorization: Bearer <你的 Key>" \
+  -H "content-type: application/json" \
+  -d '{"model":"big-pickle","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+```
+
+上游 zen 原生就说 Responses,所以这条和 OpenAI 协议一样**近乎透传** —— body 不翻译、成功体原样回,`/v1` 基址和 Bearer Key 都跟 chat/completions 共用。文本、函数调用(flat 格式 `{type:"function",name,parameters}`)、`reasoning.effort` 都实测通,流式非流式都支持。Codex CLI 这类走 Responses 的客户端填 `http://127.0.0.1:9527/v1` 就行。
+
+两个必须知道的点:
+
+- **`input` 得传数组。** 官方 SDK 允许 `"input":"hi"` 这种字符串,但上游只认数组,纯字符串会被回 400 `Empty input messages`。网关会把字符串补成 `[{role:"user",content:[{type:"input_text",text}]}]` 再发,已经是数组的原样过 —— 两种写法都能用,只是别指望上游自己认字符串。
+- **流式里有一类模型会漏个杂块,网关替你吞了。** zen 的 Responses 流是精简事件集(纯文本只有 `response.output_text.delta` / `response.completed` / `ping`,函数调用另加 `output_item.added` + `function_call_arguments.delta`)。其中 `deepseek-v4-flash` / `hy3` 这类收尾没翻干净:`response.completed` 不带 usage,末尾反而漏出一个原始 `chat.completion.chunk`。严格的 Responses 客户端(官方 SDK)碰到这个非 `response.*` 的块会解析报错,所以网关的流式 sink 按行把它拦掉(它携带的 usage 照样记进面板,不靠转发)。干净型模型(big-pickle / nemotron / laguna)不漏,这层对它们等同透传。
+
 ### Anthropic 协议(Claude Code、Cline)
 
 ```bash
@@ -147,6 +163,7 @@ openai-compatibility:
 | 路由 | 协议 | 说明 |
 | --- | --- | --- |
 | `POST /v1/chat/completions` | OpenAI | 流式/非流式都支持,流式原样透传 |
+| `POST /v1/responses` | OpenAI Responses | 流式/非流式都支持,近乎透传;`input` 允许字符串(补成数组),流式吞掉一类模型漏出的 chat 杂块 |
 | `POST /v1/messages` | Anthropic | 非流式转形状,流式实时翻译成 Messages 事件 |
 | `POST /v1/messages/count_tokens` | Anthropic | 估算值。缺这个路由 Claude Code 开工前就退出了 |
 | `GET /v1/models` | 两者 | |
@@ -286,14 +303,14 @@ npm run verify:logout     # 无头浏览器走一遍登录/退出登录(要 Chro
 server/
   index.mjs      路由、静态文件、面板 API
   auth.mjs       凭据校验、会话表、失败限速(纯逻辑,不碰 http)
-  gateway.mjs    上游转发、节点轮换、方言分发(OPENAI / ANTHROPIC)
+  gateway.mjs    上游转发、节点轮换、方言分发(OPENAI / ANTHROPIC / RESPONSES)
   anthropic.mjs  Messages ⇄ Chat Completions 转换 + SSE 状态机
   mihomo.mjs     内核进程和控制端口
   config.mjs     配置读写、mihomo yaml 生成
   build.mjs      构建 hash(环境变量 → git)、跟 GitHub 比新旧
 ```
 
-加协议就多写一个 dialect 对象(`toUpstream` / `validate` / `respond` / `sink` / `fail`),轮换和冷却那套逻辑不用动。
+加协议就多写一个 dialect 对象(`toUpstream` / `validate` / `respond` / `sink` / `fail`,外加上游 `path` 和 `applyEffort`),轮换和冷却那套逻辑不用动。
 
 ---
 

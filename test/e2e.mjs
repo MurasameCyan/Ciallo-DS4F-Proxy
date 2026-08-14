@@ -277,6 +277,80 @@ const no = (m) => { bad++; console.log(`  FAIL ${m}`); };
     : no(`中途失败末事件是 ${events.at(-1)}`);
 }
 
+// ── Responses:非流式透传 + 字符串 input 补数组 + 嵌套 reasoning.effort ──
+// 上游原生支持 Responses(见 gateway 的 RESPONSES 方言),所以这条是「近乎透传」。
+{
+  const savedFwd = gw.forward;
+  let rsent = null;
+  gw.forward = async (body) => {
+    rsent = body;
+    return {
+      object: 'response', model: 'm',
+      output: [{ type: 'message', content: [{ type: 'output_text', text: '2' }] }],
+      usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+    };
+  };
+
+  const r = await fetch(`${base}/v1/responses`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer k', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] }),
+  });
+  const j = await r.json();
+  j.object === 'response' && j.output?.[0]?.content?.[0]?.text === '2'
+    ? ok('Responses 非流式原样透传(不翻译成 chat)')
+    : no(`Responses 非流式: ${JSON.stringify(j).slice(0, 150)}`);
+
+  // 字符串 input:上游只认数组(纯字符串 → 400 Empty input messages),网关补上
+  rsent = null;
+  await fetch(`${base}/v1/responses`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer k', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, input: 'hi', reasoning: { effort: 'medium' } }),
+  }).then((x) => x.text());
+  Array.isArray(rsent?.input) && rsent.input[0]?.content?.[0]?.text === 'hi'
+    ? ok('Responses:字符串 input 补成上游要的数组')
+    : no(`字符串 input 没补成数组:${JSON.stringify(rsent?.input)}`);
+  rsent?.reasoning?.effort === 'medium' && !('reasoning_effort' in (rsent ?? {}))
+    ? ok('Responses:思考强度进 reasoning.effort,不注入顶层 reasoning_effort')
+    : no(`reasoning 没进对地方:嵌套=${JSON.stringify(rsent?.reasoning)} 顶层=${JSON.stringify(rsent?.reasoning_effort)}`);
+
+  gw.forward = savedFwd;
+}
+
+// ── Responses 流式:response.* 原样透传,收尾漏出的 chat 杂块吞掉 ──
+{
+  const saved = gw.forwardStream;
+  gw.forwardStream = async (res, body, dialect) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    const sink = dialect.sink(res, body.model);
+    sink.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: '你好' })}\n\n`);
+    sink.write(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: '世界' })}\n\n`);
+    sink.write(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'r', usage: { input_tokens: 3, output_tokens: 2 } } })}\n\n`);
+    // 漏块型模型(deepseek/hy3)收尾漏出的原始 chat 块,严格 Responses 客户端会解析报错
+    sink.write(`data: ${JSON.stringify({ object: 'chat.completion.chunk', usage: { prompt_tokens: 3, completion_tokens: 2 } })}\n\n`);
+    sink.write('data: [DONE]\n\n');
+    sink.end();
+    return { ok: true, usage: { input_tokens: 3, output_tokens: 2 } };
+  };
+
+  const r = await fetch(`${base}/v1/responses`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer k', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, stream: true, input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] }),
+  });
+  const body = await r.text();
+  const text = [...body.matchAll(/"delta":"([^"]*)"/g)].map((m) => m[1]).join('');
+
+  text === '你好世界' ? ok('Responses 流式:正文事件完整透传') : no(`Responses 流式文本对不上:「${text}」`);
+  body.includes('response.completed') ? ok('Responses 流式:completed 事件透传') : no('Responses 流式 completed 丢了');
+  !body.includes('chat.completion.chunk') ? ok('Responses 流式:收尾漏出的 chat 杂块被吞掉') : no('chat 杂块漏给了严格客户端');
+  !body.includes('event: ') ? ok('Responses 流式:裸 data: 帧,没被 Anthropic 那套改写') : no('Responses 流式混进了 event: 行');
+  body.includes('[DONE]') ? ok('Responses 流式:[DONE] 原样透传') : no('Responses 流式 [DONE] 丢了');
+
+  gw.forwardStream = saved;
+}
+
 await new Promise((r) => app.close(r));
 await new Promise((r) => ctrl.close(r));
 fs.rmSync(TMP, { recursive: true, force: true });

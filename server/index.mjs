@@ -15,7 +15,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
-import { Gateway, OPENAI, ANTHROPIC, json } from './gateway.mjs';
+import { Gateway, OPENAI, ANTHROPIC, RESPONSES, json } from './gateway.mjs';
 import { buildInfo, checkUpdate } from './build.mjs';
 import {
   matches, parseBasic, readCookie, resolveCredentials,
@@ -153,8 +153,11 @@ export function createApp({ cfg, creds, gateway, subscriptionUpdater = null }) {
       if (req.method === 'OPTIONS') return void res.writeHead(204).end();
 
       // 连错误体都得说对方言:Anthropic SDK 读不懂 {error:{message}},
-      // 它会把畸形响应当成别的问题,把人往错方向带(实测就是这么被坑的)
-      const D = path.startsWith('/v1/messages') ? ANTHROPIC : OPENAI;
+      // 它会把畸形响应当成别的问题,把人往错方向带(实测就是这么被坑的)。
+      // Responses 的错误体和 OpenAI 同形,复用它那套壳即可。
+      const D = path.startsWith('/v1/messages') ? ANTHROPIC
+        : path.startsWith('/v1/responses') ? RESPONSES
+          : OPENAI;
 
       if (!gateway.checkKey(req)) return D.fail(res, 401, 'Invalid API key', 'authentication_error');
       if (gateway.paused) {
@@ -169,6 +172,8 @@ export function createApp({ cfg, creds, gateway, subscriptionUpdater = null }) {
       });
       if (path === '/v1/chat/completions' && req.method === 'POST') return run(gateway.handleChat(req, res));
       if (path === '/v1/messages' && req.method === 'POST') return run(gateway.handleMessages(req, res));
+      // OpenAI Responses API。上游原生支持(见 gateway 的 RESPONSES 方言),透传而非翻译。
+      if (path === '/v1/responses' && req.method === 'POST') return run(gateway.handleResponses(req, res));
       // Claude Code 等客户端开工前会先问一次 token 数,没有这个路由它直接报错退出
       if (path === '/v1/messages/count_tokens' && req.method === 'POST') return run(gateway.handleCountTokens(req, res));
 

@@ -22,6 +22,9 @@ import { safeEqual } from './auth.mjs';
 
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
+// 上游原生支持 Responses API,走这条透传而不是翻译成 chat 再转回来(实测见
+// zen-responses-native)。方言各自带上游 path,轮换逻辑不用知道自己在服务哪个。
+const RESPONSES_PATH = '/zen/v1/responses';
 const MODELS_PATH = '/zen/v1/models';
 // 429 但上游没给 Retry-After 时的兜底冷却。配套「解冻排队尾」(见 rankNodes):
 // 解冻的节点不再凭低延迟插回队首,而是排到没限流过的节点后面,所以短冷却不会再
@@ -173,23 +176,28 @@ export function pickFreeModels(ids) {
 }
 
 /**
- * 方言。/v1/chat/completions 和 /v1/messages 共用同一套节点轮换、冷却、重试,
- * 差别只有三件事:请求怎么进来、成功体怎么写回去、错误体和 SSE 事件长什么样。
- * 把这三件事收进一个对象,轮换逻辑就完全不用知道自己在服务哪个 API ——
- * 否则每个 return 点都要 if (isAnthropic),漏一个就是形状错乱的响应。
+ * 方言。/v1/chat/completions、/v1/messages、/v1/responses 共用同一套节点轮换、
+ * 冷却、重试,差别只有几件事:请求怎么进来、成功体怎么写回去、错误体和 SSE
+ * 事件长什么样、以及上游 path 和思考强度往哪个字段塞。把这些收进一个对象,
+ * 轮换逻辑就完全不用知道自己在服务哪个 API —— 否则每个 return 点都要 if,
+ * 漏一个就是形状错乱的响应。
  */
 export const OPENAI = {
   name: 'openai',
+  path: CHAT_PATH,
   /** 客户端选哪个模型就用哪个 —— handleChat 已经拿实时免费清单挡过一道了 */
   toUpstream: (body) => body,
   validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages required'),
   fail: (res, status, message, type, extra) => json(res, { error: { message, type, ...extra } }, status),
+  // 顶层 reasoning_effort:有值覆盖,空值删掉(收敛客户端的乱值和会被丢的顶档别名)
+  applyEffort: (body, effort) => { if (effort) body.reasoning_effort = effort; else delete body.reasoning_effort; },
   respond: (res, oai) => json(res, oai),
   sink: (res) => rawSink(res),
 };
 
 export const ANTHROPIC = {
   name: 'anthropic',
+  path: CHAT_PATH,
   // anthropicToOpenAI 已经把 req.model 抄进去了,这里不再覆盖
   toUpstream: (body) => anthropicToOpenAI(body),
   validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages: at least one message required'),
@@ -201,8 +209,40 @@ export const ANTHROPIC = {
     const s = extra?.cooldown?.[0]?.remain;
     return json(res, anthropicError(s ? `${message}(约 ${s}s 后恢复)` : message, errTypeFor(status)), status);
   },
+  // anthropicToOpenAI 已经把强度转进了 reasoning_effort,这里和 OpenAI 同款收敛
+  applyEffort: (body, effort) => { if (effort) body.reasoning_effort = effort; else delete body.reasoning_effort; },
   respond: (res, oai, model) => json(res, openAIToAnthropic(oai, model)),
   sink: (res, model) => anthropicSink(res, model),
+};
+
+/**
+ * OpenAI Responses API。上游原生支持(见 zen-responses-native),所以这条是
+ * 近乎透传:body 形状不翻译、成功体原样回。只有两处非做不可的薄处理 ——
+ *   1. 思考强度走嵌套 reasoning.effort,不是 chat 的顶层 reasoning_effort;
+ *   2. 流式 sink 必须行级感知,拦掉一类模型收尾时漏出的 chat.completion.chunk
+ *      杂块(见 responsesSink),纯字节透传会让严格的 Responses 客户端解析报错。
+ */
+export const RESPONSES = {
+  name: 'responses',
+  path: RESPONSES_PATH,
+  // OpenAI SDK 允许 input 是字符串,但上游只认数组(纯字符串 → 400 Empty input
+  // messages),所以补成数组;已经是数组的原样透传。
+  toUpstream: (body) => (typeof body.input === 'string'
+    ? { ...body, input: [{ role: 'user', content: [{ type: 'input_text', text: body.input }] }] }
+    : body),
+  validate: (b) => ((Array.isArray(b.input) && b.input.length) || (typeof b.input === 'string' && b.input.trim())
+    ? null : 'input required'),
+  // Responses 的错误体和 OpenAI 同形 {error:{message,type}},复用即可
+  fail: (res, status, message, type, extra) => json(res, { error: { message, type, ...extra } }, status),
+  // 嵌套 reasoning.effort:保留客户端可能带的 summary 等其它 reasoning 字段,
+  // 只改 effort;删到空对象就把 reasoning 整个去掉,别发个空壳上去
+  applyEffort: (body, effort) => {
+    const r = (body.reasoning && typeof body.reasoning === 'object') ? { ...body.reasoning } : {};
+    if (effort) r.effort = effort; else delete r.effort;
+    if (Object.keys(r).length) body.reasoning = r; else delete body.reasoning;
+  },
+  respond: (res, oai) => json(res, oai),
+  sink: (res) => responsesSink(res),
 };
 
 /** OpenAI 流:上游字节原样透传,不解析不重排 */
@@ -212,6 +252,46 @@ function rawSink(res) {
     write: (chunk) => safe(() => res.write(chunk)),
     end: () => safe(() => res.end()),
     // 已经开始吐了才失败,补不了合法结尾,只能断开让客户端自己发现
+    fail: () => safe(() => res.end()),
+  };
+}
+
+/**
+ * Responses 流:近乎透传,但要行级感知。
+ *
+ * 一类模型(deepseek-v4-flash / hy3 实测)收尾 usage 没翻干净:response.completed
+ * 不带 usage,末尾反而漏出一个原始 {object:"chat.completion.chunk"} 再跟 [DONE]。
+ * 那个杂块没有 Responses 的 type 字段,严格的 Responses 客户端(官方 SDK)碰到
+ * 会解析报错,所以这里按行把它吞掉。它携带的 usage 由 forwardStream 单独抓走记账
+ * (见那里的双命名兜底),不靠转发 —— 所以吞掉不影响面板 token 统计。
+ *
+ * 干净型模型(big-pickle / nemotron 等)根本不漏这个块,这层对它们等同透传。
+ */
+function responsesSink(res) {
+  const safe = (fn) => { try { fn(); } catch {} };
+  let buf = '';
+  // 按行判断:只有确认是 chat.completion.chunk 的 data 行才丢,其余(response.*
+  // 事件、空行、[DONE]、解析不了的行)一律原样转发,保住 SSE 分帧。
+  const forwardLine = (line) => {
+    if (line.startsWith('data:')) {
+      const payload = line.slice(line.indexOf(':') + 1).trim();
+      if (payload && payload !== '[DONE]') {
+        try {
+          const j = JSON.parse(payload);
+          if (j && j.object === 'chat.completion.chunk') return;
+        } catch {}
+      }
+    }
+    safe(() => res.write(line + '\n'));
+  };
+  return {
+    write: (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();          // 末行可能被截断,留着等下一个 chunk
+      for (const line of lines) forwardLine(line);
+    },
+    end: () => { if (buf) { forwardLine(buf); buf = ''; } safe(() => res.end()); },
     fail: () => safe(() => res.end()),
   };
 }
@@ -284,15 +364,18 @@ export const CALL_LOG_LIMIT = 200;
 /**
  * 上游 usage → 统一字段名。
  *
- * 缓存 token 各家字段名都不一样,而上游会把底层模型的 usage 原样带出来,
- * 所以见到哪个认哪个:OpenAI 是 prompt_tokens_details.cached_tokens,
- * Anthropic 风格是 cache_read_input_tokens / cache_creation_input_tokens。
- * 一个都没有时 token 仍归一成 0,另用 hasCacheData 标明「无数据」,
- * 避免面板把「上游没报」误显示成「明确 0%」。
+ * 两套命名都认:chat 是 prompt_tokens/completion_tokens,Responses 是
+ * input_tokens/output_tokens(见 zen-responses-native)。缓存 token 各家字段名
+ * 也不一样,而上游会把底层模型的 usage 原样带出来,所以见到哪个认哪个:
+ * OpenAI 是 prompt_tokens_details.cached_tokens,Responses 是
+ * input_tokens_details.cached_tokens,Anthropic 风格是 cache_read_input_tokens /
+ * cache_creation_input_tokens。一个都没有时 token 仍归一成 0,另用 hasCacheData
+ * 标明「无数据」,避免面板把「上游没报」误显示成「明确 0%」。
  */
 export function readUsage(u) {
-  const pt = Number(u?.prompt_tokens) || 0;
-  const ct = Number(u?.completion_tokens) || 0;
+  // ?? 而不是 ||:上游明确报的 0 是有意义的,不能被另一套命名顶掉
+  const pt = Number(u?.prompt_tokens ?? u?.input_tokens) || 0;
+  const ct = Number(u?.completion_tokens ?? u?.output_tokens) || 0;
   const num = (...vals) => {
     for (const v of vals) { const n = Number(v); if (Number.isFinite(n) && n > 0) return n; }
     return 0;
@@ -301,13 +384,15 @@ export function readUsage(u) {
   return {
     promptTokens: pt,
     completionTokens: ct,
-    reasoningTokens: Number(u?.completion_tokens_details?.reasoning_tokens) || 0,
+    reasoningTokens: Number(u?.completion_tokens_details?.reasoning_tokens
+      ?? u?.output_tokens_details?.reasoning_tokens) || 0,
     totalTokens: Number(u?.total_tokens) || pt + ct,
-    cacheReadTokens: num(u?.prompt_tokens_details?.cached_tokens, u?.cache_read_input_tokens, u?.prompt_cache_hit_tokens),
+    cacheReadTokens: num(u?.prompt_tokens_details?.cached_tokens, u?.input_tokens_details?.cached_tokens,
+      u?.cache_read_input_tokens, u?.prompt_cache_hit_tokens),
     cacheWriteTokens: num(u?.cache_creation_input_tokens, u?.prompt_tokens_details?.cache_creation_tokens),
     hasCacheData: has(
-      [u?.prompt_tokens_details, 'cached_tokens'], [u, 'cache_read_input_tokens'],
-      [u, 'prompt_cache_hit_tokens'], [u, 'cache_creation_input_tokens'],
+      [u?.prompt_tokens_details, 'cached_tokens'], [u?.input_tokens_details, 'cached_tokens'],
+      [u, 'cache_read_input_tokens'], [u, 'prompt_cache_hit_tokens'], [u, 'cache_creation_input_tokens'],
       [u?.prompt_tokens_details, 'cache_creation_tokens'],
     ),
   };
@@ -821,15 +906,15 @@ export class Gateway {
      * 这个模型认的档位或 ''。
      *
      * 空值不发字段 —— 随上游自己的默认(DS4F 是 high);有值就覆盖掉 body 里
-     * 原有的,这样 OpenAI 路径带着的乱值(客户端写了个 foo)和会被上游丢掉的
-     * 顶档别名(xhigh)都在这儿收敛掉。Anthropic 路径的 body 已经转换过一遍,
-     * 这里用的是同一个函数、同一个 model,结果一致。
+     * 原有的,这样带着的乱值(客户端写了个 foo)和会被上游丢掉的顶档别名
+     * (xhigh)都在这儿收敛掉。往哪个字段塞由方言定:chat/messages 是顶层
+     * reasoning_effort,Responses 是嵌套 reasoning.effort —— 塞错字段上游会忽略,
+     * 于是「客户端设了 max 却没生效」。
      *
      * 必须放在 body.model 定案之后:顶档叫 max 还是 high 取决于模型。
      */
     const effort = reasoningEffort(inbound, model);
-    if (effort) body.reasoning_effort = effort;
-    else delete body.reasoning_effort;
+    dialect.applyEffort(body, effort);
 
     // 身份头在这儿构造一次,再传给下面每一次尝试 —— 换节点重试时 request/session ID
     // 必须还是同一个,否则上游看到的是几个互不相干的新会话
@@ -849,6 +934,11 @@ export class Gateway {
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
   async handleMessages(req, res) {
     return this.handleChat(req, res, ANTHROPIC);
+  }
+
+  /** OpenAI Responses API 入口。上游原生支持,同一条路换个方言(近乎透传)。 */
+  async handleResponses(req, res) {
+    return this.handleChat(req, res, RESPONSES);
   }
 
   /** 选定本次要用的节点并让 mihomo 切过去;返回节点名,失败返回 null(已响应) */
@@ -940,7 +1030,7 @@ export class Gateway {
       try {
         const result = wantStream
           ? await this.forwardStream(res, body, dialect, left(), identity)
-          : await this.forward(body, left(), identity);
+          : await this.forward(body, left(), identity, dialect.path);
 
         const dt = Date.now() - t0;
         if (wantStream) {
@@ -1056,11 +1146,13 @@ export class Gateway {
           continue;
         }
 
-        // 400/500 之类:换节点也是同样结果,直接把上游的话原样带回去
+        // 400/500 之类:换节点也是同样结果,直接把上游的话原样带回去。
+        // OpenAI 和 Responses 的错误体本来就是 {error:{...}} 同形,原样透传;
+        // 只有 Anthropic 客户端读不懂,得摘成 message 塞进它那套壳里。
         this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
         this.usage.record(body.model, null, false);
         this.logger('error', `[chat] HTTP ${status}: ${String(e.body).slice(0, 300)}`);
-        if (dialect === OPENAI) {
+        if (dialect === OPENAI || dialect === RESPONSES) {
           let payload;
           try { payload = JSON.parse(e.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
           return json(res, payload, status);
@@ -1085,11 +1177,11 @@ export class Gateway {
    * identity 非空时(实验开关开着)覆盖掉 User-Agent 并补上 OpenCode 那组头,
    * 见 identityHeaders。关着的时候这里的行为和以前一模一样。
    */
-  reqOpts(bodyStr, { accept, timeout, identity = null }) {
+  reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH }) {
     return {
       host: OPENCODE_HOST,
       port: 443,
-      path: CHAT_PATH,
+      path,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1103,13 +1195,13 @@ export class Gateway {
     };
   }
 
-  forward(body, budget = Infinity, identity = null) {
+  forward(body, budget = Infinity, identity = null, path = CHAT_PATH) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: false });
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       const t0 = Date.now();
-      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path }), (resp) => {
         let data = '';
         // 非流式的「首字」= 上游开始回话的时刻。整个 body 是一次攒完的,
         // 所以它和总耗时差的就是传输那点时间,不像流式那样能差几十秒
@@ -1165,7 +1257,7 @@ export class Gateway {
       let firstByte = 0;
       const finish = (fn) => { if (!settled) { settled = true; fn(); } };
 
-      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path }), (resp) => {
         if (resp.statusCode !== 200) {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
@@ -1204,7 +1296,11 @@ export class Gateway {
             if (!line.startsWith('data: ') || line.includes('[DONE]')) continue;
             try {
               const j = JSON.parse(line.slice(6));
-              if (j.usage) usage = j.usage;
+              // usage 可能在三处:chat 流的顶层 j.usage(Responses 漏块型模型收尾
+              // 漏出的 chat.completion.chunk 也在这)、Responses 干净型模型的
+              // response.completed.response.usage。两套命名的归一交给 readUsage。
+              const u = j.usage || j.response?.usage;
+              if (u) usage = u;
             } catch {}
           }
         });
