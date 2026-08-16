@@ -392,6 +392,8 @@ async function refresh() {
     // 开关同理:用户刚点完还没提交时别被轮询拨回去
     const idt = $('f-identity');
     if (document.activeElement !== idt) idt.checked = S.cfg.opencodeIdentityHeaders === true;
+    const persist = $('f-persist');
+    if (document.activeElement !== persist) persist.checked = S.cfg.persistUsage === true;
     const hours = $('f-sub-hours');
     if (document.activeElement !== hours) hours.value = S.cfg.subscriptionUpdateHours || 0;
     syncIdentityTag();
@@ -580,6 +582,20 @@ function wire() {
 
   // 勾了就立刻改标签文字,不等「保存并应用」—— 但真正生效还是在提交之后
   $('f-identity').onchange = syncIdentityTag;
+
+  // 统计持久化开关独立于配置表:它和订阅/内核无关,点一下立即生效,
+  // 不用等「保存并应用」。单独 POST 到 /api/config 只带这一个字段。
+  $('f-persist').onchange = async (e) => {
+    const on = e.target.checked;
+    try {
+      await api('/config', { method: 'POST', body: JSON.stringify({ persistUsage: on }) });
+      S.cfg.persistUsage = on;
+      toast(on ? '统计持久储存已开启,重启不再清零' : '统计持久储存已关闭,重启后统计清零', 'ok');
+    } catch (err) {
+      toast(`持久储存切换失败:${err.message}`, 'err');
+      e.target.checked = !on;   // 失败拨回,别让界面和服务端不一致
+    }
+  };
 
   for (const seg of document.querySelectorAll('.seg')) {
     seg.onclick = () => {

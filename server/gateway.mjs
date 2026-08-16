@@ -569,14 +569,20 @@ export class NodeCooldown {
 
 /** token 用量统计,持久化到 /data,重启不丢 */
 export class UsageTracker {
-  constructor(filePath = USAGE_FILE, logger = null) {
+  /**
+   * persist = false 时整个统计只在内存里,不读盘也不写盘 —— 面板上那个
+   * 「统计数据持久储存」开关关掉之后,进程一重启统计就从零开始。
+   * 开关是运行时可切的,所以这里把开关留成可变的 this.persist,而不是构造时定死。
+   */
+  constructor(filePath = USAGE_FILE, logger = null, persist = true) {
     this.filePath = filePath;
     this.logger = logger;
+    this.persist = persist;
     this.data = this.load();
   }
   load() {
     try {
-      if (fs.existsSync(this.filePath)) {
+      if (this.persist && fs.existsSync(this.filePath)) {
         const d = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
         // 字段都是逐步加的:旧桶和空桶合并默认值,既保留历史数,
         // 又避免后续做 `undefined += 2` 变成 NaN(JSON 落盘时会写成 null)
@@ -602,9 +608,21 @@ export class UsageTracker {
     return { total: blankTotals(), byDay: {}, byModel: {}, byNode: {}, calls: [], lastRequest: null, startTime: Date.now() };
   }
   save() {
+    if (!this.persist) return;
     try {
       fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
     } catch (e) { this.logger?.('warn', `[usage] 保存失败: ${e.message}`); }
+  }
+
+  /**
+   * 运行时切换持久化开关。开的那一下把当前(内存里的)统计落一次盘,
+   * 让之后的重启能接着这份数而不是从零开始;关掉只是停写,已经写的文件不动。
+   */
+  setPersist(on) {
+    const was = this.persist;
+    this.persist = on === true;
+    if (this.persist && !was) this.save();
+    return this.persist;
   }
   /** 客户端请求口径:一个客户端请求一次,不管中间换了几个节点 */
   record(model, usage, success) {
@@ -699,7 +717,7 @@ export class Gateway {
     this.config = cfg;          // { apiKey, port, ... },外部改了这里立即生效
     this.logger = logger;
     this.cooldown = new NodeCooldown();
-    this.usage = new UsageTracker(USAGE_FILE, logger);
+    this.usage = new UsageTracker(USAGE_FILE, logger, cfg.persistUsage === true);
     this.agent = new MihomoAgent(MIXED_PORT);
     this.nodeCache = null;
     this.nodeCacheTime = 0;

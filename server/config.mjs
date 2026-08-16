@@ -31,6 +31,7 @@ export const POOL_NAME = 'zen-pool';
 const DEFAULTS = {
   subscriptionUrl: '', apiKey: '', port: 9527,
   opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
+  persistUsage: false,
 };
 
 export function genApiKey() {
@@ -63,6 +64,7 @@ export function load() {
   // 旧 config.json 里没有这个字段,读出来是 undefined —— 归一成布尔,
   // 免得前端的 toggle 拿到 undefined 显示成不确定状态
   cfg.opencodeIdentityHeaders = cfg.opencodeIdentityHeaders === true;
+  cfg.persistUsage = cfg.persistUsage === true;
   const hours = Number(cfg.subscriptionUpdateHours);
   cfg.subscriptionUpdateHours = Number.isInteger(hours) && hours >= 0 && hours <= 8760
     ? hours : DEFAULTS.subscriptionUpdateHours;
@@ -79,11 +81,13 @@ export function save(cfg) {
   const {
     subscriptionUrl = '', apiKey = '', port = 9527,
     opencodeIdentityHeaders = false, subscriptionUpdateHours = 1,
+    persistUsage = false,
   } = cfg;
   fs.writeFileSync(CONFIG_FILE, JSON.stringify({
     subscriptionUrl, apiKey, port,
     opencodeIdentityHeaders: opencodeIdentityHeaders === true,
     subscriptionUpdateHours,
+    persistUsage: persistUsage === true,
   }, null, 2), 'utf8');
 }
 

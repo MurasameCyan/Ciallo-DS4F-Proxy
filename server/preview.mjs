@@ -58,6 +58,7 @@ const state = {
     subscriptionUrl: 'https://demo.example.com/subscribe?token=preview',
     apiKey: 'zen-a1b2c3d4', port: 9527,
     opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
+    persistUsage: false,
   },
   build: '9dfba56',
   hasUpdate: false,
@@ -356,6 +357,10 @@ async function handleApi(req, res, path) {
       log('info', state.cfg.subscriptionUpdateHours
         ? `[sub-auto] 每 ${state.cfg.subscriptionUpdateHours} 小时自动更新并测速`
         : '[sub-auto] 自动更新已关闭');
+    }
+    if (b.persistUsage !== undefined) {
+      state.cfg.persistUsage = b.persistUsage === true;
+      log('info', state.cfg.persistUsage ? '[usage] 统计持久储存已开启' : '[usage] 统计持久储存已关闭');
     }
     log('info', '[config] 已保存');
     if (b.subscriptionUrl === undefined) {

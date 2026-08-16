@@ -298,6 +298,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
         subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
         opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
         subscriptionUpdateHours: cfg.subscriptionUpdateHours,
+        persistUsage: cfg.persistUsage,
       });
     }
 
@@ -325,6 +326,12 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
         cfg.opencodeIdentityHeaders = b.opencodeIdentityHeaders === true;
       }
       cfg.subscriptionUpdateHours = nextHours;
+      // 统计持久化开关即时生效:关掉立即停写,开的那一下把内存里的数落一次盘。
+      // 它在保存时并不和订阅地址一起强制重拉 —— 它跟订阅/内核没有任何关系。
+      if (b.persistUsage !== undefined) {
+        cfg.persistUsage = b.persistUsage === true;
+        gateway.usage.setPersist(cfg.persistUsage);
+      }
 
       // 端口刻意不接受修改。容器对外端口由 compose 的 ports 决定,进程改绑
       // 只会让映射指向一个没人听的地方;而 /api/status 会把新值报给前端,
@@ -384,6 +391,7 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
         subscriptionUrl: cfg.subscriptionUrl, apiKey: cfg.apiKey, port: cfg.port,
         opencodeIdentityHeaders: cfg.opencodeIdentityHeaders,
         subscriptionUpdateHours: cfg.subscriptionUpdateHours,
+        persistUsage: cfg.persistUsage,
         nodes: refreshed,   // 前端据此提示「刷到了几个节点」,null=没订阅地址
         speed,              // {tested,alive,dead,fastest,ms};null=没测或还没测完
       });

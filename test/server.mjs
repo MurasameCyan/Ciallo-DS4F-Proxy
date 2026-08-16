@@ -176,6 +176,35 @@ await t('reset 把三个维度一起清空,并且落盘', () => {
   assert.equal(new UsageTracker(f, () => {}).getStats().total.requests, 0);
 });
 
+await t('persist=false 时不读盘也不写盘,关掉后重启统计从零开始', () => {
+  const f = path.join(TMP, 'np.json');
+  // 盘上先放一份历史数据:persist=false 的实例不该读到它
+  fs.writeFileSync(f, JSON.stringify({ total: { requests: 99 } }));
+  const u = new UsageTracker(f, () => {}, false);
+  assert.equal(u.getStats().total.requests, 0, '关掉持久化就不能把旧账读回来');
+  u.record('m', { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, true);
+  // 别被上面的旧文件骗到:record 里这次 save 是 no-op,盘上仍是 99 那条
+  const onDisk = JSON.parse(fs.readFileSync(f, 'utf8'));
+  assert.equal(onDisk.total.requests, 99, 'persist=false 时 record 不得写盘');
+  assert.equal(u.getStats().total.requests, 1, '内存里的数照常累加');
+});
+
+await t('setPersist 开的那一下把内存里的数落一次盘,关掉只停写', () => {
+  const f = path.join(TMP, 'sp.json');
+  const u = new UsageTracker(f, () => {}, false);
+  u.record('m', { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }, true);
+  assert.equal(fs.existsSync(f), false, '关着的时候从不写文件');
+
+  u.setPersist(true);
+  assert.equal(fs.existsSync(f), true, '打开的那一刻应该立刻落盘,让之后的重启接得上');
+  const reload = new UsageTracker(f, () => {});
+  assert.equal(reload.getStats().total.totalTokens, 5, '落盘的内容要能被重新读回');
+
+  u.record('m', { total_tokens: 1 }, true);
+  assert.equal(new UsageTracker(f, () => {}).getStats().total.requests, 2, '开启后继续正常累加');
+  u.setPersist(false);   // 关掉:只是停写,已经写的文件不动
+});
+
 // ── 节点尝试口径(byNode)────────────────────────────────
 
 await t('recordAttempt 按结果分类,四类互斥只加一个', () => {
@@ -1522,9 +1551,10 @@ await t('带对凭据能读到配置和状态', async () => {
   const r = await fetch(`${base}/api/config`, { headers: { authorization: auth } });
   assert.equal(r.status, 200);
   const j = await r.json();
-  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'opencodeIdentityHeaders', 'port', 'subscriptionUpdateHours', 'subscriptionUrl'], '字段形状是前端契约,不能改');
+  assert.deepEqual(Object.keys(j).sort(), ['apiKey', 'opencodeIdentityHeaders', 'persistUsage', 'port', 'subscriptionUpdateHours', 'subscriptionUrl'], '字段形状是前端契约,不能改');
   assert.equal(j.opencodeIdentityHeaders, false, '请求头开关默认关');
   assert.equal(j.subscriptionUpdateHours, 1, '保持旧版每小时自动更新的默认行为');
+  assert.equal(j.persistUsage, false, '统计持久储存默认关');
 
   const s = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
   assert.equal(s.fixedModel, undefined, '固定模型已废,留着这个字段会让前端以为还能靠它');
@@ -1719,6 +1749,50 @@ await t('旧 config.json 没有身份头字段也能加载,默认关闭', () => 
     const c = load();
     assert.equal(c.opencodeIdentityHeaders, false, '默认必须是关的 —— 这是个实验开关');
     assert.equal(c.apiKey, old.apiKey, '其余字段照原样读出来,不重新生成');
+  } finally {
+    fs.writeFileSync(f, saved);
+  }
+});
+
+await t('切 persistUsage 立即生效并落盘,不触发订阅刷新', async () => {
+  let updates = 0;
+  const savedUpdate = gateway.updateProvider;
+  gateway.updateProvider = async () => { updates++; };
+  try {
+    const r = await fetch(`${base}/api/config`, {
+      method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ persistUsage: true }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).persistUsage, true);
+    assert.equal(cfg.persistUsage, true, '同一个 cfg 对象,下一个请求就用上了');
+    assert.equal(gateway.usage.persist, true, 'usage 的开关得跟着切,否则 record 还在写盘/不写盘');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(TMP, 'config.json'), 'utf8')).persistUsage, true,
+      '得落盘,不然重启就回到关闭');
+    assert.equal(updates, 0, '切持久化不能顺带触发订阅刷新');
+
+    await (await fetch(`${base}/api/config`, {
+      method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ persistUsage: false }),
+    })).text();
+    assert.equal(cfg.persistUsage, false);
+    assert.equal(gateway.usage.persist, false);
+  } finally {
+    gateway.updateProvider = savedUpdate;
+  }
+});
+
+await t('旧 config.json 没有 persistUsage 字段也默认关闭', () => {
+  // 同样:旧实例没有这个键,缺了得当「关闭」,不是 undefined。它默认关 ——
+  // 统计本来就不该在用户不知情的情况下往磁盘上写。
+  const f = path.join(TMP, 'config.json');
+  const saved = fs.readFileSync(f, 'utf8');
+  const old = JSON.parse(saved);
+  delete old.persistUsage;
+  fs.writeFileSync(f, JSON.stringify(old));
+  try {
+    const c = load();
+    assert.equal(c.persistUsage, false, '默认必须关');
   } finally {
     fs.writeFileSync(f, saved);
   }

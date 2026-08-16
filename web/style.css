@@ -230,6 +230,9 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   flex-wrap: wrap; margin-bottom: 13px;
 }
 .card-head h2 { font-size: 14px; }
+/* 概况卡头右侧的「持久储存」开关:和卡头的 .hint 一样顶到最右。
+   复用 .chk(日志那个「自动滚动」)的样式,不另做一套开关。 */
+.card-head .chk.persist { margin-left: auto; }
 .hint { color: var(--fg-2); font-size: 12px; line-height: 1.5; }
 .card-head .hint { margin-left: auto; text-align: right; }
 
