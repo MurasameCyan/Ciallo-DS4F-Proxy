@@ -230,9 +230,39 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
   flex-wrap: wrap; margin-bottom: 13px;
 }
 .card-head h2 { font-size: 14px; }
-/* 概况卡头右侧的「持久储存」开关:和卡头的 .hint 一样顶到最右。
-   复用 .chk(日志那个「自动滚动」)的样式,不另做一套开关。 */
-.card-head .chk.persist { margin-left: auto; }
+/* 概况卡头右侧的「统计持久储存」胶囊开关:顶到最右,只留开关本体不配文字。
+   原生 checkbox 视觉上藏掉,但保留在可访问性树里(焦点、读屏、键盘都靠它),
+   可见的那颗轨道和滑块是 label 内的 <span>,靠 :checked 换色换位。 */
+.card-head .switch { margin-left: auto; position: relative; display: inline-block; cursor: pointer; }
+.card-head .switch input {
+  position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer;
+}
+.card-head .switch .track {
+  display: block; width: 34px; height: 20px;
+  border-radius: 999px;
+  background: var(--line-2);
+  border: 1px solid var(--line);
+  transition: background .16s, border-color .16s;
+  position: relative;
+}
+.card-head .switch .track::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--fg-2);
+  transition: transform .16s, background .16s;
+}
+.card-head .switch input:checked ~ .track {
+  background: var(--mint);
+  border-color: transparent;
+}
+.card-head .switch input:checked ~ .track::after {
+  transform: translateX(14px);
+  background: #04201c;
+}
+/* 键盘可达:焦点环落在开关本体上(和页面其余 :focus-visible 一致) */
+.card-head .switch input:focus-visible ~ .track {
+  outline: 2px solid var(--mint); outline-offset: 2px;
+}
 .hint { color: var(--fg-2); font-size: 12px; line-height: 1.5; }
 .card-head .hint { margin-left: auto; text-align: right; }
 

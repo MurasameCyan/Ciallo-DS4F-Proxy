@@ -59,13 +59,14 @@
   <!-- 一张卡内 2×2 四格。DOM 顺序 == 视觉顺序(两列 grid 逐行填充),
        所以 Tab 和读屏顺序也就是 左上→右上→左下→右下,不用 grid 显式定位。 -->
   <section class="card" aria-labelledby="h-overview">
-    <!-- 开关在卡头右侧,点一下立即生效(不走「保存并应用」):它只管统计要不要落盘,
-         和订阅/内核没有关系。悬停 title 说明用途 —— 只有一个开关,不配额外说明行。 -->
+    <!-- 胶囊开关在卡头右侧,点一下立即生效(不走「保存并应用」):它只管统计要不要落盘,
+         和订阅/内核没有关系。只留开关本体,不配文字 —— 用途靠 title 悬停提示和
+         aria-label 说清楚(原生 checkbox 保留键盘操作与读屏播报)。 -->
     <div class="card-head"><h2 id="h-overview">概况</h2>
-      <label class="chk persist" for="f-persist"
+      <label class="switch" for="f-persist"
              title="统计数据的持久储存。开启后用量统计写入磁盘,重启容器不丢;关闭则只留在内存里,重启后清零。默认关闭。">
-        <input type="checkbox" id="f-persist">
-        <span>持久储存</span>
+        <input type="checkbox" id="f-persist" aria-label="统计持久储存">
+        <span class="track" aria-hidden="true"></span>
       </label>
     </div>
     <div class="stats">
