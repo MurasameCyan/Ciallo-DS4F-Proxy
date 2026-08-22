@@ -766,4 +766,11 @@ t('配置卡提供小时制自动更新订阅输入', () => {
   assert.match(field, /小时/);
 });
 
+t('可用性调度启动后立即复用已完成探测的下次到期时间', () => {
+  const gateway = fs.readFileSync(new URL('../server/gateway.mjs', import.meta.url), 'utf8');
+  const fn = gateway.match(/startAvailabilityScheduler\(\)[\s\S]*?\n  \}/)?.[0] || '';
+  assert.ok(fn, '应能定位可用性调度入口');
+  assert.match(fn, /immediate:\s*true/, '启动调度要立即计算临时错误的短重试,不能固定睡六小时');
+});
+
 console.log(`\ncheck.mjs: 全部通过 (${n} 组)\n`);
