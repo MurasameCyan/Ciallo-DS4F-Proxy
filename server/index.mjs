@@ -25,6 +25,16 @@ import {
 const WEB = fileURLToPath(new URL('../web/', import.meta.url));
 const MAX_LOG = 500;
 
+/**
+ * 「补探模型」这个按钮最多等多久就先回话。探测本身不会被打断 —— 超了只是不再
+ * 占着这条 HTTP 连接,结果照样落盘、逐个模型记在运行日志里。
+ *
+ * 20 秒是按「一个 262K 模型探完」量的;1M 那一档要几十秒到几分钟,那种情况
+ * 回「还在探」比让面板等到超时有用得多。createApp 上留了个口子是为了测试能把
+ * 这个分支跑到,产线不用改它。
+ */
+const PROBE_WAIT_MS = 20_000;
+
 // 登录页得在「还没登录」的时候就能显示,所以它自己和它引的两个文件要放行。
 // 只放这两条具体路径(/login 单独处理),不是整个 web/ —— 其余静态文件照旧要凭据。
 const PUBLIC_FILES = new Set(['/style.css', '/login.js']);
@@ -96,8 +106,8 @@ function isHttps(req) {
  * 建服务但不监听 —— 测试要能在临时端口上把它拉起来,
  * 所以启动副作用(写 mihomo 配置、拉内核)都不放这里。
  */
-export function createApp({ cfg, creds, gateway, subscriptionUpdater = null }) {
-  const api = makeApiRoutes({ cfg, gateway, subscriptionUpdater });
+export function createApp({ cfg, creds, gateway, subscriptionUpdater = null, probeWaitMs = PROBE_WAIT_MS }) {
+  const api = makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs });
   const sessions = new Sessions();
   // 登录页和 Basic 共用一个失败计数器 —— 分开的话锁住表单还能拿 Basic 慢慢试
   const guard = new FailWindow();
@@ -241,7 +251,7 @@ export function createApp({ cfg, creds, gateway, subscriptionUpdater = null }) {
 }
 
 /** /api/* 路由。形状与 server/preview.mjs 逐字段对齐,前端一行没改。 */
-function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
+function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_WAIT_MS }) {
   /** 重启内核期间把网关暂停,请求收 503 重试,而不是打在半死的代理上 */
   async function withPause(fn) {
     gateway.pause();
@@ -275,6 +285,12 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
         // 免费模型清单。从上游现拉(开机一次、之后每天一次),拉不到就是兜底常量 ——
         // 写死在前端的那份已经漏过一个新上线的免费模型
         models: gateway.freeModels(),
+        // 每个模型的上下文上限,只给清单里现有的那些。这张表以前手写在
+        // web/core.js 里,现在是探出来的实测记录(见 server/capabilities.mjs)——
+        // 于是下线的模型不会再挂在面板上,新上的也不用等人去补一行常量
+        ctx: gateway.modelCtx(),
+        modelsDev: gateway.modelMetadataStatus(),
+        metadata: gateway.modelMetadataMap(),
         // build / buildUrl / repoUrl / trackRef:面板右上角那个 hash 徽标。
         // 搭轮询的车带过去,不另开一个路由 —— 它是个常量,不值得再来一次请求
         ...buildInfo(),
@@ -426,6 +442,19 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater }) {
       return json(res, r);
     }
 
+    // 给清单里没有能力记录的模型补探一次。平时开机自动跑,这个按钮是给
+    // 「开机那次撞上限流被跳过了」用的 —— 探到的记录会落盘,下次不用再探。
+    //
+    // 不 await 到底:一个 1M 模型的上下文探测要几十秒到几分钟,HTTP 上挂那么久
+    // 面板只会看到超时。20 秒内探完就把结果回给它,没完就说「还在探」,
+    // 让用户去看运行日志 —— 那边逐个模型记着结果。
+    if (path === '/api/models/probe' && m === 'POST') {
+      const r = await atMost(gateway.probeCapabilities('手动'), probeWaitMs);
+      return json(res, r
+        ? { ...r, ctx: gateway.modelCtx(), running: false }
+        : { probed: [], skipped: [], note: 'running', ctx: gateway.modelCtx(), running: true });
+    }
+
     if (path === '/api/usage' && m === 'GET') return json(res, gateway.usage.getStats());
 
     if (path === '/api/usage/reset' && m === 'POST') {
@@ -560,10 +589,13 @@ async function main() {
   // 开机立刻拉一次清单。不 await:拉取要几秒,这期间面板和 /v1 都该能用
   // —— 没拉到之前用的是 FREE_MODELS 兜底,退化成旧行为而不是失败。
   // 之后每天一次(MODELS_TTL_MS),搭面板轮询的车走,不另起定时器。
-  gateway.refreshModels()
+  const modelsReady = gateway.refreshModels()
     .then((r) => log('info', `[gateway] 免费模型 ${r.models.length} 个,客户端选哪个转发哪个`))
     // 拉不到就用兜底那份跑,refreshModels 已经记过一行 warn 了。
     // 开机失败不该让进程起不来 —— 面板和 /v1 照常可用,过一天自己再拉
+    .catch(() => {});
+  gateway.refreshModelMetadata()
+    .then((r) => log('info', `[gateway] models.dev 元数据 ${r.models ?? 0} 条`))
     .catch(() => {});
 
   if (creds.generated) {
@@ -584,6 +616,11 @@ async function main() {
       // 开机测一遍延迟。不 await:测完要几秒,而这期间面板和 /v1 都该能用
       // —— 没有延迟数据时 rankNodes 原样返回订阅顺序,退化成旧行为而不是失败。
       if (n > 0) gateway.testNodes().catch((e) => log('warn', `[delay] 开机测延迟失败: ${e.message}`));
+      // 拿清单和记录对一遍,清单里没记录的现探。排在这里是因为它有两个前提:
+      // 清单要到位(不然会照着兜底常量去探),而且得有个能出站的节点。
+      // 不 await,理由同上 —— 全都有记录时它一个字节都不出站,真有新模型时
+      // 那几分钟里网关照常可用。
+      if (n > 0) modelsReady.then(() => gateway.probeCapabilities('开机'));
     } catch (e) {
       // 不退出:面板还能用,用户得进来改订阅地址。退了就只剩看 docker logs 猜。
       log('error', `[mihomo] 启动失败: ${e.message}`);

@@ -191,10 +191,13 @@
 
     <!-- 「同步模型」不在 form 里:它和订阅地址、请求头开关无关,点它不该顺带
          提交那张表(反之表单提交也不该触发一次出站拉清单)。清单平时开机拉一次、
-         之后每天一次,这颗按钮是给「上游刚上线了新模型,不想等到明天」用的。 -->
+         之后每天一次,这颗按钮是给「上游刚上线了新模型,不想等到明天」用的。
+         「补探能力」同理:开机会自动给没记录的模型探一遍上下文和思考强度,
+         这颗是给「开机那次撞上限流被跳过了」用的。 -->
     <div class="row-actions">
       <button type="button" class="btn ghost" id="btn-restart">重启内核</button>
       <button type="button" class="btn ghost" id="btn-sync">同步模型</button>
+      <button type="button" class="btn ghost" id="btn-probe">补探能力</button>
       <button type="button" class="btn ghost" id="btn-zero">清零统计</button>
       <button type="button" class="btn warn" id="btn-reset">手动重置</button>
     </div>

@@ -16,6 +16,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 
 // config.mjs 在模块加载时就定死了 DATA_DIR,所以得先设环境变量再动态 import
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ciallo-test-'));
@@ -29,13 +30,14 @@ delete process.env.SUBSCRIPTION_URL;
 delete process.env.API_KEY;
 
 const {
-  NodeCooldown, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
+  NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
+const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
 const { createApp, createSubscriptionUpdater } = indexMod;
 
@@ -479,7 +481,7 @@ await t('身份头:读入站头大小写不敏感', () => {
   assert.equal(h['x-opencode-session'], 'sess-7', '顺手去掉首尾空白');
 });
 
-await t('身份头:session 依次找三个来源', () => {
+await t('身份头:兼容旧的 session-affinity 和通用 session-id', () => {
   const a = identityHeaders({ headers: { 'x-session-affinity': 'aff-1' } }, () => 'u');
   assert.equal(a['x-opencode-session'], 'aff-1');
   const b = identityHeaders({ headers: { 'x-session-id': 'sid-1' } }, () => 'u');
@@ -487,11 +489,127 @@ await t('身份头:session 依次找三个来源', () => {
   assert.equal(b['x-session-id'], 'sid-1', 'x-session-id 本身也照原样透传');
 });
 
+await t('身份头:显式 session 按头和 body 的优先级选,不被内容 hash 覆盖', () => {
+  const body = {
+    conversation_id: 'body-conv',
+    metadata: { session_id: 'meta-session' },
+    messages: [{ role: 'user', content: 'hello' }],
+  };
+  assert.equal(identityHeaders({ headers: {
+    'x-opencode-session': 'open-session',
+    'x-session-id': 'generic-session',
+    'conversation-id': 'header-conv',
+  }, body }, () => 'req-1')['x-opencode-session'], 'open-session');
+  assert.equal(identityHeaders({ headers: {
+    'x-session-id': 'generic-session',
+    'conversation-id': 'header-conv',
+  }, body }, () => 'req-2')['x-opencode-session'], 'generic-session');
+  assert.equal(identityHeaders({ headers: { 'conversation-id': 'header-conv' }, body }, () => 'req-3')
+    ['x-opencode-session'], 'header-conv');
+  assert.equal(identityHeaders({ headers: {}, body }, () => 'req-4')['x-opencode-session'], 'body-conv');
+  assert.equal(identityHeaders({ headers: {}, body: {
+    metadata: { session_id: 'meta-session' },
+    messages: body.messages,
+  } }, () => 'req-5')['x-opencode-session'], 'meta-session');
+});
+
+await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 SHA-256 ID', () => {
+  const first = identityHeaders({ headers: {}, body: {
+    messages: [
+      { role: 'system', content: 'rules' },
+      { role: 'user', content: 'same opening' },
+    ],
+  } }, () => 'req-a');
+  const grown = identityHeaders({ headers: {}, body: {
+    messages: [
+      { role: 'system', content: 'rules changed' },
+      { role: 'user', content: 'same opening' },
+      { role: 'assistant', content: 'answer' },
+      { role: 'user', content: 'follow-up' },
+    ],
+  } }, () => 'req-b');
+  const other = identityHeaders({ headers: {}, body: {
+    messages: [{ role: 'user', content: 'different opening' }],
+  } }, () => 'req-c');
+
+  assert.match(first['x-opencode-session'], /^ses_[0-9a-f]{24}$/);
+  assert.equal(first['x-opencode-session'], grown['x-opencode-session'],
+    '对话增长后第一条 user 不变,session 就必须不变');
+  assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
+  assert.equal(first['x-opencode-request'], 'req-a', 'request ID 仍是每个请求单独生成');
+  assert.equal(grown['x-opencode-request'], 'req-b');
+});
+
+await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', async () => {
+  const cfg = { ...load(), opencodeIdentityHeaders: true };
+  const g = new Gateway(cfg, () => {});
+  g.getAllNodes = async () => ['A'];
+  g.rankNodes = (nodes) => nodes;
+  const affinityKeys = [];
+  g.ensureNode = async (...args) => { affinityKeys.push(args[5]); return 'A'; };
+
+  const sessions = [];
+  g.attempt = async (...args) => {
+    sessions.push(args[7]['x-opencode-session']);
+    assert.equal(args[9], affinityKeys.at(-1), '选点和重试必须拿同一个 affinity key');
+  };
+  const run = async (method, body) => {
+    const req = Readable.from([JSON.stringify(body)]);
+    req.headers = {};
+    await method.call(g, req, fakeRes());
+  };
+  const model = FREE_MODELS[0];
+  await run(g.handleChat, { model, messages: [{ role: 'user', content: 'same opening' }] });
+  await run(g.handleResponses, {
+    model, input: [{ role: 'user', content: [{ type: 'input_text', text: 'same opening' }] }],
+  });
+  await run(g.handleMessages, {
+    model, max_tokens: 16, messages: [{ role: 'user', content: [{ type: 'text', text: 'same opening' }] }],
+  });
+
+  assert.equal(sessions.length, 3);
+  assert.equal(new Set(sessions).size, 1, '协议形状不同,相同首条 user 内容仍应落到同一 session');
+  assert.equal(new Set(affinityKeys).size, 1, '三种协议必须共用同一套 session+model 调度键');
+});
+
 await t('身份头:不同请求的 request ID 不一样', () => {
   const a = identityHeaders({ headers: {} });
   const b = identityHeaders({ headers: {} });
   assert.notEqual(a['x-opencode-request'], b['x-opencode-request']);
   assert.match(a['x-opencode-request'], /^[0-9a-f-]{36}$/);
+});
+
+await t('会话调度:同 session+model 粘原节点,新绑定选负载最低的', () => {
+  assert.equal(typeof NodeAffinity, 'function');
+  const a = new NodeAffinity();
+  const one = a.key('session-1', 'model-a');
+  const two = a.key('session-2', 'model-a');
+  const otherModel = a.key('session-1', 'model-b');
+
+  assert.equal(a.pick(one, ['A', 'B', 'C'], { preferred: 'A' }), 'A',
+    '负载相同时兼容全局 lockedNode');
+  assert.equal(a.pick(one, ['C', 'B', 'A'], { preferred: 'C' }), 'A',
+    '已有 affinity 优先于新的 lockedNode 和排序');
+  assert.equal(a.pick(two, ['A', 'B', 'C'], { preferred: 'A' }), 'B',
+    'A 已有一个绑定,新 session 应落到零负载的 B');
+  assert.equal(a.pick(otherModel, ['A', 'B', 'C'], { preferred: 'A' }), 'C',
+    '同 session 换 model 是独立绑定,继续按负载摊开');
+  assert.deepEqual(['A', 'B', 'C'].map((node) => a.load(node)), [1, 1, 1]);
+});
+
+await t('会话调度:失败节点释放绑定并迁移,节点消失也不留脏负载', () => {
+  const a = new NodeAffinity();
+  const key = a.key('session-1', 'model-a');
+  a.bind(key, 'A');
+  a.bind(a.key('busy', 'model-a'), 'B');
+
+  assert.equal(a.migrate(key, 'A', ['A', 'B', 'C']), 'C',
+    '排除失败的 A 后,C 比已有绑定的 B 负载低');
+  assert.equal(a.get(key), 'C');
+  assert.equal(a.load('A'), 0);
+
+  assert.equal(a.pick(key, ['A', 'B']), 'A', 'C 已从候选表消失,绑定应自动迁走');
+  assert.equal(a.load('C'), 0, '失效节点的负载计数必须同步扣掉');
 });
 
 await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
@@ -505,6 +623,25 @@ await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
   assert.equal(on.headers['User-Agent'], 'opencode-cli/1.0.0', '身份头得盖掉默认的 node');
   assert.equal(on.headers['x-opencode-client'], 'cli');
   assert.equal(on.headers['Content-Length'], 2, 'Content-Length 排在身份头后面,不能被盖掉');
+});
+
+await t('Gateway 选点:旧 affinity 胜过 lockedNode,新 affinity 按绑定负载分流', async () => {
+  const g = new Gateway(load(), () => {});
+  const model = FREE_MODELS[0];
+  const oldKey = g.affinity.key('old-session', model);
+  const newKey = g.affinity.key('new-session', model);
+  g.affinity.bind(oldKey, 'A');
+  g.lockedNode = 'A';
+  g.cur = 'A';
+  g.getCurrentNode = async () => g.cur;
+  g.switchNode = async (node) => { g.cur = node; return true; };
+
+  const fresh = await g.ensureNode(['A', 'B'], fakeRes(), OPENAI, Date.now() + 10_000, model, newKey);
+  assert.equal(fresh, 'B', 'A 已有绑定,新 session 应选零负载的 B,不能被全局锁吞掉');
+  assert.equal(g.affinity.get(newKey), 'B');
+
+  const sticky = await g.ensureNode(['B', 'A'], fakeRes(), OPENAI, Date.now() + 10_000, model, oldKey);
+  assert.equal(sticky, 'A', '已有 session 仍回原节点,即使 lockedNode/数组顺序指向别处');
 });
 
 // ── 两套账在重试循环里怎么分叉 ──────────────────────────
@@ -531,7 +668,9 @@ function retryGateway(file, script) {
   g.switchNode = async (name) => { g.cur = name; return true; };
   g.saveLastNode = () => {};
   g.tries = [];
-  const run = async () => {
+  g.forwardArgs = [];
+  const run = async (...args) => {
+    g.forwardArgs.push(args);
     const i = g.tries.length;
     g.tries.push(g.cur);          // 记「这一次出站用的是哪个节点」
     return script(i, g.cur);
@@ -550,7 +689,10 @@ await t('A 撞 429、B 成功:总览记 1 次成功,两个节点各记自己那�
   });
   g.cur = 'A';
   const res = fakeRes();
-  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+  const affinityKey = g.affinity.key('session-429', BODY.model);
+  g.affinity.bind(affinityKey, 'A');
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000,
+    null, '', affinityKey);
 
   assert.equal(res.code, 200, '客户端最终拿到的是成功');
   const d = g.usage.getStats();
@@ -566,6 +708,7 @@ await t('A 撞 429、B 成功:总览记 1 次成功,两个节点各记自己那�
   assert.equal(d.byNode.B.success, 1);
   assert.equal(d.byNode.B.totalTokens, 7, 'token 记在真正干活的那个节点上');
   assert.deepEqual(g.tries, ['A', 'B']);
+  assert.equal(g.affinity.get(affinityKey), 'B', '429 后该 session+model 迁移到成功节点');
 });
 
 await t('同一节点上的网络重试:每次真发出去都记一笔,不是整段算一次', async () => {
@@ -577,7 +720,11 @@ await t('同一节点上的网络重试:每次真发出去都记一笔,不是整
   });
   g.cur = 'A';
   const res = fakeRes();
-  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+  const identity = identityHeaders({ headers: {}, body: BODY });
+  const affinityKey = g.affinity.key(identity['x-opencode-session'], BODY.model);
+  g.affinity.bind(affinityKey, 'A');
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000,
+    identity, '', affinityKey);
 
   const d = g.usage.getStats();
   assert.equal(d.total.requests, 1);
@@ -586,6 +733,9 @@ await t('同一节点上的网络重试:每次真发出去都记一笔,不是整
   assert.equal(d.byNode.A.timeout, 3);
   assert.equal(d.byNode.B.success, 1);
   assert.deepEqual(g.tries, ['A', 'A', 'A', 'B']);
+  assert.ok(g.forwardArgs.every((args) => args[2] === identity),
+    '同一次请求的网络重试和换节点必须复用同一组 identity headers');
+  assert.equal(g.affinity.get(affinityKey), 'B', '网络错误重试耗尽后也要把绑定迁到新节点');
 });
 
 await t('全员 429:客户端记 1 次失败,每个节点各记自己被限流那次', async () => {
@@ -640,9 +790,13 @@ await t('流式成功:usage 记在节点上,总览也拿到同一份', async () 
 await t('流式中断的节点不锁定,下次请求不能继续优先粘着它', async () => {
   const g = retryGateway('sm6.json', () => ({ ok: false, usage: null }));
   g.cur = 'A';
-  await g.attempt(fakeRes(), BODY, ['A'], 'A', true, ANTHROPIC, Date.now() + 60_000);
+  const affinityKey = g.affinity.key('stream-session', BODY.model);
+  g.affinity.bind(affinityKey, 'A');
+  await g.attempt(fakeRes(), BODY, ['A'], 'A', true, ANTHROPIC, Date.now() + 60_000,
+    null, '', affinityKey);
 
   assert.equal(g.lockedNode, null);
+  assert.equal(g.affinity.get(affinityKey), null, '已经中断的节点不能继续粘住该 session');
   assert.equal(g.usage.getStats().byNode.A.upstreamError, 1);
 });
 
@@ -920,13 +1074,19 @@ await t('拉失败也推进 modelsAt,否则面板每 2 秒轮询就每 2 秒重�
   assert.equal(calls, 2, 'TTL 没到就不该再试');
 });
 
-await t('兜底清单和实测上下文表对得上,不能只补一处', async () => {
-  // 两份表都是手写的,漏一处的后果不一样:兜底少了模型 = 拉不到时面板少列;
-  // 上下文表少了 = 少个括号。所以只要求前者覆盖后者,反向允许缺 —— 上游新上一个
-  // 模型时它会先进兜底清单,上下文得单独实测一次才有数(见 core.js 的注释)
-  const { MODEL_CTX } = await import('../web/core.js');
-  for (const id of Object.keys(MODEL_CTX)) {
-    assert.ok(FREE_MODELS.includes(id), `${id} 有上下文数据却不在兜底清单里`);
+await t('兜底清单里的每个模型都有实测记录,反过来允许多(下线的记录留着复用)', async () => {
+  // 方向是刻意的。兜底清单少一个模型 = 拉不到清单时面板少列一个;记录少一条 =
+  // 那个模型按「顶档 high + 宽松」处理,而这正是 xhigh 静默失效那个坑。所以
+  // 要求清单 ⊆ 记录,两份都是手写的,补一处不补另一处会被这条挡下。
+  //
+  // 反向**必须**允许缺:SEED 里留着 4 个已下线模型的记录,那是「id 一样的话
+  // 回来了直接复用」的意思 —— 记录是一张按 id 查的字典,清单里没有它就不显示。
+  const { SEED } = await import('../server/capabilities.mjs');
+  for (const id of FREE_MODELS) {
+    assert.ok(SEED[id], `${id} 在兜底清单里却没有实测记录`);
+    // 上下文可以是空的(muse-spark 那种探过了但夹不出上限的,面板就不显示后缀),
+    // 但顶档不行 —— 折错档会让请求直接失败,那才是这条断言要挡的坑
+    assert.ok(SEED[id].top, `${id} 的顶档不能空着`);
   }
   assert.equal(new Set(FREE_MODELS).size, FREE_MODELS.length, '兜底清单不能有重复');
 });
@@ -939,6 +1099,34 @@ await t('TTL 内不重复出站,并发调用共用一次', async () => {
   assert.equal(calls, 1, '面板 2 秒轮一次,并发挤在一起是常态');
   g.freeModels(); g.freeModels();
   assert.equal(calls, 1, '拿到过就压住,别每次轮询都出一次站');
+});
+
+await t('/v1/models 附带 models.dev 元数据,但不覆盖实测能力字段', () => {
+  const g = new Gateway(load(), () => {});
+  g.models = ['deepseek-v4-flash-free', 'unknown-free'];
+  const store = new ModelMetadataStore({ file: path.join(TMP, 'gateway-meta.json'), logger: () => {} });
+  store.models = new Map([
+    ['deepseek-v4-flash-free', {
+      id: 'deepseek-v4-flash-free', provider: 'opencode', name: 'DeepSeek V4 Flash Free',
+      contextWindow: 200000, maxOutputTokens: 128000, inputCost: 0, outputCost: 0,
+      inputModalities: ['text', 'image'], outputModalities: ['text'], reasoning: true,
+      toolCall: true, deprecated: false, nativeProtocol: 'chat',
+    }],
+  ]);
+  store.updatedAt = Date.now();
+  g.metadata = store;
+  const res = fakeRes();
+  g.handleModels(res);
+  const item = JSON.parse(res.body).data.find((m) => m.id === 'deepseek-v4-flash-free');
+  assert.equal(item.name, 'DeepSeek V4 Flash Free');
+  assert.equal(item.context_window, 1048576, 'context_window 必须来自实测能力,不能照抄 models.dev');
+  assert.equal(item.max_output_tokens, 128000);
+  assert.equal(item.input_cost, 0);
+  assert.deepEqual(item.input_modalities, ['text', 'image']);
+  assert.equal(item.native_protocol, 'chat');
+  assert.equal(item.deprecated, false);
+  const unknown = JSON.parse(res.body).data.find((m) => m.id === 'unknown-free');
+  assert.equal(unknown.name, undefined, '没有元数据时保持基础 OpenAI model 形状');
 });
 
 // ── mihomo 配置生成 ────────────────────────────────────
@@ -1400,6 +1588,8 @@ const subscriptionSchedules = [];
 const app = createApp({
   cfg, creds, gateway,
   subscriptionUpdater: { schedule: (hours) => subscriptionSchedules.push(hours) },
+  // 「探太久就先回话」那个分支得跑到,但不能让测试真等 20 秒
+  probeWaitMs: 60,
 });
 await new Promise((r) => app.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${app.address().port}`;
@@ -1992,6 +2182,10 @@ await t('POST /api/models/sync 现拉一遍清单并回变更明细', async () =
   gateway.models = ['old-free'];
   gateway.modelsAt = 0;
   gateway.upstreamGet = async () => ({ data: [{ id: 'old-free' }, { id: 'new-free' }] });
+  // 探测得挡掉:真跑会往 opencode.ai 发几 MB。顺带验它**真的被叫了** ——
+  // 新模型不探的话它就按「顶档 high + 宽松」跑,那正是 xhigh 静默失效那个坑
+  const probed = [];
+  gateway.caps.probeMissing = async (models) => { probed.push([...models]); return { probed: [], skipped: [] }; };
 
   const r = await fetch(`${base}/api/models/sync`, { method: 'POST', headers: { authorization: auth } });
   assert.equal(r.status, 200);
@@ -1999,6 +2193,48 @@ await t('POST /api/models/sync 现拉一遍清单并回变更明细', async () =
   assert.deepEqual(j.models, ['old-free', 'new-free']);
   assert.deepEqual(j.added, ['new-free'], 'toast 要说出新增了哪个,不然看不出这次到底拉到了没有');
   assert.deepEqual(j.gone, []);
+  assert.deepEqual(probed, [['old-free', 'new-free']], '拉到新模型就该补探一次');
+});
+
+await t('清单没变化时不重探(拉一次清单不等于花一轮出站去探)', async () => {
+  gateway.models = ['old-free'];
+  gateway.modelsAt = 0;
+  gateway.upstreamGet = async () => ({ data: [{ id: 'old-free' }] });
+  let called = 0;
+  gateway.caps.probeMissing = async () => { called++; return { probed: [], skipped: [] }; };
+
+  await fetch(`${base}/api/models/sync`, { method: 'POST', headers: { authorization: auth } });
+  assert.equal(called, 0);
+});
+
+await t('POST /api/models/probe 补探缺记录的,探太久就说「还在探」而不是挂住', async () => {
+  gateway.models = ['big-pickle'];
+  gateway.caps.probeMissing = async () => ({ probed: ['big-pickle 上下文=1048576(validator)'], skipped: [] });
+  const r = await fetch(`${base}/api/models/probe`, { method: 'POST', headers: { authorization: auth } });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.running, false);
+  assert.deepEqual(j.probed, ['big-pickle 上下文=1048576(validator)']);
+  assert.equal(j.ctx['big-pickle'], 1048576, '回来的时候把新的上下文表一起带上,面板不用再等一轮轮询');
+
+  // 探不完就先回话。一个 1M 模型的上下文探测要几十秒到几分钟,挂在 HTTP 上
+  // 面板只会看到超时 —— 那时用户根本不知道它其实在探
+  gateway.caps.probeMissing = () => new Promise(() => {});
+  const slow = await fetch(`${base}/api/models/probe`, { method: 'POST', headers: { authorization: auth } });
+  const sj = await slow.json();
+  assert.equal(sj.running, true);
+  assert.equal(sj.note, 'running');
+});
+
+await t('/api/status 带上下文表,而且只带清单里现有的模型', async () => {
+  gateway.models = ['big-pickle', 'brand-new-free'];
+  const r = await fetch(`${base}/api/status`, { headers: { authorization: auth } });
+  const j = await r.json();
+  assert.equal(j.ctx['big-pickle'], 1048576);
+  assert.ok(!('brand-new-free' in j.ctx), '还没探到的不给数,前端据此只显示模型名');
+  // 下线的模型记录还在盘上(id 一样回来了直接复用),但不能挂在面板上
+  assert.ok(gateway.caps.get('longcat-2.0-free'), '记录留着');
+  assert.ok(!('longcat-2.0-free' in j.ctx), '但清单里没有就不显示');
 });
 
 await t('拉不到时 /api/models/sync 回 500 而不是假装成功', async () => {

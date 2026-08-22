@@ -13,11 +13,16 @@ import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { MihomoAgent } from './proxy.mjs';
-import { LAST_NODE_FILE, USAGE_FILE, MIXED_PORT, CTRL_PORT, POOL_NAME } from './config.mjs';
+import {
+  LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE,
+  MIXED_PORT, CTRL_PORT, POOL_NAME,
+} from './config.mjs';
 import {
   anthropicToOpenAI, openAIToAnthropic, anthropicError, errTypeFor, AnthropicStream, flattenText,
-  reasoningEffort,
+  reasoningEffort, setModelEfforts,
 } from './anthropic.mjs';
+import { Capabilities } from './capabilities.mjs';
+import { ModelMetadataStore, MODELS_DEV_TTL_MS } from './model-metadata.mjs';
 import { safeEqual } from './auth.mjs';
 
 const OPENCODE_HOST = 'opencode.ai';
@@ -122,14 +127,20 @@ const HEALTH_TIMEOUT_MS = Math.min(Math.max(Number(process.env.NODE_TEST_TIMEOUT
  * 也不能因为一次网络抖动变空。
  *
  * 写死过一次的代价:上游后来加了 longcat-2.0-free,而这份列表没人记得改,
- * 面板于是少列一个能用的模型。所以现在它只是 fallback。这份是 2026-08-11
- * 拉到的 11 个 —— 上一版只有 7 个,拉取失败时面板就少列 4 个能用的模型,
- * 同一个坑的第二次。
+ * 面板于是少列一个能用的模型。所以现在它只是 fallback。这份是 2026-08-21
+ * 核对上游清单的结果:8 个 —— 2026-08-11 拉到的 11 个里,ling-3.0-flash/tiny-free、
+ * longcat-2.0-free、north-mini-code-free 这 4 个已经下线,外加当天上线的
+ * x-preview-f-free。
  *
- * 注意「在清单里」不等于「此刻能出结果」:同日实测 11 个里 4 个是坏的
+ * 下线的那 4 个从这里删掉了,但它们的**实测记录留着**(server/capabilities.mjs
+ * 的 SEED):记录是一张按 id 查的字典,清单里没有它就不显示,哪天回来了 id 一样
+ * 直接复用,不用再探一遍。早先不敢删是因为删了要连带动一张手写的上下文表和三处
+ * 测试断言 —— 那张表现在不手写了。
+ *
+ * 注意「在清单里」不等于「此刻能出结果」:2026-08-11 实测 11 个里 4 个是坏的
  * (hy3-free 402 免费额度耗尽、ling-3.0-flash/tiny-free 503 Endpoint is
  * unavailable、north-mini-code-free 401),换出口 IP 重试同样失败,是上游
- * 供应商侧的问题。这里照列不筛 —— 逐个探活要 11 次出站、慢的模型单次就
+ * 供应商侧的问题。这里照列不筛 —— 逐个探活要一次出站一个模型、慢的单次就
  * 10 秒,而且坏的会自己好;真发请求时上游的错误会原样回给客户端。
  */
 export const FREE_MODELS = [
@@ -137,13 +148,16 @@ export const FREE_MODELS = [
   'deepseek-v4-flash-free',
   'hy3-free',
   'laguna-s-2.1-free',
-  'ling-3.0-flash-free',
-  'ling-3.0-tiny-free',
-  'longcat-2.0-free',
   'mimo-v2.5-free',
+  // 2026-08-21 上线。实测是**坏的**:不管发什么都回一个没有 error 字段的
+  // 「成功壳子」配一个怪状态码(基线 400、max_tokens=9e8 却是 429),
+  // 只有普普通通的一次对话能回 200。列着是因为它确实在上游清单上
+  'muse-spark-1.2-contributor-free',
   'nemotron-3-ultra-free',
   'nemotron-3.5-lightning-free',
-  'north-mini-code-free',
+  // Ox Alpha(上游文档里的显示名是「Ox Alpha Free」,id 没带这三个字)。
+  // 2026-08-20 上线的匿名 stealth 模型,免费一周,别按 id 猜它是什么。
+  'x-preview-f-free',
 ];
 
 /**
@@ -405,6 +419,43 @@ const IDENTITY_DEFAULTS = {
   'x-opencode-project': 'default',
 };
 
+function contentSignal(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const text = [];
+    let textOnly = true;
+    for (const block of content) {
+      if (typeof block === 'string') {
+        text.push(block);
+      } else if ((block?.type === 'text' || block?.type === 'input_text') && typeof block.text === 'string') {
+        text.push(block.text);
+      } else {
+        textOnly = false;
+      }
+    }
+    if (textOnly && text.length) return text.join('');
+  }
+  try { return JSON.stringify(content) || ''; } catch { return ''; }
+}
+
+/** 第一条 user 内容不会随对话历史增长,适合做无显式 ID 时的稳定会话种子。 */
+function conversationSeed(body) {
+  if (typeof body?.input === 'string' && body.input) return body.input;
+  for (const field of ['messages', 'input']) {
+    for (const item of Array.isArray(body?.[field]) ? body[field] : []) {
+      if (item?.role !== 'user') continue;
+      const signal = contentSignal(item.content);
+      if (signal && signal !== 'null') return signal;
+    }
+  }
+  return '';
+}
+
+function stableSessionId(signal) {
+  const hash = crypto.createHash('sha256').update(`ses\0${signal}`).digest('hex');
+  return `ses_${hash.slice(0, 24)}`;
+}
+
 /**
  * 合成 OpenCode CLI 的身份头(实验开关,默认关)。
  *
@@ -432,8 +483,12 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
     out[name] = pick(name.toLowerCase()) || dflt;
   }
   out['x-opencode-request'] = pick('x-opencode-request') || uuid();
-  // 会话 ID 依次找这三个:OpenCode 自己的、粘性路由用的、以及通用的那个
-  out['x-opencode-session'] = pick('x-opencode-session', 'x-session-affinity', 'x-session-id') || uuid();
+  const body = inbound?.body;
+  const explicitSession = pick('x-opencode-session', 'x-session-id', 'conversation-id', 'x-session-affinity')
+    || (typeof body?.conversation_id === 'string' ? body.conversation_id.trim() : '')
+    || (typeof body?.metadata?.session_id === 'string' ? body.metadata.session_id.trim() : '');
+  const seed = conversationSeed(body);
+  out['x-opencode-session'] = explicitSession || (seed ? stableSessionId(seed) : uuid());
   // 这两个没有合理的默认值,客户端没给就别凭空造
   for (const n of ['x-session-id', 'x-title']) {
     const v = pick(n);
@@ -454,6 +509,96 @@ export function providerGroup(model) {
   if (m.startsWith('laguna')) return 'laguna';
   // DS4F / big-pickle / mimo / longcat / hy3 / north 归默认组
   return 'default';
+}
+
+/**
+ * session+model 到 mihomo 节点的轻量绑定表。
+ *
+ * 这里只负责选点,不持有 transport、不自行发请求。Map 的插入顺序同时充当 LRU,
+ * 防止长期运行时一次性会话无限堆积；负载就是当前仍保留的绑定数。
+ */
+export class NodeAffinity {
+  constructor(limit = 2048) {
+    this.limit = Math.max(1, Number(limit) || 2048);
+    this.bindings = new Map();
+    this.loads = new Map();
+  }
+
+  key(session, model) {
+    const s = typeof session === 'string' ? session.trim() : '';
+    const m = typeof model === 'string' ? model.trim() : '';
+    return s && m ? JSON.stringify([s, m]) : '';
+  }
+
+  get(key) { return key ? this.bindings.get(key) || null : null; }
+  load(node) { return this.loads.get(node) || 0; }
+
+  #bump(node, delta) {
+    const n = this.load(node) + delta;
+    if (n > 0) this.loads.set(node, n); else this.loads.delete(node);
+  }
+
+  bind(key, node) {
+    if (!key || !node) return node || null;
+    const current = this.bindings.get(key);
+    if (current === node) {
+      this.bindings.delete(key);
+      this.bindings.set(key, node);
+      return node;
+    }
+    if (current) this.release(key, current);
+    while (this.bindings.size >= this.limit) {
+      const oldest = this.bindings.keys().next().value;
+      this.release(oldest);
+    }
+    this.bindings.set(key, node);
+    this.#bump(node, 1);
+    return node;
+  }
+
+  release(key, node = null) {
+    if (!key) return false;
+    const current = this.bindings.get(key);
+    if (!current || (node && current !== node)) return false;
+    this.bindings.delete(key);
+    this.#bump(current, -1);
+    return true;
+  }
+
+  pick(key, nodes, { available = () => true, exclude = null, preferred = null } = {}) {
+    const candidates = (nodes || []).filter((node) => !exclude?.has(node) && available(node));
+    const current = this.get(key);
+    if (current && candidates.includes(current)) return this.bind(key, current);
+    if (current) this.release(key, current);
+    if (!candidates.length) return null;
+
+    if (!key) return candidates.includes(preferred) ? preferred : candidates[0];
+    const minimum = Math.min(...candidates.map((node) => this.load(node)));
+    const leastLoaded = candidates.filter((node) => this.load(node) === minimum);
+    return this.bind(key, leastLoaded.includes(preferred) ? preferred : leastLoaded[0]);
+  }
+
+  migrate(key, failedNode, nodes, options = {}) {
+    this.release(key, failedNode);
+    const exclude = new Set(options.exclude || []);
+    if (failedNode) exclude.add(failedNode);
+    return this.pick(key, nodes, { ...options, exclude, preferred: null });
+  }
+
+  dropNode(node) {
+    let dropped = 0;
+    for (const [key, bound] of [...this.bindings]) {
+      if (bound === node && this.release(key, node)) dropped++;
+    }
+    return dropped;
+  }
+
+  clear() {
+    const n = this.bindings.size;
+    this.bindings.clear();
+    this.loads.clear();
+    return n;
+  }
 }
 
 /**
@@ -725,11 +870,81 @@ export class Gateway {
     this.testedAt = 0;          // 上次测延迟的时刻,0 = 还没测过
     this.testing = null;        // 进行中的延迟测试 Promise,防并发重复测
     this.lockedNode = null;     // 成功后锁定,后续请求直接用,直到 429
+    this.affinity = new NodeAffinity(); // session+model -> node,独立于全局锁
     this.switching = false;
     this.paused = false;        // 重启/重置期间置位,请求收 503 而不是打到坏代理上
     this.models = FREE_MODELS;  // 上游那份免费清单,先用兜底常量顶着
     this.modelsAt = 0;          // 上次拉成功的时刻,0 = 还没拉过
     this.modelsFetch = null;    // 进行中的拉取,防并发(面板 2 秒轮一次)
+    this.metadata = new ModelMetadataStore({ file: MODELS_DEV_FILE, logger });
+    this.metadataAttemptAt = 0;
+    this.metadataFetch = null;
+
+    // 每个模型的上下文上限和思考强度档位。盘上那份 + 内置初值,查不到的开机现探
+    // (见 probeCapabilities)。post 直接给 forward:探测要的就是「发一次非流式
+    // 请求,成功给我 JSON、失败给我 {status, body}」,而且它不记账 —— 探测的
+    // 出站不该出现在面板的调用统计里。
+    this.caps = new Capabilities({
+      file: CAPS_FILE,
+      post: (body) => this.forward(body),
+      logger,
+    });
+    setModelEfforts(this.caps.effortMap());
+  }
+
+  /**
+   * 给清单里没有记录的模型补一次能力探测,探完把思考强度表灌回 anthropic.mjs。
+   *
+   * fire-and-forget:调用方(开机流程、拉完清单)都不该等它 —— 一个 1M 模型的
+   * 上下文探测要几十秒到几分钟,而在它探完之前网关是**能用**的(那个模型按
+   * 「顶档 high + 宽松」处理,也就是有记录之前的老行为)。
+   *
+   * 全都有记录时这个方法一个字节都不出站,所以正常重启是免费的 —— 只有上游
+   * 真上了新模型才会掏钱。
+   */
+  probeCapabilities(reason = '') {
+    return this.caps.probeMissing(this.models)
+      .then((r) => {
+        if (r.probed?.length) setModelEfforts(this.caps.effortMap());
+        return r;
+      })
+      .catch((e) => {
+        this.logger('warn', `[caps] 探测出错${reason ? `(${reason})` : ''}: ${e.message}`);
+        return { probed: [], skipped: [], note: 'error' };
+      });
+  }
+
+  /** 面板要的那张「id → 上下文上限」,只给当前清单里的 —— 下线的模型不该显示 */
+  modelCtx() {
+    return this.caps.ctxMap(this.models);
+  }
+
+  modelMetadata(model) {
+    return this.metadata.get(model);
+  }
+
+  modelMetadataMap() {
+    return this.metadata.forModels(this.models);
+  }
+
+  modelMetadataStatus() {
+    const status = this.metadata.status();
+    // Keep status polling cheap and throttle failed refreshes to one attempt per TTL.
+    if (status.stale && Date.now() - this.metadataAttemptAt >= MODELS_DEV_TTL_MS) {
+      this.refreshModelMetadata().catch(() => {});
+    }
+    return status;
+  }
+
+  refreshModelMetadata({ force = false } = {}) {
+    if (this.metadataFetch) return this.metadataFetch;
+    if (!force && Date.now() - this.metadataAttemptAt < MODELS_DEV_TTL_MS) {
+      return Promise.resolve({ updated: false, reason: 'attempted', models: this.metadata.status().models });
+    }
+    this.metadataAttemptAt = Date.now();
+    this.metadataFetch = this.metadata.refresh({ force })
+      .finally(() => { this.metadataFetch = null; });
+    return this.metadataFetch;
   }
 
   pause() { this.paused = true; }
@@ -739,6 +954,7 @@ export class Gateway {
   resetCooldowns() {
     const n = this.cooldown.clearAll();
     this.lockedNode = null;
+    this.affinity.clear();
     this.nodeCache = null;
     this.nodeCacheTime = 0;
     this.logger('ok', `[reset] 清空 ${n} 个冷却记录,重置锁定节点`);
@@ -765,9 +981,35 @@ export class Gateway {
   }
 
   handleModels(res) {
+    const models = this.freeModels();
+    const metadata = this.metadata.forModels(models);
+    const ctx = this.modelCtx();
     json(res, {
       object: 'list',
-      data: this.freeModels().map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'opencode-zen' })),
+      data: models.map((id) => {
+        const meta = metadata[id];
+        const base = { id, object: 'model', created: 1700000000, owned_by: 'opencode-zen' };
+        if (!meta) return base;
+        return {
+          ...base,
+          name: meta.name,
+          ...(meta.description ? { description: meta.description } : {}),
+          // models.dev context values are advisory and known to be wrong for some
+          // Zen models; expose the locally probed capability instead.
+          ...(ctx[id] != null ? { context_window: ctx[id] } : {}),
+          ...(meta.maxOutputTokens != null ? { max_output_tokens: meta.maxOutputTokens } : {}),
+          ...(meta.inputCost != null ? { input_cost: meta.inputCost } : {}),
+          ...(meta.outputCost != null ? { output_cost: meta.outputCost } : {}),
+          ...(meta.cacheReadCost != null ? { cache_read_cost: meta.cacheReadCost } : {}),
+          ...(meta.cacheWriteCost != null ? { cache_write_cost: meta.cacheWriteCost } : {}),
+          input_modalities: meta.inputModalities,
+          output_modalities: meta.outputModalities,
+          reasoning: meta.reasoning,
+          tool_call: meta.toolCall,
+          deprecated: meta.deprecated,
+          native_protocol: meta.nativeProtocol,
+        };
+      }),
     });
   }
 
@@ -810,6 +1052,9 @@ export class Gateway {
         this.modelsAt = Date.now();
         if (added.length) this.logger('info', `[models] 免费清单 ${free.length} 个,新增 ${added.join(', ')}`);
         if (gone.length) this.logger('info', `[models] 免费清单 ${free.length} 个,下线 ${gone.join(', ')}`);
+        // 新上的模型现探一次,别等下次重启。下线的**不删记录** —— 它哪天回来了
+        // id 一样就直接复用,而面板显示的是这份清单,记录里多几条没人问它。
+        if (added.length) this.probeCapabilities('新模型');
         return { models: free, added, gone };
       })
       .catch((e) => {
@@ -934,9 +1179,11 @@ export class Gateway {
     const effort = reasoningEffort(inbound, model);
     dialect.applyEffort(body, effort);
 
-    // 身份头在这儿构造一次,再传给下面每一次尝试 —— 换节点重试时 request/session ID
-    // 必须还是同一个,否则上游看到的是几个互不相干的新会话
-    const identity = this.config.opencodeIdentityHeaders ? identityHeaders(req) : null;
+    // session 同时服务可选的 OpenCode 请求头和节点 affinity。请求头开关关着时
+    // 仍做稳定调度,只是 identity 不发往上游。
+    const requestIdentity = identityHeaders({ headers: req.headers, body: inbound });
+    const identity = this.config.opencodeIdentityHeaders ? requestIdentity : null;
+    const affinityKey = this.affinity.key(requestIdentity['x-opencode-session'], model);
 
     // 排过序的表:延迟低的在前,测不通的直接不在表里。pickAvailable 取的是
     // 「第一个不冷却的」,所以排序在这儿就等于优先级。
@@ -944,9 +1191,9 @@ export class Gateway {
     if (nodes.length === 0) {
       return dialect.fail(res, 503, '没有可用节点 —— 检查订阅地址和 mihomo 状态', 'no_nodes');
     }
-    const cur = await this.ensureNode(nodes, res, dialect, deadline, model);
+    const cur = await this.ensureNode(nodes, res, dialect, deadline, model, affinityKey);
     if (!cur) return;   // ensureNode 已经回过错误了
-    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort);
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey);
   }
 
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
@@ -960,10 +1207,22 @@ export class Gateway {
   }
 
   /** 选定本次要用的节点并让 mihomo 切过去;返回节点名,失败返回 null(已响应) */
-  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity, model = null) {
+  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity, model = null, affinityKey = '') {
     const group = providerGroup(model);
-    let cur = this.lockedNode;
-    if (cur && !this.cooldown.isCooling(cur, group) && nodes.includes(cur)) return cur;
+    let cur = affinityKey
+      ? this.affinity.pick(affinityKey, nodes, {
+        preferred: this.lockedNode,
+        available: (node) => !this.cooldown.isCooling(node, group),
+      })
+      : this.lockedNode;
+    if (affinityKey && cur && nodes.includes(cur)) {
+      if ((await this.getCurrentNode()) === cur || await this.switchNode(cur)) return cur;
+      this.affinity.release(affinityKey, cur);
+      this.cooldown.mark429(cur, group);
+      dialect.fail(res, 503, 'Switch node failed', 'api_error');
+      return null;
+    }
+    if (!affinityKey && cur && !this.cooldown.isCooling(cur, group) && nodes.includes(cur)) return cur;
 
     cur = this.cooldown.pickAvailable(nodes, group);
     if (!cur) {
@@ -991,6 +1250,7 @@ export class Gateway {
       dialect.fail(res, 503, 'Switch node failed', 'api_error');
       return null;
     }
+    if (affinityKey) this.affinity.bind(affinityKey, cur);
     return cur;
   }
   /**
@@ -1002,7 +1262,8 @@ export class Gateway {
    * 所以下面每条 `continue`(还要再试)之前只有 recordAttempt,
    * 每条 `return`(定案了)才有 record。
    */
-  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity, identity = null, effort = '') {
+  async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity,
+    identity = null, effort = '', affinityKey = '') {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
@@ -1010,6 +1271,23 @@ export class Gateway {
     const left = () => deadline - Date.now();
     const call = { model: body.model, effort };
     const fails = { timeout: 0, rateLimited: 0 };
+    const bind = (node) => { if (affinityKey) this.affinity.bind(affinityKey, node); };
+    const unbind = (node) => { if (affinityKey) this.affinity.release(affinityKey, node); };
+    const switchTo = async (node) => {
+      if (!(await this.switchNode(node))) {
+        unbind(node);
+        return false;
+      }
+      cur = node;
+      bind(cur);
+      return true;
+    };
+    const pickNext = (group, exclude) => affinityKey
+      ? this.affinity.pick(affinityKey, nodes, {
+        exclude,
+        available: (node) => !this.cooldown.isCooling(node, group),
+      })
+      : this.cooldown.pickAvailable(nodes, group, exclude);
 
     /**
      * 终态失败的统一出口。原来三处各写一套文案,其中「Tried N nodes, all
@@ -1059,6 +1337,9 @@ export class Gateway {
             this.lockedNode = cur;
             this.cooldown.clear(cur);
             this.saveLastNode(cur);
+            bind(cur);
+          } else {
+            unbind(cur);
           }
           // 只给成功那次记耗时:中断的那次总耗时量的是「断在第几秒」,
           // 不是这个节点跑完一次要多久,混进平均值里读不出任何东西
@@ -1072,6 +1353,7 @@ export class Gateway {
         this.lockedNode = cur;
         this.cooldown.clear(cur);
         this.saveLastNode(cur);
+        bind(cur);
         this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
         this.usage.record(body.model, result.usage, true);
         this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`
@@ -1083,6 +1365,7 @@ export class Gateway {
         // 流已经开始吐了就不能重试:头都发出去了,换节点等于给客户端拼接两半响应。
         // 收尾由 forwardStream 里的 sink 负责(它才拿得到那个 sink),这里只记账。
         if (e.notStarted === false) {
+          unbind(cur);
           this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
           this.usage.record(body.model, null, false);
           this.logger('error', `[stream-mid] node="${cur}" 中断: ${e.body || e.message}`);
@@ -1094,6 +1377,7 @@ export class Gateway {
           const group = providerGroup(body.model);
           const retryAfter = e.retryAfter ?? null;
           this.cooldown.mark429(cur, group, retryAfter);
+          unbind(cur);
           this.usage.recordAttempt(cur, 'rateLimited', null, null, call);
           fails.rateLimited++;
           const coolSec = retryAfter ?? Math.ceil(COOLDOWN_MS / 1000);
@@ -1101,7 +1385,7 @@ export class Gateway {
           tried.add(cur);
           netRetry = 0;
 
-          const next = this.cooldown.pickAvailable(nodes, group, tried);
+          const next = pickNext(group, tried);
           if (!next) {
             const s = this.cooldown.summary();
             this.usage.record(body.model, null, false);
@@ -1113,15 +1397,15 @@ export class Gateway {
           // 上游限流是按窗口算的,给它一点恢复时间
           await sleep(2000);
           switches++;
-          if (await this.switchNode(next)) cur = next;
+          if (await switchTo(next)) cur = next;
           else {
             tried.add(next);
-            const fallback = this.cooldown.pickAvailable(nodes, group, tried);
+            const fallback = pickNext(group, tried);
             if (!fallback) {
               return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
             switches++;
-            if (await this.switchNode(fallback)) cur = fallback;
+            if (await switchTo(fallback)) cur = fallback;
             else {
               tried.add(fallback);
               continue;
@@ -1142,20 +1426,22 @@ export class Gateway {
           tried.add(cur);
           netRetry = 0;
           this.logger('warn', `[timeout] node="${cur}" 重试 ${MAX_NET_RETRY} 次仍失败,换下一个`);
-          const next = this.cooldown.pickAvailable(nodes, providerGroup(body.model), tried);
+          unbind(cur);
+          const group = providerGroup(body.model);
+          const next = pickNext(group, tried);
           if (!next) {
             return giveUp('所有节点都超时,没有可换的了', true);
           }
           switches++;
-          if (await this.switchNode(next)) cur = next;
+          if (await switchTo(next)) cur = next;
           else {
             tried.add(next);
-            const fallback = this.cooldown.pickAvailable(nodes, providerGroup(body.model), tried);
+            const fallback = pickNext(group, tried);
             if (!fallback) {
               return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
             switches++;
-            if (await this.switchNode(fallback)) cur = fallback;
+            if (await switchTo(fallback)) cur = fallback;
             else {
               tried.add(fallback);
               continue;

@@ -45,13 +45,34 @@ const NODES = [
 /**
  * 真网关这一份是从上游 /zen/v1/models 现拉的(一天一次)。这里写死 2026-08-11
  * 实测拉到的 11 个 —— 预览要照出最长的那一列,少列几个就看不出模型区块够不够高。
- * 11 个现在都有上下文后缀(hy3-free 的 197K 是 2026-08-12 补测的,见 core.js 的 MODEL_CTX)。
+ * 11 个现在都有上下文后缀(hy3-free 的 197K 是 2026-08-12 补测的)。
  */
 const DEMO_MODELS = [
   'big-pickle', 'deepseek-v4-flash-free', 'hy3-free', 'laguna-s-2.1-free',
   'ling-3.0-flash-free', 'ling-3.0-tiny-free', 'longcat-2.0-free', 'mimo-v2.5-free',
   'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'north-mini-code-free',
 ];
+
+/**
+ * 上下文上限。真网关这份是探出来的实测记录(server/capabilities.mjs),经
+ * /api/status 的 `ctx` 下发;预览刻意不 import 真网关代码,所以这里照抄一份。
+ *
+ * 「同步模型」按出来的那个 glm-5-air-free 故意不在这张表里 —— 那正是真环境里
+ * 新模型刚进清单、还没探出上限的样子(只显示模型名,没有 `[1M]` 后缀)。
+ */
+const DEMO_CTX = {
+  'big-pickle': 1048576,
+  'deepseek-v4-flash-free': 1048576,
+  'mimo-v2.5-free': 1048576,
+  'longcat-2.0-free': 1048580,
+  'nemotron-3-ultra-free': 1000000,
+  'nemotron-3.5-lightning-free': 1000000,
+  'ling-3.0-flash-free': 262144,
+  'ling-3.0-tiny-free': 262144,
+  'laguna-s-2.1-free': 262144,
+  'north-mini-code-free': 256000,
+  'hy3-free': 196608,
+};
 
 const state = {
   cfg: {
@@ -65,6 +86,9 @@ const state = {
   // 「同步模型」按一次翻一次面,多出/少掉一个模型。/api/status 跟着变,
   // 所以点完能看见「可用模型」那一列真的动了,而不只是弹个 toast
   extraModel: false,
+  // 「补探能力」按一次翻一次面:第一次「探到一个」、第二次「都有记录」。
+  // 真环境里第二种是常态(有记录就不出站),光看真环境碰不到第一种
+  probed: false,
   current: NODES[2],
   cooldowns: new Map(),          // name -> 进入冷却的时间戳
   // name -> 最近一次限流时刻。解冻(cooldowns 删了)也留着,ranked() 靠它把刚解冻的
@@ -318,6 +342,9 @@ async function handleApi(req, res, path) {
       mihomoRunning: true, mihomoVersion: 'v1.19.13',
       paused: false, demo: true,
       models: state.extraModel ? [...DEMO_MODELS, 'glm-5-air-free'] : DEMO_MODELS,
+      // 探到的上下文会当场出现在模型胶囊上:glm-5-air-free 先只有名字,
+      // 「补探能力」之后才长出 [262K] 后缀
+      ctx: state.probed ? { ...DEMO_CTX, 'glm-5-air-free': 262144 } : DEMO_CTX,
       build: state.build,
       buildUrl: `${REPO_URL}/commit/${state.build}`,
       repoUrl: REPO_URL,
@@ -400,8 +427,20 @@ async function handleApi(req, res, path) {
     return json(res, { models, added, gone });
   }
 
-  if (path === '/api/usage' && m === 'GET') return json(res, state.usage);
+  // 补探能力。假数据每点一次翻面:第一次「探到一个」、第二次「都有记录」——
+  // 真环境里第二种是常态(有记录就不出站),光看真环境碰不到第一种
+  if (path === '/api/models/probe' && m === 'POST') {
+    await new Promise((r) => setTimeout(r, 700));
+    state.probed = !state.probed;
+    if (!state.probed) return json(res, { probed: [], skipped: [], note: 'nothing-missing', ctx: DEMO_CTX, running: false });
+    log('info', '[caps] 探到 1 个:glm-5-air-free 上下文=262144(validator)');
+    return json(res, {
+      probed: ['glm-5-air-free 上下文=262144(validator)'], skipped: [], note: 'ok',
+      ctx: { ...DEMO_CTX, 'glm-5-air-free': 262144 }, running: false,
+    });
+  }
 
+  if (path === '/api/usage' && m === 'GET') return json(res, state.usage);
   if (path === '/api/usage/reset' && m === 'POST') {
     state.usage.total = {
       requests: 0, success: 0, fail: 0,

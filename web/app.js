@@ -287,22 +287,26 @@ function renderConn() {
  * 写死在前端的那份漏过一个新上线的免费模型,所以不再留本地常量做兜底 ——
  * 兜底在服务端,前端拿到什么就显示什么。
  *
- * 名字后面的 `[1M]` 是上下文上限,来自 core.js 里那张实测表;上游不给这个元数据,
- * 表里查不到就只显示模型名(新模型上线时就是这样)。
+ * 名字后面的 `[1M]` 是上下文上限,来自服务端的实测记录(status.ctx);上游不给这个
+ * 元数据,服务端还没探到的就只显示模型名(刚上线的新模型有那么几十秒是这样)。
  */
 function renderModels() {
   const list = Array.isArray(S.status.models) ? S.status.models : [];
+  const ctx = S.status.ctx && typeof S.status.ctx === 'object' ? S.status.ctx : {};
   const ul = $('models');
   // 内容没变就不重建。以前是每轮无条件重建(8 个 <li> 比 diff 还便宜),但下面
   // 要读 scrollWidth 量溢出,那会强制同步重排 —— 2 秒一次地重排一整格不值得,
   // 而这个清单几周才变一次
-  const key = list.join(' ');
+  //
+  // key 里必须连上下文一起算:新模型是先进清单、几十秒后才探出上限的,只看清单
+  // 的话那个 `[1M]` 要等到清单下次真的变了才补上
+  const key = JSON.stringify(list.map((m) => [m, ctx[m] ?? 0]));
   if (ul.dataset.key === key) return;
   ul.dataset.key = key;
 
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
-    li.textContent = modelLabel(m);
+    li.textContent = modelLabel(m, ctx);
     return li;
   }));
 
@@ -478,6 +482,22 @@ function wire() {
       r?.gone?.length ? `下线 ${r.gone.join(', ')}` : '',
     ].filter(Boolean).join(',');
     return diff ? `共 ${n} 个,${diff}` : `共 ${n} 个,没有变化`;
+  });
+
+  // 补探能力:给清单里还没有记录的模型探一遍上下文上限和思考强度档位。
+  // 平时开机自动跑一次(有记录的一个字节都不出站),这颗按钮是给「开机那次撞上
+  // 限流被跳过了」用的。
+  //
+  // toast 要分清「没探到」和「不用探」—— 前者是待办(换个出口再点一次),
+  // 后者是正常状态。探不完就说还在探:1M 模型一个要几十秒到几分钟,那时候
+  // 结果在运行日志里逐个模型出现。
+  $('btn-probe').onclick = (e) => run(e.target, '补探能力', async () => {
+    const r = await api('/models/probe', { method: 'POST' });
+    if (r?.running) return '还在探,结果看运行日志';
+    const got = r?.probed?.length ?? 0;
+    const miss = r?.skipped?.length ?? 0;
+    if (!got && !miss) return '都有记录,不用探';
+    return `探到 ${got} 个${miss ? `,${miss} 个没探到(看运行日志)` : ''}`;
   });
 
   $('btn-speed').onclick = (e) => run(e.target, '测延迟', async () => {

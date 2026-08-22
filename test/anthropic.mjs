@@ -113,11 +113,58 @@ t('工具结果和文字混在一条消息时,文字排在结果之后', () => {
   assert.equal(r.messages[1].content, '继续');
 });
 
-t('image 块丢掉但不让整条消息失败', () => {
+t('Anthropic URL image 转成 OpenAI image_url,与文本保序', () => {
+  const r = anthropicToOpenAI({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } },
+        { type: 'text', text: '这是什么' },
+      ],
+    }],
+  });
+  assert.deepEqual(r.messages[0].content, [
+    { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+    { type: 'text', text: '这是什么' },
+  ]);
+});
+
+t('Anthropic base64 image 转成 OpenAI data URL,不改变前后文本顺序', () => {
+  const r = anthropicToOpenAI({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: '前' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+        { type: 'text', text: '后' },
+      ],
+    }],
+  });
+  assert.deepEqual(r.messages[0].content, [
+    { type: 'text', text: '前' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    { type: 'text', text: '后' },
+  ]);
+});
+
+t('无效 image 块丢掉但不让整条消息失败', () => {
   const r = anthropicToOpenAI({
     messages: [{ role: 'user', content: [{ type: 'image', source: {} }, { type: 'text', text: '这是什么' }] }],
   });
   assert.equal(r.messages[0].content, '这是什么');
+});
+
+t('assistant 历史里的非法 image 仍跳过,不生成上游不接受的 assistant image_url', () => {
+  const r = anthropicToOpenAI({
+    messages: [{
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '看到了' },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/invalid.png' } },
+      ],
+    }],
+  });
+  assert.deepEqual(r.messages[0], { role: 'assistant', content: '看到了' });
 });
 
 t('采样参数按名字搬过去,top_k 刻意丢掉', () => {
@@ -164,6 +211,52 @@ t('普通回复转成 content 数组 + usage 改名', () => {
   assert.deepEqual(r.content, [{ type: 'text', text: 'hello' }]);
   assert.equal(r.stop_reason, 'end_turn');
   assert.deepEqual(r.usage, { input_tokens: 10, output_tokens: 5 });
+});
+
+t('OpenAI image_url URL 转成 Anthropic URL image,文本和图片保序', () => {
+  const r = openAIToAnthropic({
+    choices: [{
+      finish_reason: 'stop',
+      message: { content: [
+        { type: 'text', text: '前' },
+        { type: 'image_url', image_url: { url: 'https://example.com/dog.webp', detail: 'high' } },
+        { type: 'text', text: '后' },
+      ] },
+    }],
+  });
+  assert.deepEqual(r.content, [
+    { type: 'text', text: '前' },
+    { type: 'image', source: { type: 'url', url: 'https://example.com/dog.webp' } },
+    { type: 'text', text: '后' },
+  ]);
+});
+
+t('Responses input_image data URL 转成 Anthropic base64 image', () => {
+  const r = openAIToAnthropic({
+    choices: [{
+      finish_reason: 'stop',
+      message: { content: [
+        { type: 'input_image', image_url: 'data:image/jpeg;base64,/9j/AA==' },
+        { type: 'input_text', text: '请描述' },
+      ] },
+    }],
+  });
+  assert.deepEqual(r.content, [
+    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: '/9j/AA==' } },
+    { type: 'text', text: '请描述' },
+  ]);
+});
+
+t('带 data URL 参数的 input_image 仍能还原媒体类型和 base64', () => {
+  const r = openAIToAnthropic({
+    choices: [{
+      finish_reason: 'stop',
+      message: { content: [{ type: 'input_image', image_url: 'data:image/svg+xml;charset=utf-8;base64,PHN2Zy8+' }] },
+    }],
+  });
+  assert.deepEqual(r.content, [
+    { type: 'image', source: { type: 'base64', media_type: 'image/svg+xml', data: 'PHN2Zy8+' } },
+  ]);
 });
 
 t('非流式响应报告客户端实际请求模型,不采用上游别名', () => {
@@ -457,6 +550,7 @@ t('推理中途上游报错也能关掉思考块', () => {
 
 const DS4F = 'deepseek-v4-flash-free';
 const NORTH = 'north-mini-code-free';
+const OX = 'x-preview-f-free';
 
 t('客户端显式给的档位直接采信,大小写和空格不影响', () => {
   assert.equal(reasoningEffort({ reasoning_effort: 'max' }, DS4F), 'max');
@@ -476,6 +570,31 @@ t('中低档原样放行,不因模型而变', () => {
     assert.equal(reasoningEffort({ reasoning_effort: lv }, DS4F), lv);
     assert.equal(reasoningEffort({ reasoning_effort: lv }, NORTH), lv);
   }
+});
+
+// x-preview-f-free(上游文档里的「Ox Alpha Free」)不属于「不认就丢字段」那类:
+// 它的校验器对 minimal/medium/xhigh 直接 400(原文点名 low/high/max 三档),
+// 而 medium 正是 Claude Code 敲 think 翻出来的档位 —— 不夹这个模型就对那批客户端不可用
+t('OX 只认 low/high/max,不认的档位就近向上夹而不是让上游 400', () => {
+  const ox = (lv) => reasoningEffort({ reasoning_effort: lv }, OX);
+  assert.equal(ox('minimal'), 'low', 'minimal 上面最近的一档是 low');
+  assert.equal(ox('medium'), 'high', '向下夹到 low 实测 reasoning_tokens=0,等于没思考');
+  assert.equal(ox('low'), 'low', '本来就认的档不动');
+  assert.equal(ox('high'), 'high');
+  // 顶档两种说法都落到 max —— 这个模型确实认 max(实测 reasoning_tokens 38 > high 的 8)
+  assert.equal(ox('xhigh'), 'max');
+  assert.equal(ox('max'), 'max');
+  // 夹取只对表里的模型生效,别的模型的既有行为不能被带着改
+  assert.equal(reasoningEffort({ reasoning_effort: 'medium' }, DS4F), 'medium');
+  assert.equal(reasoningEffort({ reasoning_effort: 'minimal' }, NORTH), 'minimal');
+});
+
+t('OX 的 budget_tokens 也走同一套夹取', () => {
+  const budget = (n) => reasoningEffort({ thinking: { type: 'enabled', budget_tokens: n } }, OX);
+  assert.equal(budget(1024), 'low');     // 协议下限,本来就认
+  assert.equal(budget(4000), 'high');    // think —— 翻出来是 medium,夹上去
+  assert.equal(budget(10000), 'high');   // think hard
+  assert.equal(budget(31999), 'max');    // ultrathink 拿到这个模型真正的顶档
 });
 
 t('不是档位的字符串当没给 —— 原样透传会让上游 400', () => {

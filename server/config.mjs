@@ -22,6 +22,8 @@ export const MIHOMO_CONFIG = path.join(DATA_DIR, 'mihomo-zen.yaml');
 export const MIHOMO_DATA_DIR = path.join(DATA_DIR, 'mihomo-data');
 export const LAST_NODE_FILE = path.join(DATA_DIR, 'last-node.txt');
 export const USAGE_FILE = path.join(DATA_DIR, 'usage.json');
+export const CAPS_FILE = path.join(DATA_DIR, 'capabilities.json');
+export const MODELS_DEV_FILE = path.join(DATA_DIR, 'models.dev.json');
 
 export const MIHOMO_BIN = process.env.MIHOMO_BIN || '/usr/local/bin/mihomo';
 export const MIXED_PORT = 17897;

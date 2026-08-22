@@ -9,13 +9,17 @@
  *                          ├─→ 同一套节点轮换/重试 ─→ opencode zen
  *   /v1/messages ──转换────┘
  *
- * 这个文件只有纯函数和一个流翻译器,不碰网络,能直接 assert。
+ * 这个文件只有纯函数和一个流翻译器,不碰网络,能直接 assert。唯一的 import 是
+ * capabilities.mjs 里那份实测记录的**内置初值**(SEED,纯常量)—— 网关起来后会
+ * 用盘上的记录盖掉它,见 setModelEfforts。
  *
  * 参考了 https://github.com/YuJunZhiXue/Cline-proxy 的 proxy.go,但避开它两处:
  *   1. 一条 user 消息里多个 tool_result 只转出最后一个(前面的被覆盖)
  *   2. 工具参数刚收到第一个分片就 emit content_block_start+stop,长参数会截断
  * 这里 tool_use 按规范走 input_json_delta 增量,块在流结束时才关。
  */
+
+import { SEED, effortMapOf } from './capabilities.mjs';
 
 /** Anthropic 的 content 可以是 string 也可以是 block 数组,统一抽成纯文本 */
 export function flattenText(content) {
@@ -51,31 +55,65 @@ export function toolsToOpenAI(tools) {
 }
 
 /**
- * 思考强度的合法档位。客户端能说的全集,不代表每个模型都认。
- * 挡掉明显不是档位的字符串,免得把乱输入原样送出去换一个 400。
+ * 思考强度的六档,从弱到强。客户端能说的全集,不代表每个模型都认。
+ * 既当白名单(挡掉明显不是档位的字符串,免得把乱输入原样送出去换一个 400),
+ * 也当夹取时的顺序表(见 clampEffort)。
  */
-export const EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+export const EFFORTS = new Set(LADDER);
 
 /** 客户端表达「顶档」的两种说法。它们要落到模型实际认的最高档,而不是原样发出去 */
 const TOP = new Set(['xhigh', 'max']);
 
 /**
- * 认 max 这一档的模型。
+ * 每个模型认哪几档 —— `{ [id]: {top, efforts} }`。
  *
- * 这张表必须存在,因为 zen 对不认的档位是**丢字段**而不是降到最近一档:
- * DS4F 的 thinkingLevelMap 里 off/minimal/low/medium/xhigh 全是 null,只有
- * high/max 有值 —— 客户端选「极高(xhigh)」原样发过去会被丢掉、回落到默认 high,
- * 于是「极高」比「最多」还弱。而 north-mini-code-free 反过来:它只到 high,
- * 连 max 都是 null,所以也不能无脑把顶档都发成 max。
+ * 这份数据以前是这个文件里的两张手写常量表(MAX_CAPABLE 和 STRICT_EFFORTS)。
+ * 现在改成从 server/capabilities.mjs 的实测记录灌进来,因为它必须跟着上游的
+ * 免费清单走:上游新上一个模型,手写表里没有 → 顶档折错、严格模型的 medium
+ * 直接 400,而那正是 Claude Code 敲 `think` 翻出来的档位。
  *
- * ponytail: 上限是这张表得手工维护,而 zen 的免费清单换得挺勤。不在表里的模型
- * 按 high 处理 —— 那是各家最普遍支持的顶档,宁可少一档也不会被丢成默认值。
- * 哪天某个免费模型也支持 max 了,往这儿加一行就行。
+ * 两件事这份数据必须说清楚,少一件就会静默出错:
+ *
+ *   top      这个模型认的最高档。上游对不认的档位是**丢字段**而不是降级,所以
+ *            给一个它不认的 max 等于什么都没发,回落到默认档 —— 反而比 high 弱。
+ *            (xhigh 一度静默失效就是这个,那还是 Claude Code 的默认档。)
+ *   efforts  它认的**全部**档位,非空时表示「不认的会报 400 而不是被丢掉」,
+ *            于是中间那几档也得夹(见 clampEffort)。null = 宽松,不用夹。
+ *
+ * 默认值是 SEED 折出来的,所以不调 setModelEfforts 也是对的(测试和
+ * import 这个模块的地方都不用先初始化)—— 网关起来后会用盘上的记录盖掉。
+ * 反过来也重要:万一哪天忘了接线,退化成的是「我们量过的那批值」,而不是
+ * 「所有模型都按 high + 宽松」—— 后者会把 xhigh 静默失效那个坑原地挖回来。
  */
-const MAX_CAPABLE = new Set(['deepseek-v4-flash-free']);
+let MODEL_EFFORTS = effortMapOf(SEED);
 
-/** 这个模型实际认的最高档 */
-const topEffort = (model) => (MAX_CAPABLE.has(String(model ?? '').trim()) ? 'max' : 'high');
+export function setModelEfforts(map) {
+  MODEL_EFFORTS = map && typeof map === 'object' ? map : effortMapOf(SEED);
+}
+
+const capOf = (model) => MODEL_EFFORTS[String(model ?? '').trim()] || null;
+
+/** 这个模型实际认的最高档。没记录时按 high —— 那是各家最普遍支持的顶档,
+ *  宁可少一档也不要被上游丢成默认值 */
+const topEffort = (model) => capOf(model)?.top || 'high';
+
+/**
+ * 把档位夹到这个模型认的那几档。没记录、或者记录说它宽松,就原样返回。
+ *
+ * miss 时**就近向上**,不是向下:少想一档的后果是「用户明确要求思考却没思考」
+ * (x-preview-f-free 的 low 实测 reasoning_tokens=0),多想一档只是慢一点。六档
+ * 映到三档时这也正好是成比例的 —— minimal/low→low、medium/high→high、xhigh/max→max。
+ */
+function clampEffort(effort, model) {
+  const ok = capOf(model)?.efforts;
+  if (!effort || !Array.isArray(ok) || !ok.length || ok.includes(effort)) return effort;
+  for (let i = LADDER.indexOf(effort) + 1; i < LADDER.length; i++) {
+    if (ok.includes(LADDER[i])) return LADDER[i];
+  }
+  return ok[ok.length - 1];   // 比它更强的都没有,那就给最强那档
+}
 
 /**
  * thinking.budget_tokens → 档位。
@@ -122,7 +160,7 @@ const BUDGET_TIERS = [
 export function reasoningEffort(req, model = '') {
   const raw = req?.reasoning_effort ?? req?.reasoning?.effort ?? req?.output_config?.effort;
   const want = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  if (EFFORTS.has(want)) return TOP.has(want) ? topEffort(model) : want;
+  if (EFFORTS.has(want)) return clampEffort(TOP.has(want) ? topEffort(model) : want, model);
 
   // 明确关掉思考时不发字段:DS4F 关不掉思考,硬塞个最低档也是被上游丢掉,
   // 不如让它走默认 —— 至少行为是可预期的。
@@ -133,7 +171,7 @@ export function reasoningEffort(req, model = '') {
   const budget = Number(req?.thinking?.budget_tokens);
   if (!Number.isFinite(budget) || budget <= 0) return '';
   const tier = BUDGET_TIERS.find(([max]) => budget <= max)?.[1];
-  return tier ?? topEffort(model);
+  return clampEffort(tier ?? topEffort(model), model);
 }
 
 /** {type:'any'} 是「必须调工具但随便哪个」,对上 OpenAI 的 'required' */
@@ -144,6 +182,24 @@ export function toolChoiceToOpenAI(tc) {
   if (tc.type === 'any') return 'required';
   if (tc.type === 'tool' && tc.name) return { type: 'function', function: { name: tc.name } };
   return undefined;
+}
+
+/** Anthropic image source 转 OpenAI Chat 的 image_url content part。 */
+function imageToOpenAI(block) {
+  const source = block?.source;
+  if (!source || typeof source !== 'object') return null;
+  if (source.type === 'url') {
+    const url = typeof source.url === 'string' ? source.url.trim() : '';
+    return url ? { type: 'image_url', image_url: { url } } : null;
+  }
+  if (source.type === 'base64') {
+    const mediaType = typeof source.media_type === 'string' ? source.media_type.trim() : '';
+    const data = typeof source.data === 'string' ? source.data : '';
+    return mediaType && data
+      ? { type: 'image_url', image_url: { url: `data:${mediaType};base64,${data}` } }
+      : null;
+  }
+  return null;
 }
 
 /**
@@ -171,6 +227,8 @@ export function anthropicToOpenAI(req) {
     if (!Array.isArray(m.content)) continue;
 
     const texts = [];
+    const contentParts = [];
+    let hasImage = false;
     const reasoning = [];
     const toolCalls = [];
     const toolResults = [];
@@ -178,8 +236,21 @@ export function anthropicToOpenAI(req) {
       if (!b || typeof b !== 'object') continue;
       switch (b.type) {
         case 'text':
-          if (typeof b.text === 'string') texts.push(b.text);
+          if (typeof b.text === 'string') {
+            texts.push(b.text);
+            contentParts.push({ type: 'text', text: b.text });
+          }
           break;
+        case 'image': {
+          // Anthropic 只允许 user 消息携图;助手历史中的异常块丢掉,避免 OpenAI assistant validator 400。
+          if (role !== 'user') break;
+          const image = imageToOpenAI(b);
+          if (image) {
+            contentParts.push(image);
+            hasImage = true;
+          }
+          break;
+        }
         case 'thinking':
           if (role === 'assistant' && typeof b.thinking === 'string') reasoning.push(b.thinking);
           break;
@@ -203,23 +274,26 @@ export function anthropicToOpenAI(req) {
             content: typeof b.content === 'string' ? b.content : flattenText(b.content),
           });
           break;
-        // image / document 之类上游不吃,丢掉,别让请求整体失败
+        // document 之类上游不吃,丢掉,别让请求整体失败
       }
     }
+
+    // 纯文本保持旧的字符串形状;只有真正出现图片时才换成 content parts。
+    const content = hasImage ? contentParts : texts.join('\n');
 
     if (toolResults.length) {
       msgs.push(...toolResults);
       // 同一条消息里跟工具结果混在一起的文字要保留,但得排在结果之后
-      if (texts.length) msgs.push({ role, content: texts.join('\n') });
+      if (contentParts.length) msgs.push({ role, content });
       continue;
     }
     if (role === 'assistant' && toolCalls.length) {
-      const assistant = { role: 'assistant', content: texts.join('\n') || null, tool_calls: toolCalls };
+      const assistant = { role: 'assistant', content: contentParts.length ? content : null, tool_calls: toolCalls };
       if (reasoning.length) assistant.reasoning_content = reasoning.join('\n');
       msgs.push(assistant);
       continue;
     }
-    const message = { role, content: texts.join('\n') };
+    const message = { role, content };
     if (role === 'assistant' && reasoning.length) message.reasoning_content = reasoning.join('\n');
     msgs.push(message);
   }
@@ -256,6 +330,52 @@ function parseArgs(s) {
   } catch { return {}; }
 }
 
+/** OpenAI Chat/Responses 的图片 part 转 Anthropic image block。 */
+function imageToAnthropic(part) {
+  const raw = part?.image_url;
+  const url = typeof raw === 'string' ? raw.trim()
+    : (raw && typeof raw.url === 'string' ? raw.url.trim() : '');
+  if (!url) return null;
+
+  if (url.toLowerCase().startsWith('data:')) {
+    const comma = url.indexOf(',');
+    if (comma < 0) return null;
+    const header = url.slice(5, comma);
+    const segments = header.split(';');
+    const mediaType = segments.shift()?.trim() || '';
+    if (!mediaType || !segments.some((part) => part.trim().toLowerCase() === 'base64')) return null;
+    const data = url.slice(comma + 1);
+    if (!data) return null;
+    return {
+      type: 'image',
+      source: { type: 'base64', media_type: mediaType, data },
+    };
+  }
+  return { type: 'image', source: { type: 'url', url } };
+}
+
+function openAIContentToAnthropic(value) {
+  if (typeof value === 'string') return value ? [{ type: 'text', text: value }] : [];
+  if (!Array.isArray(value)) return [];
+  const content = [];
+  for (const part of value) {
+    if (typeof part === 'string') {
+      if (part) content.push({ type: 'text', text: part });
+      continue;
+    }
+    if (!part || typeof part !== 'object') continue;
+    if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
+      if (typeof part.text === 'string') content.push({ type: 'text', text: part.text });
+      continue;
+    }
+    if (part.type === 'image_url' || part.type === 'input_image') {
+      const image = imageToAnthropic(part);
+      if (image) content.push(image);
+    }
+  }
+  return content;
+}
+
 /** 响应:OpenAI → Anthropic(非流式) */
 export function openAIToAnthropic(oai, fallbackModel = '') {
   const choice = oai?.choices?.[0] ?? {};
@@ -266,7 +386,7 @@ export function openAIToAnthropic(oai, fallbackModel = '') {
   if (reasoning) content.push({
     type: 'thinking', thinking: reasoning, signature: 'ciallo-zen-proxy',
   });
-  if (typeof msg.content === 'string' && msg.content) content.push({ type: 'text', text: msg.content });
+  content.push(...openAIContentToAnthropic(msg.content));
   for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
     content.push({
       type: 'tool_use',

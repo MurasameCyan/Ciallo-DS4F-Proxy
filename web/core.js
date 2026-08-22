@@ -26,46 +26,25 @@ export function fmtTokens(n) {
   return compact.format(Number(n) || 0);
 }
 
-/**
- * 各免费模型的上下文上限(token)。**实测值**,不是抄来的:
- *
- *   上游 `/zen/v1/models` 只给 id,一个字节的元数据都没有;models.dev 那份对
- *   至少 4 个模型是错的(给 deepseek-v4-flash-free 写 200000,真值 1048576)。
- *   实测办法是让上游自己的参数校验器把数字报出来 —— 发一个必然超限的请求,
- *   报错原文里就带着上限。2026-08-11 全量测过一遍。
- *
- * `hy3-free` 是唯一一个换了判据的:它没有参数校验器,超限也不报错,而是**静默
- * 截断**。所以它的数不是从错误原文读来的,是从 `prompt_tokens` 封顶推出来的 ——
- * 700K/800K/1.2M/2M/3M 字符五种输入全都回报 196608,而未超限的输入(120K→72368、
- * 250K→150809、300K→180778)随输入线性增长。收敛到同一个数的那个值就是上限。
- *
- * ponytail: 手写的表,新模型上线这儿不会自动长出来 —— 查不到就不显示后缀
- * (见 modelLabel),清单本身照旧从上游现拉,所以最坏是少个括号,不会漏模型。
- * 要自动化就得每个模型先发一次超限请求去问,不值得为一个括号出这些站。
- * 上游改了窗口大小也一样得手动重测,写进 README 的模型表是同一份数据。
- */
-export const MODEL_CTX = {
-  'big-pickle': 1048576,
-  'deepseek-v4-flash-free': 1048576,
-  'mimo-v2.5-free': 1048576,
-  'longcat-2.0-free': 1048580,
-  'nemotron-3-ultra-free': 1000000,
-  'nemotron-3.5-lightning-free': 1000000,
-  'ling-3.0-flash-free': 262144,
-  'ling-3.0-tiny-free': 262144,
-  'laguna-s-2.1-free': 262144,
-  'north-mini-code-free': 256000,
-  // 静默截断,不是校验器报的数。超了不报错,多出来的那截直接不看 —— 见上面的说明
-  'hy3-free': 196608,
-};
-
 /** 上下文用不带小数的紧凑写法:262144 -> "262K"。1M 级的都取整成 "1M" */
 const ctxFmt = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 0 });
 
-/** "mimo-v2.5-free" -> "mimo-v2.5-free[1M]";表里没有的原样返回 */
-export function modelLabel(id) {
-  const ctx = MODEL_CTX[id];
-  return ctx ? `${id}[${ctxFmt.format(ctx)}]` : String(id ?? '');
+/**
+ * "mimo-v2.5-free" -> "mimo-v2.5-free[1M]";查不到上限的原样返回。
+ *
+ * 上限从哪来:`/api/status` 的 `ctx`,也就是服务端 `server/capabilities.mjs`
+ * 那份**实测记录**(上游 `/zen/v1/models` 一个字节的元数据都不给,models.dev
+ * 那份对至少 4 个模型是错的 —— 给 deepseek-v4-flash-free 写 200000,真值
+ * 1048576)。这张表以前是手写在这个文件里的常量,代价付过两次:新模型上线不会
+ * 自动长出来,下线的模型倒是一直挂着。现在服务端只给当前清单里那些,前端拿到
+ * 什么显示什么。
+ *
+ * 服务端还没探到的(比如刚上线的模型、或者开机那次撞上限流)这里查不到,
+ * 就只显示模型名 —— 少个括号,不影响清单本身。
+ */
+export function modelLabel(id, ctxMap) {
+  const ctx = Number(ctxMap?.[id]);
+  return ctx > 0 ? `${id}[${ctxFmt.format(ctx)}]` : String(id ?? '');
 }
 
 /** 毫秒时长 -> 中文粗粒度,只保留两级单位 */
