@@ -23,7 +23,7 @@ const normalizeModels = (models) => [...new Set(
 /**
  * 探针失败时把业务 4xx（包括模型下线、鉴权/额度/端点错误）记成
  * unavailable; 429、网络错误、408、5xx 都是临时状态,先保留 unknown,
- * 并在短重试窗口后再确认,不能据此把模型灰掉六小时。
+ * 下一轮六小时探测再确认,不能据此把模型灰掉六小时。
  */
 export function classifyAvailabilityError(error) {
   const status = Number(error?.status) || 0;
@@ -162,7 +162,7 @@ export class ModelAvailability {
           status: classified.status,
           checkedAt: this.now(),
           error: classified,
-          nextTryAt: classified.status === 'unknown' ? this.now() + this.retryMs : null,
+          nextTryAt: null,
         });
         this.logger(
           classified.status === 'unavailable' ? 'warn' : 'info',

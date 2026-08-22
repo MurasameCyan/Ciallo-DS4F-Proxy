@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {
-  ModelAvailability, MODEL_AVAILABILITY_TTL_MS, MODEL_AVAILABILITY_RETRY_MS,
+  ModelAvailability, MODEL_AVAILABILITY_TTL_MS,
 } from '../server/model-availability.mjs';
 
 let n = 0;
@@ -88,7 +88,7 @@ await t('明确业务 4xx 都标为 unavailable,包括鉴权和额度错误', as
   }
 });
 
-await t('临时错误使用短重试时间,不会锁成六小时 unknown', async () => {
+await t('临时错误保持 unknown,也只随六小时周期重探', async () => {
   let now = 1000;
   let calls = 0;
   const a = new ModelAvailability({
@@ -98,19 +98,22 @@ await t('临时错误使用短重试时间,不会锁成六小时 unknown', async
   await a.probe(['limited-free']);
   now += 60_000 + 1;
   await a.probe(['limited-free']);
+  assert.equal(calls, 1, '一分钟后不能重打,否则长期 429 会白耗出口额度');
+  now += MODEL_AVAILABILITY_TTL_MS;
+  await a.probe(['limited-free']);
   assert.equal(calls, 2);
 });
 
-await t('后台调度在临时错误后采用短重试,稳定结果仍保持六小时周期', async () => {
+await t('后台调度对临时错误和稳定结果都保持六小时周期', async () => {
   let now = 1000;
   const a = new ModelAvailability({
     now: () => now,
     post: async () => { throw { status: 503, body: 'upstream down' }; },
   });
   await a.probe(['transient-free']);
-  assert.equal(a.nextDelay(['transient-free']), MODEL_AVAILABILITY_RETRY_MS);
+  assert.equal(a.nextDelay(['transient-free']), MODEL_AVAILABILITY_TTL_MS);
   a.post = async () => ({});
-  now += MODEL_AVAILABILITY_RETRY_MS + 1;
+  now += MODEL_AVAILABILITY_TTL_MS + 1;
   await a.probe(['transient-free']);
   assert.equal(a.status(['transient-free'])['transient-free'].status, 'available');
   assert.equal(a.nextDelay(['transient-free']), MODEL_AVAILABILITY_TTL_MS);

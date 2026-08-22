@@ -1023,8 +1023,8 @@ export class Gateway {
       () => this.freeModels(),
       {
         canProbe: async () => (await this.getAllNodes()).length > 0,
-        // 启动前的首轮探测可能已经留下临时错误;立即 tick 才会按
-        // nextTryAt 复用 60 秒重试,而不是无条件睡满六小时。
+        // 启动即计算当前记录的到期时间;稳定结果仍睡六小时,
+        // 没节点时才按短间隔检查节点是否恢复。
         immediate: true,
       },
     );
