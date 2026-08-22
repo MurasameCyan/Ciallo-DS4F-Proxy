@@ -180,6 +180,23 @@ await t('探档位撞 429 直接抛,不把限流当成「探到了」', async ()
   await assert.rejects(() => caps.probeEfforts('x-free'), (e) => e.status === 429);
 });
 
+await t('模型不可用不是能力信息,探测应保留错误而不是缓存假档位', async () => {
+  const { post } = fakePost(() => ({ throw: {
+    status: 400,
+    body: '{"error":{"message":"Model is unavailable"}}',
+  } }));
+  const caps = new Capabilities({ file: tmpFile('caps-model-unavailable.json'), post });
+  await assert.rejects(() => caps.probeEfforts('gone-free'), (e) => e.status === 400);
+  assert.equal(caps.get('gone-free'), null, '模型不可用不能落能力记录');
+});
+
+await t('鉴权错误不是能力信息,不能把 401 缓存成模型档位', async () => {
+  const { post } = fakePost(() => ({ throw: { status: 401, body: 'Unauthorized' } }));
+  const caps = new Capabilities({ file: tmpFile('caps-auth-error.json'), post });
+  await assert.rejects(() => caps.probeEfforts('auth-free'), (e) => e.status === 401);
+  assert.equal(caps.get('auth-free'), null);
+});
+
 await t('探上下文:校验器报了数就直接采信,一次出站', async () => {
   const { post, calls } = fakePost(() => ({ throw: { status: 400, body: 'Prompt exceeds max length 262144' } }));
   const caps = new Capabilities({ file: tmpFile('caps-c1.json'), post });

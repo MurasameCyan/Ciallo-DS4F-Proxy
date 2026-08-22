@@ -285,6 +285,11 @@ function makeApiRoutes({ cfg, gateway, subscriptionUpdater, probeWaitMs = PROBE_
         // 免费模型清单。从上游现拉(开机一次、之后每天一次),拉不到就是兜底常量 ——
         // 写死在前端的那份已经漏过一个新上线的免费模型
         models: gateway.freeModels(),
+        modelCooldowns: gateway.modelCooldown.summary(),
+        // 每个模型的最小请求连通性。探测在后台进行,这里始终同步返回最近快照;
+        // 前端据 status=unavailable 灰显,unknown/probing 保持可点击。
+        modelAvailability: gateway.modelAvailability(),
+        modelAvailabilityStatus: gateway.modelAvailabilityStatus?.() || null,
         // 每个模型的上下文上限,只给清单里现有的那些。这张表以前手写在
         // web/core.js 里,现在是探出来的实测记录(见 server/capabilities.mjs)——
         // 于是下线的模型不会再挂在面板上,新上的也不用等人去补一行常量
@@ -620,7 +625,12 @@ async function main() {
       // 清单要到位(不然会照着兜底常量去探),而且得有个能出站的节点。
       // 不 await,理由同上 —— 全都有记录时它一个字节都不出站,真有新模型时
       // 那几分钟里网关照常可用。
-      if (n > 0) modelsReady.then(() => gateway.probeCapabilities('开机'));
+      if (n > 0) modelsReady.then(async () => {
+        // 两类探测都走同一个单节点出口,先做 1-token 可用性确认,
+        // 再开始可能上传数 MB 的能力探测,避免启动瞬间并发撞额度。
+        await gateway.probeAvailability('开机', { force: true });
+        gateway.probeCapabilities('开机');
+      });
     } catch (e) {
       // 不退出:面板还能用,用户得进来改订阅地址。退了就只剩看 docker logs 猜。
       log('error', `[mihomo] 启动失败: ${e.message}`);
@@ -629,10 +639,14 @@ async function main() {
     log('warn', '[config] 还没有订阅地址 —— 打开面板在「配置」里填,或设 SUBSCRIPTION_URL 环境变量');
   }
   subscriptionUpdater.schedule();
+  // 可用性结果六小时刷新一次。探测本身只在有节点时执行;没有订阅时定时器
+  // 仍然 unref,不会阻止进程退出,配置保存后 /api/status 会立即补一次。
+  gateway.startAvailabilityScheduler?.();
 
   const bye = async (sig) => {
     log('info', `[exit] 收到 ${sig},收尾中`);
     subscriptionUpdater.stop();
+    gateway.stopAvailabilityScheduler?.();
     server.close();
     await mihomo.stop(log);
     process.exit(0);

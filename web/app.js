@@ -10,7 +10,7 @@ import {
   successRate, fmtPercent, cooldownDeadline, remainMs, nodeRows,
   pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown, COOLDOWN_MS,
   fmtDelay, delayGrade, fmtAgo, hasNewer, callLog, nodeStats, configPayload, updateHours,
-  modelLabel,
+  modelLabel, modelState,
 } from './core.js';
 
 const $ = (id) => document.getElementById(id);
@@ -289,24 +289,37 @@ function renderConn() {
  *
  * 名字后面的 `[1M]` 是上下文上限,来自服务端的实测记录(status.ctx);上游不给这个
  * 元数据,服务端还没探到的就只显示模型名(刚上线的新模型有那么几十秒是这样)。
+ * modelAvailability 是最小连通性探针的快照;只有明确 unavailable 的项灰显,
+ * unknown/probing 仍保留,避免把暂时限流或网络故障误画成下线。
  */
 function renderModels() {
   const list = Array.isArray(S.status.models) ? S.status.models : [];
   const ctx = S.status.ctx && typeof S.status.ctx === 'object' ? S.status.ctx : {};
+  const availability = S.status.modelAvailability
+    && typeof S.status.modelAvailability === 'object'
+    ? S.status.modelAvailability : {};
   const ul = $('models');
   // 内容没变就不重建。以前是每轮无条件重建(8 个 <li> 比 diff 还便宜),但下面
   // 要读 scrollWidth 量溢出,那会强制同步重排 —— 2 秒一次地重排一整格不值得,
   // 而这个清单几周才变一次
   //
   // key 里必须连上下文一起算:新模型是先进清单、几十秒后才探出上限的,只看清单
-  // 的话那个 `[1M]` 要等到清单下次真的变了才补上
-  const key = JSON.stringify(list.map((m) => [m, ctx[m] ?? 0]));
+  // 的话那个 `[1M]` 要等到清单下次真的变了才补上。状态也放进来:探针后台
+  // 完成时清单本身不变,但胶囊仍要从 probing 变成 available/unavailable
+  const key = JSON.stringify(list.map((m) => {
+    const state = modelState(m, availability);
+    return [m, ctx[m] ?? 0, state.status, state.message];
+  }));
   if (ul.dataset.key === key) return;
   ul.dataset.key = key;
 
   ul.replaceChildren(...list.map((m) => {
     const li = document.createElement('li');
+    const state = modelState(m, availability);
+    li.classList.add(state.status);
     li.textContent = modelLabel(m, ctx);
+    li.setAttribute('aria-label', `${li.textContent} · ${state.label}`);
+    if (state.message) li.title = `${li.textContent} · ${state.message}`;
     return li;
   }));
 
@@ -316,7 +329,7 @@ function renderModels() {
   for (const li of ul.children) {
     if (li.scrollWidth <= li.clientWidth + 1) continue;
     li.tabIndex = 0;
-    li.title = li.textContent;
+    li.title ||= li.textContent;
   }
 }
 

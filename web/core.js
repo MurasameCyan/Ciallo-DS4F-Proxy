@@ -47,6 +47,33 @@ export function modelLabel(id, ctxMap) {
   return ctx > 0 ? `${id}[${ctxFmt.format(ctx)}]` : String(id ?? '');
 }
 
+/**
+ * 面板模型状态只接受后端约定的四种值。缺记录、旧网关或坏值统一归为
+ * unknown:网络抖动不能被误画成模型已下线。message 只展示明确的上游
+ * 不可用原因,避免把限流/连接错误混进模型状态。
+ */
+const MODEL_STATE_LABELS = {
+  unknown: '状态未知',
+  probing: '探测中',
+  available: '可用',
+  unavailable: '不可用',
+};
+
+export function modelState(id, availability) {
+  const raw = availability && typeof availability === 'object' ? availability[id] : null;
+  const candidate = String(raw?.status ?? '').trim().toLowerCase();
+  const status = Object.hasOwn(MODEL_STATE_LABELS, candidate) ? candidate : 'unknown';
+  const message = status === 'unavailable'
+    ? String(raw?.error?.message ?? '').trim()
+    : '';
+  return {
+    status,
+    label: MODEL_STATE_LABELS[status],
+    message,
+    muted: status === 'unavailable',
+  };
+}
+
 /** 毫秒时长 -> 中文粗粒度,只保留两级单位 */
 export function fmtUptime(ms) {
   const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));

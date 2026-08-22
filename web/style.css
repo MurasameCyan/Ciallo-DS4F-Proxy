@@ -657,6 +657,30 @@ input[readonly] { color: var(--fg-2); }
 }
 .models li::-webkit-scrollbar { display: none; }
 
+/* 模型状态用胶囊边框左侧的小点表达,文字仍保持完整可复制。只有上游明确
+   判定不可用的模型灰显;未知/探测中不能因为网络问题被误当成下线。 */
+.models li { position: relative; padding-left: 20px; }
+.models li::before {
+  content: '';
+  position: absolute; left: 8px; top: 50%;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--fg-2); transform: translateY(-50%);
+}
+.models li.unknown::before { background: var(--fg-2); }
+.models li.probing {
+  border-color: color-mix(in oklab, var(--amber) 42%, var(--line-2));
+}
+.models li.probing::before { background: var(--amber); }
+.models li.available {
+  border-color: color-mix(in oklab, var(--mint) 34%, var(--line-2));
+}
+.models li.available::before { background: var(--mint); }
+.models li.unavailable {
+  color: var(--fg-2); border-color: var(--line);
+  opacity: .52;
+}
+.models li.unavailable::before { background: var(--fg-2); }
+
 /* ── 按钮 ─────────────────────────────────────────────── */
 
 .btn {

@@ -23,7 +23,12 @@ import {
 } from './anthropic.mjs';
 import { Capabilities } from './capabilities.mjs';
 import { ModelMetadataStore, MODELS_DEV_TTL_MS } from './model-metadata.mjs';
+import { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 import { safeEqual } from './auth.mjs';
+import { classifyUpstreamError, upstreamErrorMessage } from './upstream-errors.mjs';
+
+export { classifyUpstreamError } from './upstream-errors.mjs';
+export { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 
 const OPENCODE_HOST = 'opencode.ai';
 const CHAT_PATH = '/zen/v1/chat/completions';
@@ -36,6 +41,10 @@ const MODELS_PATH = '/zen/v1/models';
 // 造成「解冻→立刻重打→再冻」的高频刷屏。60s 足够躲开一阵限流窗口,又能在其余
 // 节点也不行时较快回来重试。带 Retry-After 的仍按上游给的时长走(见 mark429)。
 export const COOLDOWN_MS = 60 * 1000;
+export const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
+// availability 不是节点限流:没有节点时状态探测最多每分钟尝试一次,避免面板轮询
+// 把 mihomo 控制端口和上游一起打满。真正的成功/失败结果六小时才过期。
+const MODEL_AVAILABILITY_RETRY_MS = 60 * 1000;
 
 /**
  * 解析 Retry-After 响应头,返回秒数(null 表示没有或解析失败)。
@@ -712,6 +721,54 @@ export class NodeCooldown {
   }
 }
 
+/** 上游明确说模型不可用时,短暂跳过该模型,不要继续消耗其它出口额度。 */
+export class ModelCooldown {
+  constructor(ttlMs = MODEL_COOLDOWN_MS) {
+    this.ttlMs = ttlMs;
+    this.cooldowns = new Map(); // model -> { until, message }
+  }
+
+  mark(model, message = '') {
+    const id = String(model ?? '').trim();
+    if (!id) return;
+    this.cooldowns.set(id, { until: Date.now() + this.ttlMs, message: String(message || '') });
+  }
+
+  get(model) {
+    const id = String(model ?? '').trim();
+    const entry = this.cooldowns.get(id);
+    if (!entry) return null;
+    const remain = entry.until - Date.now();
+    if (remain <= 0) {
+      this.cooldowns.delete(id);
+      return null;
+    }
+    return { ...entry, remain: Math.ceil(remain / 1000) };
+  }
+
+  isCooling(model) { return this.get(model) !== null; }
+
+  clear(model) {
+    const id = String(model ?? '').trim();
+    return id ? this.cooldowns.delete(id) : false;
+  }
+
+  clearAll() {
+    const n = this.cooldowns.size;
+    this.cooldowns.clear();
+    return n;
+  }
+
+  summary() {
+    const out = [];
+    for (const [model] of this.cooldowns) {
+      const entry = this.get(model);
+      if (entry) out.push({ model, remain: entry.remain, message: entry.message });
+    }
+    return out;
+  }
+}
+
 /** token 用量统计,持久化到 /data,重启不丢 */
 export class UsageTracker {
   /**
@@ -862,6 +919,7 @@ export class Gateway {
     this.config = cfg;          // { apiKey, port, ... },外部改了这里立即生效
     this.logger = logger;
     this.cooldown = new NodeCooldown();
+    this.modelCooldown = new ModelCooldown();
     this.usage = new UsageTracker(USAGE_FILE, logger, cfg.persistUsage === true);
     this.agent = new MihomoAgent(MIXED_PORT);
     this.nodeCache = null;
@@ -879,6 +937,14 @@ export class Gateway {
     this.metadata = new ModelMetadataStore({ file: MODELS_DEV_FILE, logger });
     this.metadataAttemptAt = 0;
     this.metadataFetch = null;
+    // 免费模型可用性是独立于能力记录的短请求探针。结果只在内存里留存:
+    // 重启后重新确认,避免把旧 IP/旧上游状态当成当前事实。
+    this.availability = new ModelAvailability({
+      post: (body) => this.forward(body),
+      logger,
+    });
+    this.availabilityFetch = null;
+    this.availabilityNextTryAt = 0;
 
     // 每个模型的上下文上限和思考强度档位。盘上那份 + 内置初值,查不到的开机现探
     // (见 probeCapabilities)。post 直接给 forward:探测要的就是「发一次非流式
@@ -912,6 +978,63 @@ export class Gateway {
         this.logger('warn', `[caps] 探测出错${reason ? `(${reason})` : ''}: ${e.message}`);
         return { probed: [], skipped: [], note: 'error' };
       });
+  }
+
+  /**
+   * 探测当前免费清单的连通性。必须先确认 mihomo 至少有一个节点,
+   * 否则 status:0 只代表本地没出站,不能把所有模型误报成不可用。
+   * availabilityFetch + 模块内 running 两层去重,分别挡住状态轮询和同一轮内的
+   * 重入。force 只给「刚拉到新模型」这类明确事件使用。
+   */
+  probeAvailability(reason = '', { force = false } = {}) {
+    if (this.availabilityFetch) return this.availabilityFetch;
+    if (!force && Date.now() < this.availabilityNextTryAt && !this.availability.running) {
+      return Promise.resolve(this.availability.status(this.models));
+    }
+    this.availabilityNextTryAt = Date.now() + MODEL_AVAILABILITY_RETRY_MS;
+    this.availabilityFetch = (async () => {
+      const nodes = await this.getAllNodes();
+      if (!nodes.length) {
+        this.logger('info', `[availability] 无可用节点,跳过探测${reason ? `(${reason})` : ''}`);
+        return this.availability.status(this.models);
+      }
+      return this.availability.probe(this.models);
+    })()
+      .catch((e) => {
+        this.logger('info', `[availability] 探测失败${reason ? `(${reason})` : ''}: ${e?.message || e}`);
+        return this.availability.status(this.models);
+      })
+      .finally(() => { this.availabilityFetch = null; });
+    return this.availabilityFetch;
+  }
+
+  /** 面板要的模型可用性表;到期探测放后台,绝不阻塞 /api/status。 */
+  modelAvailability() {
+    const models = this.freeModels();
+    if (this.availability.needsProbe(models) && !this.availability.running) {
+      this.probeAvailability('状态').catch(() => {});
+    }
+    return this.availability.status(models);
+  }
+
+  /** 开机/节点就绪后启动每六小时一轮的后台探测。 */
+  startAvailabilityScheduler() {
+    this.availability.startScheduler(
+      () => this.freeModels(),
+      {
+        canProbe: async () => (await this.getAllNodes()).length > 0,
+        immediate: false,
+      },
+    );
+    return this.availability.schedulerStatus();
+  }
+
+  stopAvailabilityScheduler() {
+    this.availability.stopScheduler();
+  }
+
+  modelAvailabilityStatus() {
+    return this.availability.schedulerStatus();
   }
 
   /** 面板要的那张「id → 上下文上限」,只给当前清单里的 —— 下线的模型不该显示 */
@@ -953,12 +1076,13 @@ export class Gateway {
   /** 手动重置:清冷却 + 解锁 + 弃节点缓存(订阅换了以后旧节点名已经不存在了) */
   resetCooldowns() {
     const n = this.cooldown.clearAll();
+    const m = this.modelCooldown.clearAll();
     this.lockedNode = null;
     this.affinity.clear();
     this.nodeCache = null;
     this.nodeCacheTime = 0;
-    this.logger('ok', `[reset] 清空 ${n} 个冷却记录,重置锁定节点`);
-    return n;
+    this.logger('ok', `[reset] 清空 ${n} 个节点冷却和 ${m} 个模型冷却记录,重置锁定节点`);
+    return n + m;
   }
 
   // ── /v1/* 路由 ────────────────────────────────────────
@@ -1050,11 +1174,18 @@ export class Gateway {
         const gone = this.models.filter((m) => !free.includes(m));
         this.models = free;
         this.modelsAt = Date.now();
+        for (const model of gone) {
+          this.modelCooldown.clear(model);
+          this.availability.expire(model);
+        }
         if (added.length) this.logger('info', `[models] 免费清单 ${free.length} 个,新增 ${added.join(', ')}`);
         if (gone.length) this.logger('info', `[models] 免费清单 ${free.length} 个,下线 ${gone.join(', ')}`);
         // 新上的模型现探一次,别等下次重启。下线的**不删记录** —— 它哪天回来了
         // id 一样就直接复用,而面板显示的是这份清单,记录里多几条没人问它。
-        if (added.length) this.probeCapabilities('新模型');
+        if (added.length) {
+          this.probeCapabilities('新模型');
+          this.probeAvailability('新模型', { force: true }).catch(() => {});
+        }
         return { models: free, added, gone };
       })
       .catch((e) => {
@@ -1161,6 +1292,12 @@ export class Gateway {
       return dialect.fail(res, 400,
         `Model not available: ${model} —— 只接受 /v1/models 里的免费模型`, 'invalid_model');
     }
+    const unavailable = this.modelCooldown.get(model);
+    if (unavailable) {
+      return dialect.fail(res, 400,
+        `Model unavailable: ${model} —— 上游暂不可用,约 ${unavailable.remain}s 后重试`,
+        'invalid_model', { cooldown: [{ model, remain: unavailable.remain }] });
+    }
     body.model = model;
 
     /**
@@ -1179,10 +1316,15 @@ export class Gateway {
     const effort = reasoningEffort(inbound, model);
     dialect.applyEffort(body, effort);
 
-    // session 同时服务可选的 OpenCode 请求头和节点 affinity。请求头开关关着时
-    // 仍做稳定调度,只是 identity 不发往上游。
+    // session 同时服务稳定上游标识和节点 affinity。完整 OpenCode 请求头开关
+    // 关着时只发 x-opencode-session,其余头不发。
     const requestIdentity = identityHeaders({ headers: req.headers, body: inbound });
-    const identity = this.config.opencodeIdentityHeaders ? requestIdentity : null;
+    // 稳定 session 是独立能力:即使完整 OpenCode 头开关关闭,也把会话标识发给
+    // 上游,让同一对话有机会命中 prompt cache。其余 client/project/user-agent
+    // 仍遵守原有实验开关,避免无意改变免费端点的请求画像。
+    const identity = this.config.opencodeIdentityHeaders
+      ? requestIdentity
+      : { 'x-opencode-session': requestIdentity['x-opencode-session'] };
     const affinityKey = this.affinity.key(requestIdentity['x-opencode-session'], model);
 
     // 排过序的表:延迟低的在前,测不通的直接不在表里。pickAvailable 取的是
@@ -1313,6 +1455,19 @@ export class Gateway {
         return dialect.fail(res, 429, 'All nodes rate-limited', 'all_nodes_429', { cooldown: this.cooldown.summary() });
       }
       return dialect.fail(res, 503, 'No usable upstream node', 'all_nodes_unavailable');
+    };
+
+    const returnUpstreamError = (e, attemptRecorded = false) => {
+      const status = Number(e?.status) || 502;
+      if (!attemptRecorded) this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
+      this.usage.record(body.model, null, false);
+      this.logger('error', `[chat] HTTP ${status}: ${String(e?.body ?? e?.message ?? '').slice(0, 300)}`);
+      if (dialect === OPENAI || dialect === RESPONSES) {
+        let payload;
+        try { payload = JSON.parse(e?.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
+        return json(res, payload, status);
+      }
+      return dialect.fail(res, status, upstreamErrorMessage(e?.body) || `HTTP ${status}`, errTypeFor(status));
     };
 
     // 次数和时间两个上限,谁先到都停。次数防「48 个节点挨个试」,
@@ -1450,22 +1605,40 @@ export class Gateway {
           continue;
         }
 
-        // 400/500 之类:换节点也是同样结果,直接把上游的话原样带回去。
+        const kind = classifyUpstreamError(status, e.body);
+        if (kind === 'model_unavailable') {
+          this.modelCooldown.mark(body.model, upstreamErrorMessage(e.body));
+          this.availability.markUnavailable(body.model, e);
+          return returnUpstreamError(e);
+        }
+
+        if (kind === 'retryable') {
+          this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
+          tried.add(cur);
+          netRetry = 0;
+          if (this.lockedNode === cur) this.lockedNode = null;
+          unbind(cur);
+          const group = providerGroup(body.model);
+          let moved = false;
+          while (!moved) {
+            const next = pickNext(group, tried);
+            if (!next) break;
+            switches++;
+            if (await switchTo(next)) {
+              moved = true;
+              break;
+            }
+            tried.add(next);
+            if (switches > MAX_NODE_TRIES) break;
+          }
+          if (moved) continue;
+          return returnUpstreamError(e, true);
+        }
+
+        // 其它 4xx:换节点也是同样结果,直接把上游的话原样带回去。
         // OpenAI 和 Responses 的错误体本来就是 {error:{...}} 同形,原样透传;
         // 只有 Anthropic 客户端读不懂,得摘成 message 塞进它那套壳里。
-        this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
-        this.usage.record(body.model, null, false);
-        this.logger('error', `[chat] HTTP ${status}: ${String(e.body).slice(0, 300)}`);
-        if (dialect === OPENAI || dialect === RESPONSES) {
-          let payload;
-          try { payload = JSON.parse(e.body); } catch { payload = { error: { message: `HTTP ${status}` } }; }
-          return json(res, payload, status);
-        }
-        // Anthropic 客户端只认自己那套错误体,上游的原样转过去它读不懂,
-        // 于是把上游的话摘成 message 塞进正确的壳里
-        let msg = `HTTP ${status}`;
-        try { msg = JSON.parse(e.body)?.error?.message || msg; } catch {}
-        return dialect.fail(res, status, msg, errTypeFor(status));
+        return returnUpstreamError(e);
       }
     }
     return giveUp(`换过 ${MAX_NODE_TRIES} 个节点仍未成功`);
@@ -1478,8 +1651,8 @@ export class Gateway {
    * 不带 Authorization + User-Agent: node 是刻意的 —— zen 免费端点就认这个形态,
    * 补上 Bearer 反而 401。额度按出口 IP 算,所以换 IP 才是有意义的动作。
    *
-   * identity 非空时(实验开关开着)覆盖掉 User-Agent 并补上 OpenCode 那组头,
-   * 见 identityHeaders。关着的时候这里的行为和以前一模一样。
+   * identity 非空时补上稳定 session;完整 identity 对象(实验开关开着)还会覆盖
+   * User-Agent 并补上 OpenCode 那组头。Authorization 始终不加入。
    */
   reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH }) {
     return {

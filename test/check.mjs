@@ -13,7 +13,7 @@ import {
   COOLDOWN_MS, MAX_LOG, fmtTokens, fmtUptime, fmtClock, successRate, fmtPercent,
   cooldownDeadline, remainMs, nodeRows, pushLog, maskKey, endpointBase, anthropicBase, rankBreakdown,
   fmtDelay, delayGrade, fmtAgo, hasNewer, cacheRate, nodeStats, callLog, configPayload, updateHours,
-  modelLabel,
+  modelLabel, modelState,
 } from '../web/core.js';
 
 let n = 0;
@@ -261,6 +261,48 @@ t('modelLabel 给模型名带上下文后缀,服务端没给上限的原样返�
   for (const id of Object.keys(CTX)) {
     assert.match(modelLabel(id, CTX), /\[\d+[KM]\]$/, `${id} 的后缀得是纯数字加 K/M`);
   }
+});
+
+t('modelState 归一四种模型状态,坏值和缺字段回退 unknown', () => {
+  const states = {
+    ready: { status: 'available' },
+    checking: { status: 'probing' },
+    gone: { status: 'unavailable', error: { message: 'Model is unavailable' } },
+    bad: { status: 'broken' },
+  };
+  assert.deepEqual(modelState('ready', states), {
+    status: 'available', label: '可用', message: '', muted: false,
+  });
+  assert.deepEqual(modelState('checking', states), {
+    status: 'probing', label: '探测中', message: '', muted: false,
+  });
+  assert.deepEqual(modelState('gone', states), {
+    status: 'unavailable', label: '不可用', message: 'Model is unavailable', muted: true,
+  });
+  for (const [id, map] of [['new', states], ['bad', states], ['new', null]]) {
+    assert.deepEqual(modelState(id, map), {
+      status: 'unknown', label: '状态未知', message: '', muted: false,
+    });
+  }
+});
+
+t('模型清单渲染四种状态,状态变化会刷新且只有 unavailable 灰显', () => {
+  const app = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../web/style.css', import.meta.url), 'utf8');
+  const fn = app.match(/function renderModels\(\)[\s\S]*?\n\}/)?.[0] || '';
+  assert.ok(fn, '应能定位 renderModels');
+
+  assert.match(fn, /modelAvailability/, '应消费 status.modelAvailability');
+  assert.match(fn, /modelState\(m,\s*availability\)/, '状态归一应留在 core.js');
+  assert.match(fn, /state\.status/, '状态必须进入缓存键,否则轮询更新不会重绘');
+  assert.match(fn, /classList\.add\(state\.status\)/, '每个模型项应带状态类');
+  assert.match(fn, /aria-label/, '不能只靠颜色区分状态');
+
+  for (const state of ['unknown', 'probing', 'available', 'unavailable']) {
+    assert.match(css, new RegExp(`\\.models li\\.${state}\\b`), `${state} 应有明确样式`);
+  }
+  const unavailable = css.match(/\.models li\.unavailable\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(unavailable, /opacity:\s*0?\.[0-9]+/, '明确不可用的模型应灰显');
 });
 
 t('rankBreakdown 按成功次数降序并截断', () => {

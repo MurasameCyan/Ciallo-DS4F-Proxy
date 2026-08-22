@@ -24,6 +24,7 @@
  */
 
 import fs from 'node:fs';
+import { classifyUpstreamError, isCapabilityError } from './upstream-errors.mjs';
 
 /** 思考强度六档,从弱到强。和 anthropic.mjs 的 LADDER 是同一份顺序 */
 export const LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
@@ -167,15 +168,17 @@ const filler = (n) => 'word '.repeat(n);
 /**
  * 这次失败是「上游的校验器在说话」,还是「压根没送到」?
  *
- * 只有 4xx(429 除外)算前者。5xx、以及 status 0(连不上、超时、TLS 失败)的
- * 错误原文里没有任何关于这个模型的信息 —— 把它们当成「探到了:宽松、顶档 high」
+ * 只有可解释的业务 4xx 算前者。模型不可用、429、5xx 以及 status 0
+ * (连不上、超时、TLS 失败)的错误原文里没有能力信息 —— 把它们当成「探到了:
+ * 宽松、顶档 high」
  * 会往盘上写一条**假记录**,而且以后再也不会重探(run 只探没记录的),于是一次
  * 网络抖动能让某个模型永久按错的档位跑。宁可这一轮没探到:下次开机、或者面板
  * 上点一下「补探能力」就会再试。
  *
  * 429 也归这边:限流不是这个模型的属性,是这个出口 IP 此刻的状态。
  */
-const informative = (e) => Number(e?.status) >= 400 && Number(e.status) < 500 && Number(e.status) !== 429;
+const informative = (e) => isCapabilityError(e?.status, e?.body)
+  && classifyUpstreamError(e?.status, e?.body) === 'terminal';
 
 /**
  * @param {object} o

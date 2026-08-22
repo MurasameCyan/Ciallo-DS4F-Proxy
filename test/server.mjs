@@ -32,6 +32,7 @@ delete process.env.API_KEY;
 const {
   NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
+  classifyUpstreamError, MODEL_COOLDOWN_MS,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -111,6 +112,24 @@ await t('无 Retry-After 时兜底冷却 60 秒(不是 5 分钟)', () => {
   assert.ok(Math.abs(entry.until - (Date.now() + COOLDOWN_MS)) < 100,
     `应是 now+COOLDOWN_MS,差了 ${entry.until - (Date.now() + COOLDOWN_MS)}ms`);
   assert.equal(entry.retryAfter, null, '兜底不该伪造一个 Retry-After 数值');
+});
+
+await t('上游错误分类:模型不可用不当成节点限流,5xx 才是可重试错误', () => {
+  assert.equal(classifyUpstreamError(400, '{"error":{"message":"Model is unavailable"}}'), 'model_unavailable');
+  assert.equal(classifyUpstreamError(429, 'Model is unavailable'), 'rate_limited');
+  assert.equal(classifyUpstreamError(408, 'upstream timeout'), 'retryable');
+  assert.equal(classifyUpstreamError(503, 'upstream overloaded'), 'retryable');
+  assert.equal(classifyUpstreamError(400, 'invalid reasoning_effort'), 'terminal');
+});
+
+await t('模型冷却会过期,且默认窗口足够短不永久隐藏恢复的模型', () => {
+  assert.ok(MODEL_COOLDOWN_MS > 0 && MODEL_COOLDOWN_MS <= 60 * 60 * 1000);
+  const g = new Gateway(load(), () => {});
+  g.modelCooldown.mark('ds4f');
+  assert.ok(g.modelCooldown.isCooling('ds4f'));
+  assert.equal(g.modelCooldown.summary()[0].model, 'ds4f');
+  g.modelCooldown.cooldowns.set('ds4f', { until: Date.now() - 1 });
+  assert.equal(g.modelCooldown.isCooling('ds4f'), false);
 });
 
 await t('冷却过期即删,但 lastMarked 记着最近限流时刻(供 rankNodes 排队尾)', () => {
@@ -572,6 +591,22 @@ await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', a
   assert.equal(new Set(affinityKeys).size, 1, '三种协议必须共用同一套 session+model 调度键');
 });
 
+await t('完整身份头开关关闭时仍发送稳定 session 标识', async () => {
+  const cfg = { ...load(), opencodeIdentityHeaders: false };
+  const g = new Gateway(cfg, () => {});
+  g.getAllNodes = async () => ['A'];
+  g.rankNodes = (nodes) => nodes;
+  g.ensureNode = async () => 'A';
+  let sent = null;
+  g.attempt = async (...args) => { sent = args[7]; };
+  const body = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'stable opening' }] };
+  const req = Readable.from([JSON.stringify(body)]);
+  req.headers = {};
+  await g.handleChat(req, fakeRes(), OPENAI);
+  assert.match(sent?.['x-opencode-session'] || '', /^ses_[0-9a-f]{24}$/);
+  assert.equal(sent?.['x-opencode-client'], undefined, '完整身份头仍受开关控制');
+});
+
 await t('身份头:不同请求的 request ID 不一样', () => {
   const a = identityHeaders({ headers: {} });
   const b = identityHeaders({ headers: {} });
@@ -682,6 +717,21 @@ function retryGateway(file, script) {
 
 const BODY = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
 
+await t('模型冷却命中时直接回 400,不再查节点或消耗出口', async () => {
+  const cfg = { ...load(), persistUsage: false };
+  const g = new Gateway(cfg, () => {});
+  g.models = [FREE_MODELS[0]];
+  g.modelsAt = Date.now();
+  g.modelCooldown.mark(FREE_MODELS[0]);
+  g.getAllNodes = async () => { throw new Error('不该查节点'); };
+  const req = Readable.from([JSON.stringify(BODY)]);
+  req.headers = {};
+  const res = fakeRes();
+  await g.handleChat(req, res, OPENAI);
+  assert.equal(res.code, 400);
+  assert.match(res.body, /上游暂不可用/);
+});
+
 await t('A 撞 429、B 成功:总览记 1 次成功,两个节点各记自己那一笔', async () => {
   const g = retryGateway('sm1.json', (i) => {
     if (i === 0) throw Object.assign(new Error('429'), { status: 429 });
@@ -709,6 +759,60 @@ await t('A 撞 429、B 成功:总览记 1 次成功,两个节点各记自己那�
   assert.equal(d.byNode.B.totalTokens, 7, 'token 记在真正干活的那个节点上');
   assert.deepEqual(g.tries, ['A', 'B']);
   assert.equal(g.affinity.get(affinityKey), 'B', '429 后该 session+model 迁移到成功节点');
+});
+
+await t('模型不可用只冷却模型,不切出口节点', async () => {
+  const g = retryGateway('sm-model-unavailable.json', () => {
+    throw Object.assign(new Error('model unavailable'), {
+      status: 400,
+      body: '{"error":{"message":"Model is unavailable"}}',
+    });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 400);
+  assert.deepEqual(g.tries, ['A'], '模型级错误不能浪费其它出口的尝试');
+  assert.ok(g.modelCooldown.isCooling(BODY.model));
+  assert.equal(g.availability.status([BODY.model])[BODY.model].status, 'unavailable',
+    '真实请求遇到模型下线时,面板状态也应立即变灰');
+  assert.equal(g.cooldown.isCooling('A', 'default'), false, '模型不可用不能把节点放进 429 冷却');
+});
+
+await t('5xx 会切到下一个节点,成功后只算一次客户端成功', async () => {
+  const g = retryGateway('sm-upstream-5xx.json', (i) => {
+    if (i === 0) throw Object.assign(new Error('upstream overloaded'), {
+      status: 503,
+      body: '{"error":{"message":"upstream overloaded"}}',
+    });
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 200);
+  assert.deepEqual(g.tries, ['A', 'B']);
+  assert.equal(g.usage.getStats().byNode.A.upstreamError, 1);
+  assert.equal(g.usage.getStats().total.success, 1);
+});
+
+await t('所有节点都 5xx 时保留上游最后一个错误,不伪报节点全挂', async () => {
+  const g = retryGateway('sm-upstream-5xx-final.json', () => {
+    throw Object.assign(new Error('upstream overloaded'), {
+      status: 503,
+      body: '{"error":{"message":"upstream overloaded"}}',
+    });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 503);
+  assert.match(res.body, /upstream overloaded/);
+  assert.deepEqual(g.tries, ['A', 'B']);
+  assert.ok(!res.body.includes('all_nodes_unavailable'));
 });
 
 await t('同一节点上的网络重试:每次真发出去都记一笔,不是整段算一次', async () => {
@@ -1753,6 +1857,16 @@ await t('带对凭据能读到配置和状态', async () => {
   // 免费模型清单也搭这趟车。这里出不了站,所以看到的必然是兜底那份 ——
   // 要验的是这个字段一定在、一定非空:前端已经不留本地常量了
   assert.deepEqual(s.models, FREE_MODELS);
+  assert.deepEqual(Object.keys(s.modelAvailability).sort(), [...FREE_MODELS].sort(),
+    '状态表必须覆盖当前免费清单');
+  assert.ok(Object.values(s.modelAvailability).every((x) => x.status === 'unknown'),
+    '没有出站节点时只能是 unknown,不能误报 unavailable');
+  assert.equal(s.modelAvailabilityStatus.ttlMs, 6 * 60 * 60 * 1000);
+  assert.deepEqual(Object.keys(s.modelAvailability), FREE_MODELS,
+    '状态接口必须给当前清单里的每个模型一个可用性状态');
+  assert.ok(Object.values(s.modelAvailability).every((v) =>
+    ['unknown', 'probing', 'available', 'unavailable'].includes(v.status)),
+  '可用性状态只能是约定的四种值');
   // 构建标识搭 /api/status 的车过去,面板右上角那个徽标全靠这几个字段
   assert.equal(s.build, 'a'.repeat(7));
   assert.match(s.buildUrl, /^https:\/\/github\.com\/.+\/commit\/a{7}$/);
