@@ -87,6 +87,11 @@ export class MihomoAgent extends https.Agent {
     const port = Number(options.port) || 443;
     connectTunnel({ proxyPort: this.proxyPort, host, port })
       .then((sock) => {
+        // TCP 层 keepalive:推理模型思考几分钟一个字节都不吐,中间的 NAT/防火墙
+        // 会把「没流量」的连接当死链掐掉 —— 日志里的 [stream] 中断: aborted 就是
+        // 这个。keepalive 探测包让链路一直被认成活跃。连接复用是关着的,这只影响
+        // 当前请求自己的隧道。
+        sock.setKeepAlive(true, 15_000);
         cb(null, tls.connect({
           ...options,                   // 把调用方的 TLS 选项(ca / rejectUnauthorized 等)带上
           socket: sock,

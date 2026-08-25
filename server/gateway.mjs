@@ -42,6 +42,23 @@ const MODELS_PATH = '/zen/v1/models';
 // 节点也不行时较快回来重试。带 Retry-After 的仍按上游给的时长走(见 mark429)。
 export const COOLDOWN_MS = 60 * 1000;
 export const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
+// 节点封域(机场在 CONNECT/TLS 层拒连 opencode.ai)的冷却。这不是限流,是确定性
+// 故障:同一节点短时间内不会自己好,但机场可能几小时后换线路,所以取 30 分钟 ——
+// 比无 Retry-After 的 429(60s)长得多,又不用等一天。
+export const BLOCKED_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * 从远端日志钉死的三类「机场节点拒绝代理 opencode.ai」,加上 CONNECT 直接回 403:
+ *   - Client network socket disconnected before secure TLS connection was established
+ *     (mihomo 日志里对应 dial ... err code: 403,CONNECT 阶段被拒)
+ *   - Hostname/IP does not match certificate's altnames ...(DNS 劫持到别的站)
+ *   - EPROTO ... tlsv1 unrecognized name / SSL alert number 112(SNI 封锁)
+ * 它们全是确定性的:重试同一节点只会把每次请求拖长 40-90s,直接换下一个。
+ */
+export function isNodeBlockedError(e) {
+  const text = String(e?.body ?? e?.message ?? '');
+  return /disconnected before secure TLS connection was established|does not match certificate's altnames|tlsv1 unrecognized name|SSL alert number 112|CONNECT[^\n]*(?:403|拒绝)/i.test(text);
+}
 // availability 不是节点限流:没有节点时状态探测最多每分钟尝试一次,避免面板轮询
 // 把 mihomo 控制端口和上游一起打满。真正的成功/失败结果六小时才过期。
 const MODEL_AVAILABILITY_RETRY_MS = 60 * 1000;
@@ -77,9 +94,9 @@ function parseRetryAfter(value) {
  * 所以改成时间驱动:超预算立刻回一个真错误。宁可让客户端看到 504,
  * 也不能让它挂到超时 —— 挂着连日志都对不上号。
  */
-export const REQUEST_DEADLINE_MS = 75_000;   // 一个请求从进来到回复的上限(小请求的基线)
-const UPSTREAM_TIMEOUT_MS = 45_000;          // 单次请求的静默上限(非流式的整段等待 / 流式的首字节)
-const STREAM_IDLE_MS = 120_000;              // 流式:开始吐了以后允许的静默
+export const REQUEST_DEADLINE_MS = 300_000;  // 一个请求从进来到回复的上限(小请求的基线)
+const UPSTREAM_TIMEOUT_MS = 120_000;         // 单次请求的静默上限(非流式的整段等待 / 流式的首字节)
+const STREAM_IDLE_MS = 300_000;              // 流式:开始吐了以后允许的静默
 const MAX_NODE_TRIES = 6;                    // 最多换几个节点。48 个全试一遍没意义:
                                              // 连续 6 个都 429 基本就是整体被限了
 const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开新的尝试了
@@ -102,8 +119,8 @@ const MIN_TRY_MS = 8_000;                    // 剩这么点时间就别再开�
  * 注意流式并不吃这个亏:实测 1M 请求的首字节也只要 7.5s(上游不等 prefill 走完
  * 才开口),放宽对它只是保险。真正被固定预算掐死的是非流式。
  */
-export const budgetFor = (bytes) => Math.min(420_000, REQUEST_DEADLINE_MS + Math.round((bytes / 1048576) * 75_000));
-export const silentFor = (bytes) => Math.min(240_000, UPSTREAM_TIMEOUT_MS + Math.round((bytes / 1048576) * 45_000));
+export const budgetFor = (bytes) => Math.min(900_000, REQUEST_DEADLINE_MS + Math.round((bytes / 1048576) * 75_000));
+export const silentFor = (bytes) => Math.min(600_000, UPSTREAM_TIMEOUT_MS + Math.round((bytes / 1048576) * 45_000));
 
 /**
  * 把上游的 reasoning_content 翻成 Anthropic 的 thinking 块。
@@ -574,6 +591,14 @@ export class NodeAffinity {
     return true;
   }
 
+  /**
+   * 单节点优先:新绑定一律落 preferred(全局 lockedNode = 当前节点),已有绑定
+   * 粘自己的。额度按出口 IP 算,把会话摊到多个出口等于每份额度都只用到一半;
+   * 而且全局 selector 只有一个,并发分散选址必然互相拔节点(乱跳的根因)。
+   * 迁移只在失败(429/封域/5xx)时发生,由 attempt 的换节点路径驱动。
+   *
+   * loads 计数保留:面板统计和 LRU 还用得着,但不再参与选址。
+   */
   pick(key, nodes, { available = () => true, exclude = null, preferred = null } = {}) {
     const candidates = (nodes || []).filter((node) => !exclude?.has(node) && available(node));
     const current = this.get(key);
@@ -581,17 +606,17 @@ export class NodeAffinity {
     if (current) this.release(key, current);
     if (!candidates.length) return null;
 
-    if (!key) return candidates.includes(preferred) ? preferred : candidates[0];
-    const minimum = Math.min(...candidates.map((node) => this.load(node)));
-    const leastLoaded = candidates.filter((node) => this.load(node) === minimum);
-    return this.bind(key, leastLoaded.includes(preferred) ? preferred : leastLoaded[0]);
+    // 没有 key 的调用(旧路径)和新绑定行为一致:preferred 在候选里就落它
+    if (preferred && candidates.includes(preferred)) return this.bind(key, preferred);
+    return this.bind(key, candidates[0]);
   }
 
   migrate(key, failedNode, nodes, options = {}) {
     this.release(key, failedNode);
     const exclude = new Set(options.exclude || []);
     if (failedNode) exclude.add(failedNode);
-    return this.pick(key, nodes, { ...options, exclude, preferred: null });
+    // 迁移时也粘 preferred(当前节点),不往零负载节点散 —— 单节点优先的延续
+    return this.pick(key, nodes, { ...options, exclude });
   }
 
   dropNode(node) {
@@ -632,6 +657,15 @@ export class NodeCooldown {
     const key = this.#key(node, group);
     this.cooldowns.set(key, { until: Date.now() + ms, retryAfter: retryAfterSec });
     this.lastMarked.set(key, Date.now());
+  }
+
+  /**
+   * 封域冷却。和 429 共用一张表(跳过逻辑一样),但时长独立、不带 retryAfter,
+   * summary 里标 reason 让面板能区分「被限流」和「被机场封了」。
+   */
+  markBlocked(node, group = 'default') {
+    this.cooldowns.set(this.#key(node, group), { until: Date.now() + BLOCKED_COOLDOWN_MS, retryAfter: null, blocked: true });
+    this.lastMarked.set(this.#key(node, group), Date.now());
   }
 
   isCooling(node, group = 'default') {
@@ -714,7 +748,8 @@ export class NodeCooldown {
         node,
         group,
         remain: Math.ceil(left / 1000),
-        retryAfter: c.retryAfter
+        retryAfter: c.retryAfter,
+        blocked: c.blocked === true
       });
     }
     return out;
@@ -1429,6 +1464,7 @@ export class Gateway {
     const pickNext = (group, exclude) => affinityKey
       ? this.affinity.pick(affinityKey, nodes, {
         exclude,
+        preferred: this.lockedNode,   // 迁移也优先粘全局当前节点(单节点优先)
         available: (node) => !this.cooldown.isCooling(node, group),
       })
       : this.cooldown.pickAvailable(nodes, group, exclude);
@@ -1575,6 +1611,29 @@ export class Gateway {
           // 超时/连接失败:每次都是真发出去过的一次尝试,所以重试前先记一笔
           this.usage.recordAttempt(cur, 'timeout', null, null, call);
           fails.timeout++;
+
+          // 机场拒连(TLS 握手断/证书劫持/SNI 封锁)是确定性故障:
+          // 重试同一节点只会把每次请求拖长几十秒(卡死事故的根因),直接进
+          // 封域冷却并立刻换下一个。
+          if (isNodeBlockedError(e)) {
+            const group = providerGroup(body.model);
+            this.cooldown.markBlocked(cur, group);
+            tried.add(cur);
+            netRetry = 0;
+            this.logger('warn', `[blocked] node="${cur}" 疑似机场拒连该域名(${String(e.body || e.message).slice(0, 80)}),冷却 ${BLOCKED_COOLDOWN_MS / 60_000}min,立即换下一个`);
+            unbind(cur);
+            if (this.lockedNode === cur) this.lockedNode = null;
+            const next = pickNext(group, tried);
+            if (!next) return giveUp('所有节点都被机场拒连或冷却中');
+            switches++;
+            if (await switchTo(next)) cur = next;
+            else {
+              tried.add(next);
+              continue;
+            }
+            continue;
+          }
+
           if (++netRetry <= MAX_NET_RETRY) {
             this.logger('warn', `[net-retry ${netRetry}/${MAX_NET_RETRY}] node="${cur}": ${e.body || e.message}`);
             await sleep(1000);
@@ -1736,6 +1795,21 @@ export class Gateway {
       let firstByte = 0;
       const finish = (fn) => { if (!settled) { settled = true; fn(); } };
 
+      /**
+       * 思考期心跳:上游 200 之后到首个业务事件之间可能静默几分钟(DS4F 实测
+       * 200s+),网关和上游之间有 TCP keepalive 撑着,但网关和客户端之间还隔着
+       * 宝塔 nginx —— 它默认 proxy_read_timeout 60s,静默期一到就掐浏览器这条
+       * 连接(「web 进不去 / 长任务被截断」的另一半)。SSE 注释行(: ping)是
+       * 协议允许的 keepalive,所有客户端都会忽略它;首字节到了就停。
+       */
+      let heartbeat = null;
+      const startHeartbeat = () => {
+        heartbeat = setInterval(() => {
+          try { res.write(': ping\n\n'); } catch {}
+        }, 15_000);
+      };
+      const stopHeartbeat = () => { clearInterval(heartbeat); heartbeat = null; };
+
       const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path }), (resp) => {
         if (resp.statusCode !== 200) {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
@@ -1754,6 +1828,7 @@ export class Gateway {
           'X-Accel-Buffering': 'no',
         });
         started = true;
+        startHeartbeat();
         const sink = dialect.sink(res, body.model);
 
         // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
@@ -1766,6 +1841,7 @@ export class Gateway {
 
         let buf = '';
         resp.on('data', (chunk) => {
+          if (!firstByte) stopHeartbeat();   // 真数据来了,心跳使命完成
           firstByte ||= Date.now() - t0;
           sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
           buf += chunk.toString();
@@ -1784,10 +1860,12 @@ export class Gateway {
           }
         });
         resp.on('end', () => finish(() => {
+          stopHeartbeat();
           sink.end();
           resolve({ ok: true, usage, ttfb: firstByte });
         }));
         resp.on('error', (e) => finish(() => {
+          stopHeartbeat();
           this.logger('error', `[stream] 中断: ${e.message}`);
           // sink.fail 会补一个合法收尾(Anthropic 那边是 error + message_stop),
           // 客户端的状态机于是能正常结束,而不是等到自己超时
@@ -1797,6 +1875,7 @@ export class Gateway {
       });
 
       r.on('error', (e) => finish(() => {
+        stopHeartbeat();
         if (started) {
           // 头已经发了,只能就地收尾。这里不能 reject 回重试循环。
           this.logger('error', `[stream] 传输中断: ${e.message}`);

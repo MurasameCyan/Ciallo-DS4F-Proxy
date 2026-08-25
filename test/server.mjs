@@ -32,7 +32,7 @@ delete process.env.API_KEY;
 const {
   NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
-  classifyUpstreamError, MODEL_COOLDOWN_MS,
+  classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -102,6 +102,46 @@ await t('Retry-After 覆盖默认冷却时长', () => {
   const expected = Date.now() + 30_000;
   assert.ok(Math.abs(entry.until - expected) < 100, `应是 now+30s,差了 ${entry.until - expected}ms`);
   assert.equal(entry.retryAfter, 30);
+});
+
+await t('机场封域特征(TLS 握手断/证书不符/EPROTO)识别为节点封锁', () => {
+  // 三种都是远端日志里实测出现过的确定性故障:mihomo 日志 dial → err code: 403,
+  // 客户端侧就是这三副面孔。它们不是「慢」,重试同一节点纯烧时间。
+  assert.equal(isNodeBlockedError({ status: 0, body: 'Client network socket disconnected before secure TLS connection was established' }), true);
+  assert.equal(isNodeBlockedError({ status: 0, body: "Hostname/IP does not match certificate's altnames: Host: opencode.ai. is not in the cert's altnames: DNS:jsdelivr.net" }), true);
+  assert.equal(isNodeBlockedError({ status: 0, body: 'write EPROTO ... tlsv1 unrecognized name:...SSL alert number 112' }), true);
+  assert.equal(isNodeBlockedError({ status: 0, body: 'CONNECT 拒绝: HTTP 403' }), true, '代理层直接回 403 也是封域');
+  assert.equal(isNodeBlockedError({ status: 0, body: 'timeout after 45000ms' }), false, '超时是另一回事,走原有重试');
+  assert.equal(isNodeBlockedError({ status: 502, body: 'bad gateway' }), false, '上游 HTTP 错误不归它管');
+});
+
+await t('封域节点首次失败即冷却 BLOCKED_COOLDOWN_MS,不做同节点重试', () => {
+  assert.ok(BLOCKED_COOLDOWN_MS >= 10 * 60 * 1000 && BLOCKED_COOLDOWN_MS <= 24 * 3600 * 1000,
+    `封域冷却应是分钟到小时级(10min~1d),得到 ${BLOCKED_COOLDOWN_MS}`);
+  const c = new NodeCooldown();
+  c.markBlocked('A', 'default');
+  assert.equal(c.isCooling('A', 'default'), true);
+  assert.equal(c.pickAvailable(['A', 'B'], 'default'), 'B', '冷却中的节点立刻被跳过');
+});
+
+await t('封域节点第一次失败就换下一个,不再烧两次同节点重试', async () => {
+  // 旧行为:A 上首发+重试2次(每次45s)→才换B;一次请求白耗90s+。
+  // 新行为:识别出 TLS 断连是机场拒连,A 直接进冷却,B 立刻接上。
+  const g = retryGateway('sm-blocked.json', (i) => {
+    if (i === 0) throw Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { status: 0 });
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+  });
+  const body = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, body, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.deepEqual(g.tries, ['A', 'B'], '识别出封域后必须立刻换节点,同节点重试一次都不能有');
+  assert.equal(res.code, 200);
+  assert.equal(g.cooldown.isCooling('A', 'default'), true, '该节点应进入封域冷却');
+  const d = g.usage.getStats();
+  assert.equal(d.byNode.A.timeout, 1, '只有首发那一笔,没有重试');
+  assert.equal(d.byNode.B.success, 1);
 });
 
 await t('无 Retry-After 时兜底冷却 60 秒(不是 5 分钟)', () => {
@@ -614,7 +654,9 @@ await t('身份头:不同请求的 request ID 不一样', () => {
   assert.match(a['x-opencode-request'], /^[0-9a-f-]{36}$/);
 });
 
-await t('会话调度:同 session+model 粘原节点,新绑定选负载最低的', () => {
+await t('会话调度:所有会话粘同一个节点,用完额度才整体迁移', () => {
+  // 用户预期:单节点出站,额度按出口 IP 算 —— 所有新会话都该粘当前节点,
+  // 直到 429/封禁把它换掉。旧设计按「负载最低」摊开,并发时互相拔全局 selector。
   assert.equal(typeof NodeAffinity, 'function');
   const a = new NodeAffinity();
   const one = a.key('session-1', 'model-a');
@@ -622,29 +664,30 @@ await t('会话调度:同 session+model 粘原节点,新绑定选负载最低的
   const otherModel = a.key('session-1', 'model-b');
 
   assert.equal(a.pick(one, ['A', 'B', 'C'], { preferred: 'A' }), 'A',
-    '负载相同时兼容全局 lockedNode');
-  assert.equal(a.pick(one, ['C', 'B', 'A'], { preferred: 'C' }), 'A',
-    '已有 affinity 优先于新的 lockedNode 和排序');
-  assert.equal(a.pick(two, ['A', 'B', 'C'], { preferred: 'A' }), 'B',
-    'A 已有一个绑定,新 session 应落到零负载的 B');
-  assert.equal(a.pick(otherModel, ['A', 'B', 'C'], { preferred: 'A' }), 'C',
-    '同 session 换 model 是独立绑定,继续按负载摊开');
-  assert.deepEqual(['A', 'B', 'C'].map((node) => a.load(node)), [1, 1, 1]);
+    '新绑定落全局 lockedNode(当前节点)');
+  assert.equal(a.pick(two, ['A', 'B', 'C'], { preferred: 'B' }), 'B',
+    'lockedNode 指到哪就落哪,不按负载分散');
+  assert.equal(a.pick(otherModel, ['C', 'A', 'B'], { preferred: null }), 'C',
+    '没有 preferred 时落排序第一的节点(延迟最低),同样不分摊');
+  assert.deepEqual(['A', 'B', 'C'].map((node) => a.load(node)), [1, 1, 1],
+    '负载计数只做统计,不再参与选址');
 });
 
-await t('会话调度:失败节点释放绑定并迁移,节点消失也不留脏负载', () => {
+await t('会话调度:已有绑定的会话继续粘原节点,失败才迁走', () => {
   const a = new NodeAffinity();
   const key = a.key('session-1', 'model-a');
   a.bind(key, 'A');
+  assert.equal(a.pick(key, ['C', 'B', 'A'], { preferred: 'C' }), 'A',
+    '已有 affinity 粘原节点,lockedNode 和数组顺序都拉不走');
   a.bind(a.key('busy', 'model-a'), 'B');
 
-  assert.equal(a.migrate(key, 'A', ['A', 'B', 'C']), 'C',
-    '排除失败的 A 后,C 比已有绑定的 B 负载低');
-  assert.equal(a.get(key), 'C');
-  assert.equal(a.load('A'), 0);
+  // migrate:绑定节点(A)失败被排除后,优先落当前节点(preferred=B),不挑零负载
+  assert.equal(a.migrate(key, 'A', ['A', 'B', 'C'], { preferred: 'B' }), 'B',
+    '迁移时也粘 lockedNode,不往零负载节点散');
+  assert.equal(a.get(key), 'B');
 
-  assert.equal(a.pick(key, ['A', 'B']), 'A', 'C 已从候选表消失,绑定应自动迁走');
-  assert.equal(a.load('C'), 0, '失效节点的负载计数必须同步扣掉');
+  // 候选里没有 preferred 时退回排序第一
+  assert.equal(a.migrate(key, 'B', ['C', 'A']), 'C');
 });
 
 await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
@@ -660,7 +703,7 @@ await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {
   assert.equal(on.headers['Content-Length'], 2, 'Content-Length 排在身份头后面,不能被盖掉');
 });
 
-await t('Gateway 选点:旧 affinity 胜过 lockedNode,新 affinity 按绑定负载分流', async () => {
+await t('Gateway 选点:新会话一律粘 lockedNode,已有会话粘原节点', async () => {
   const g = new Gateway(load(), () => {});
   const model = FREE_MODELS[0];
   const oldKey = g.affinity.key('old-session', model);
@@ -671,9 +714,10 @@ await t('Gateway 选点:旧 affinity 胜过 lockedNode,新 affinity 按绑定负
   g.getCurrentNode = async () => g.cur;
   g.switchNode = async (node) => { g.cur = node; return true; };
 
+  // 新会话不再按负载分散:lockedNode 是 A 就落 A —— 单节点用完额度才换
   const fresh = await g.ensureNode(['A', 'B'], fakeRes(), OPENAI, Date.now() + 10_000, model, newKey);
-  assert.equal(fresh, 'B', 'A 已有绑定,新 session 应选零负载的 B,不能被全局锁吞掉');
-  assert.equal(g.affinity.get(newKey), 'B');
+  assert.equal(fresh, 'A', '新 session 粘当前节点,不往其它出口散');
+  assert.equal(g.affinity.get(newKey), 'A');
 
   const sticky = await g.ensureNode(['B', 'A'], fakeRes(), OPENAI, Date.now() + 10_000, model, oldKey);
   assert.equal(sticky, 'A', '已有 session 仍回原节点,即使 lockedNode/数组顺序指向别处');
@@ -958,11 +1002,22 @@ await t('时间预算按请求体积放大,大到 1Mi 也装得下', () => {
   assert.ok(budgetFor(2_000) - REQUEST_DEADLINE_MS < 1_000, '几 KB 的小请求最多加出不到一秒,行为和以前一样');
   assert.ok(budgetFor(4.3 * 1048576) > 350_000, '1M 上下文实测最坏 129s prefill,预算得装得下');
   assert.ok(silentFor(4.3 * 1048576) > 220_000);
-  assert.equal(budgetFor(999 * 1048576), 420_000, '再大也得有个顶,不能挂到天荒地老');
-  assert.equal(silentFor(999 * 1048576), 240_000);
+  assert.equal(budgetFor(999 * 1048576), 900_000, '再大也得有个顶,不能挂到天荒地老');
+  assert.equal(silentFor(999 * 1048576), 600_000);
   // 连续放大,不分档 —— 分档会让刚卡在档位下面的请求白等
   assert.ok(budgetFor(0.9 * 1048576) > budgetFor(0.8 * 1048576));
   assert.ok(silentFor(0.9 * 1048576) > silentFor(0.8 * 1048576));
+});
+
+await t('推理模型的思考时间不能被网关自己掐死', () => {
+  // 实测 DS4F「写个 SVG 动画」200s 内推理 68k 字、正文 0 字;慢节点 TTFB 61-63s。
+  // 旧值 75s/45s 基线必然把这类请求杀在半路 —— 日志里全是 ttfb timeout after 45-63s。
+  const BASE = REQUEST_DEADLINE_MS;
+  assert.ok(BASE >= 300_000, `小请求总预算基线至少 300s(思考 200s+ 很常见),得到 ${BASE}`);
+  assert.ok(budgetFor(2_000) >= 300_000, '小请求也要容得下一次完整的长思考');
+  assert.ok(silentFor(2_000) >= 120_000, 'TTFB 窗口至少 120s:实测有节点 61-63s 才回首个字节');
+  assert.ok(budgetFor(4.3 * 1048576) >= silentFor(4.3 * 1048576),
+    '总预算必须 ≥ 单次静默上限,否则一次等待就烧穿整个预算');
 });
 
 // ── 节点延迟与排序 ──────────────────────────────────────
