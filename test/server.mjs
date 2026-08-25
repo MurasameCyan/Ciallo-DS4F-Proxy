@@ -38,6 +38,7 @@ const {
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
+const { LaneManager } = await import('../server/lane.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
@@ -689,6 +690,135 @@ await t('会话调度:已有绑定的会话继续粘原节点,失败才迁走', 
 
   // 候选里没有 preferred 时退回排序第一
   assert.equal(a.migrate(key, 'B', ['C', 'A']), 'C');
+});
+
+await t('lane:主 lane 忙时按实时节点快照创建独立子 lane', async () => {
+  let now = 0;
+  const created = [];
+  const manager = new LaneManager({
+    idleMs: 100,
+    now: () => now,
+    createChild: async ({ node }) => {
+      const lane = { id: `child-${node}`, node };
+      created.push(lane);
+      return lane;
+    },
+    destroyChild: async () => {},
+  });
+  const available = (blocked) => (node) => !blocked.has(node);
+  const main = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: available(new Set()) });
+  const child = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: available(new Set(['B'])) });
+
+  assert.equal(main.id, 'main');
+  assert.equal(child.node, 'C', '子 lane 必须跳过主 lane 和主 lane 的实时禁用节点');
+  assert.equal(created.length, 1);
+  manager.release(main);
+  manager.release(child);
+  now = 101;
+  await manager.reap();
+  assert.equal(created.length, 1);
+  assert.equal(manager.children().length, 0, '子 lane 空闲后应被回收');
+});
+
+await t('lane:子 lane 有活动请求时不会被回收', async () => {
+  let now = 0;
+  let destroyed = 0;
+  const manager = new LaneManager({
+    idleMs: 100,
+    now: () => now,
+    createChild: async ({ node }) => ({ id: `child-${node}`, node }),
+    destroyChild: async () => { destroyed++; },
+  });
+  const main = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  const child = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  manager.release(main);
+  now = 101;
+  await manager.reap();
+  assert.equal(destroyed, 0);
+  assert.equal(manager.children().length, 1);
+  manager.release(child);
+  now = 202;   // 推进时钟越过 idleMs,否则 lastUsed 贴着当前时刻,cutoff 追不上
+  await manager.reap();
+  assert.equal(destroyed, 1);
+});
+
+await t('lane:没有可用独立节点时回退主 lane,不丢请求', async () => {
+  const manager = new LaneManager({
+    createChild: async () => { throw new Error('不应创建'); },
+    destroyChild: async () => {},
+  });
+  const main = await manager.acquire({ nodes: ['A'], mainNode: 'A', available: () => true });
+  const fallback = await manager.acquire({ nodes: ['A'], mainNode: 'A', available: () => true });
+  assert.equal(fallback.id, 'main');
+  manager.release(main);
+  manager.release(fallback);
+});
+
+await t('lane:gateway 的 acquireLane 复用主 lane 的实时冷却表', async () => {
+  const g = new Gateway(load(), () => {});
+  let seq = 0;
+  g._spawnChildLane = async ({ node }) => ({ id: ++seq, node, agent: {}, inst: {}, active: 0, lastUsed: 0 });
+  g._destroyChildLane = async () => {};
+
+  // 主 lane 占用后,子 lane 只能挑没被主 lane 占用的节点
+  const main = await g.acquireLane({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  assert.equal(main.id, 'main');
+  const child = await g.acquireLane({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  assert.equal(child.node, 'B', '子 lane 必须避开主 lane 占用节点');
+
+  // 冷却表是共享的:主 lane 标记 B 冷却后,子 lane 立刻跳过 B,改选 C
+  g.cooldown.mark429('B', 'default');
+  const notCooling = (node) => !g.cooldown.isCooling(node, 'default');
+  const child2 = await g.acquireLane({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: notCooling });
+  assert.equal(child2.node, 'C', 'B 冷却后子 lane 跳到 C,冷却表实时生效');
+
+  // 只剩被主 lane 占用的 A 时,没有独立节点,回落主 lane
+  g.cooldown.mark429('C', 'default');
+  const child3 = await g.acquireLane({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: notCooling });
+  assert.equal(child3.id, 'main', '没有可用独立节点,回落主 lane');
+
+  g.lanes.release(main);
+  g.lanes.release(child);
+  g.lanes.release(child2);
+  if (child3.id !== 'main') g.lanes.release(child3);
+});
+
+await t('lane:子 lane 请求成功后 release,主 lane 不受影响', async () => {
+  const g = new Gateway(load(), () => {});
+  let spawned = 0;
+  g._spawnChildLane = async ({ node }) => ({ id: ++spawned, node, agent: {}, inst: {}, active: 0, lastUsed: 0 });
+  g._destroyChildLane = async () => {};
+  g.getAllNodes = async () => ['A', 'B'];
+  g.rankNodes = (n) => n;
+  g.getCurrentNode = async () => null;
+  g.switchNode = async () => true;
+  g._childSwitch = async () => true;
+  g.cooldown.clear = () => {};
+  g.saveLastNode = () => {};
+  g.usage.recordAttempt = () => {};
+  g.usage.record = () => {};
+
+  const body = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'x' }] };
+  const req = Readable.from([JSON.stringify(body)]);
+  req.headers = {};
+  const res = fakeRes();
+
+  // 主 lane 已被占用且锁定在 A,第二次请求应落到子 lane 的 B
+  g.lockedNode = 'A';
+  await g.acquireLane({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  let usedLane = null;
+  g.forward = async () => ({ usage: {}, _ttfb: 1 });
+  g.attempt = async (...args) => {
+    usedLane = args[10];
+    assert.equal(usedLane.node, 'B', '第二个请求落到子 lane');
+    assert.equal(g.lanes.children().length, 1);
+    // 子 lane 成功不更新全局 lockedNode(attempt 内部会 release,这里只需校验)
+    return undefined;
+  };
+
+  await g.handleChat(req, res, OPENAI);
+  assert.equal(usedLane?.node, 'B');
+  assert.equal(g.lanes.children().length, 1, '子 lane 仍存活,等待空闲回收');
 });
 
 await t('reqOpts:开关关着时出站还是裸 User-Agent: node', () => {

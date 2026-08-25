@@ -103,16 +103,16 @@ export function save(cfg) {
  * 订阅地址用 JSON.stringify 转义:机场的 token 里常有 & ? = #,
  * 裸着写进 yaml 会被当成注释或流式集合的语法。
  */
-export function buildMihomoYaml(subscriptionUrl) {
+export function buildMihomoYaml(subscriptionUrl, { mixedPort = MIXED_PORT, ctrlPort = CTRL_PORT } = {}) {
   if (!subscriptionUrl) throw new Error('订阅地址为空');
   const url = JSON.stringify(String(subscriptionUrl));
 
   return `# 由 Ciallo Zen Proxy 自动生成,手改会在下次保存配置时被覆盖。
-mixed-port: ${MIXED_PORT}
+mixed-port: ${mixedPort}
 allow-lan: false
 mode: rule
 log-level: warning
-external-controller: 127.0.0.1:${CTRL_PORT}
+external-controller: 127.0.0.1:${ctrlPort}
 ipv6: false
 tcp-concurrent: true
 unified-delay: true
@@ -165,8 +165,24 @@ rules:
 }
 
 /** 写出 mihomo 配置文件,返回路径 */
-export function writeMihomoConfig(subscriptionUrl) {
+export function writeMihomoConfig(subscriptionUrl, { mixedPort = MIXED_PORT, ctrlPort = CTRL_PORT, name = '' } = {}) {
   ensureDirs();
-  fs.writeFileSync(MIHOMO_CONFIG, buildMihomoYaml(subscriptionUrl), 'utf8');
-  return MIHOMO_CONFIG;
+  // name 非空是子 lane:独立文件名 + 独立端口,和主 lane 的 mihomo-zen.yaml 并存不冲突
+  const file = name ? path.join(DATA_DIR, `mihomo-zen-${name}.yaml`) : MIHOMO_CONFIG;
+  fs.writeFileSync(file, buildMihomoYaml(subscriptionUrl, { mixedPort, ctrlPort }), 'utf8');
+  return file;
+}
+
+/**
+ * 子 lane 的端口和数据目录。主 lane 用默认值(MIXED_PORT/CTRL_PORT 和 mihomo-data),
+ * 子 lane 按序号偏移:多实例必须各占一个 mixed-port 和一个 external-controller 端口,
+ * 数据目录也要分开,否则会抢同一份 cache.db 锁。
+ * id 从 1 起(0 就是主 lane,直接用默认)。
+ */
+export function lanePorts(id) {
+  return { mixedPort: MIXED_PORT + id, ctrlPort: CTRL_PORT + id };
+}
+
+export function laneDataDir(id) {
+  return path.join(DATA_DIR, `mihomo-data-${id}`);
 }

@@ -15,8 +15,10 @@ import crypto from 'node:crypto';
 import { MihomoAgent } from './proxy.mjs';
 import {
   LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE,
-  MIXED_PORT, CTRL_PORT, POOL_NAME,
+  MIXED_PORT, CTRL_PORT, POOL_NAME, lanePorts, laneDataDir, writeMihomoConfig,
 } from './config.mjs';
+import { MihomoInstance } from './mihomo.mjs';
+import { LaneManager } from './lane.mjs';
 import {
   anthropicToOpenAI, openAIToAnthropic, anthropicError, errTypeFor, AnthropicStream, flattenText,
   reasoningEffort, setModelEfforts,
@@ -46,6 +48,10 @@ export const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
 // 故障:同一节点短时间内不会自己好,但机场可能几小时后换线路,所以取 30 分钟 ——
 // 比无 Retry-After 的 429(60s)长得多,又不用等一天。
 export const BLOCKED_COOLDOWN_MS = 30 * 60 * 1000;
+// 并发分摊:主 lane 忙时最多再拉起几个独立出口,每个子 lane 空闲满这个时间就回收。
+// 主 lane 常驻负责订阅刷新和默认出站;子 lane 只在真正并发时才存在,平时和现状一样。
+export const MAX_CHILD_LANES = 2;
+export const LANE_IDLE_MS = 5 * 60 * 1000;
 
 /**
  * 从远端日志钉死的三类「机场节点拒绝代理 opencode.ai」,加上 CONNECT 直接回 403:
@@ -1007,6 +1013,16 @@ export class Gateway {
     this.modelCooldown = new ModelCooldown();
     this.usage = new UsageTracker(USAGE_FILE, logger, cfg.persistUsage === true);
     this.agent = new MihomoAgent(MIXED_PORT);
+    // 多 lane 并发分摊。冷却表/节点表/affinity/usage 都留在这一个 Gateway 实例上,
+    // 子 lane 只多一个独立出站通道(独立 mihomo 进程 + 独立端口),选点/禁用决策
+    // 仍查同一份共享状态 —— 主 lane 标记 429/封域,子 lane 立刻一起看不到它。
+    this._laneSeq = 0;
+    this.lanes = new LaneManager({
+      idleMs: LANE_IDLE_MS,
+      maxChildren: MAX_CHILD_LANES,
+      createChild: ({ node }) => this._spawnChildLane({ node }),
+      destroyChild: (lane) => this._destroyChildLane(lane),
+    });
     this.nodeCache = null;
     this.nodeCacheTime = 0;
     this.delay = new Map();     // 节点 -> 实测延迟 ms;null = 测过但不通
@@ -1420,9 +1436,30 @@ export class Gateway {
     if (nodes.length === 0) {
       return dialect.fail(res, 503, '没有可用节点 —— 检查订阅地址和 mihomo 状态', 'no_nodes');
     }
-    const cur = await this.ensureNode(nodes, res, dialect, deadline, model, affinityKey);
+    // 并发分摊:主 lane 忙时(已有请求占用)尝试开子 lane,让它走独立出口 IP。
+    // 子 lane 只在有独立可用节点时才创建;没有就回落主 lane,绝不丢请求。
+    // 注意:子 lane 只出现在主 lane 已被占用的时刻,所以平时(单用户、低并发)
+    // 行为与现状完全一致 —— 一个节点用到底,只有并发挤压时才启用第二条线。
+    let lane = null;
+    try {
+      lane = await this.acquireLane({
+        nodes,
+        mainNode: this.lockedNode,
+        available: (node) => !this.cooldown.isCooling(node, providerGroup(model)),
+      });
+    } catch (e) {
+      this.logger('warn', `[lane] 分配失败,回落主 lane: ${e.message}`);
+    }
+
+    const cur = await this.ensureNode(nodes, res, dialect, deadline, model, affinityKey, lane);
     if (!cur) return;   // ensureNode 已经回过错误了
-    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey);
+    // 子 lane 绑定节点被冷却时 ensureNode 内部回退了,返回的 cur 是主 lane 选的。
+    // 此时 lane 已失去意义(它固定绑在冷却节点上),释放它、改走主 lane。
+    if (lane && lane.node !== cur) {
+      this.lanes.release(lane);
+      lane = null;
+    }
+    return this.attempt(res, body, nodes, cur, wantStream, dialect, deadline, identity, effort, affinityKey, lane);
   }
 
   /** Anthropic Messages API 入口。同一条路,只是换个方言。 */
@@ -1436,8 +1473,19 @@ export class Gateway {
   }
 
   /** 选定本次要用的节点并让 mihomo 切过去;返回节点名,失败返回 null(已响应) */
-  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity, model = null, affinityKey = '') {
+  async ensureNode(nodes, res, dialect = OPENAI, deadline = Infinity, model = null, affinityKey = '', lane = null) {
     const group = providerGroup(model);
+    // 子 lane 已经在拉起时固定绑了节点:直接用它,不再经主 selector 挑选/切换。
+    // 它选节点时用的就是这份共享冷却表,所以这里只需要再确认没被并发冷却掉。
+    if (lane && lane.node) {
+      if (!this.cooldown.isCooling(lane.node, group)) {
+        if (affinityKey) this.affinity.bind(affinityKey, lane.node);
+        return lane.node;
+      }
+      // 绑定节点已被冷却:释放 affinity,回退主 lane 的常规路径(主 lane 会另选)
+      if (affinityKey) this.affinity.release(affinityKey, lane.node);
+      lane = null;
+    }
     let cur = affinityKey
       ? this.affinity.pick(affinityKey, nodes, {
         preferred: this.lockedNode,
@@ -1492,7 +1540,7 @@ export class Gateway {
    * 每条 `return`(定案了)才有 record。
    */
   async attempt(res, body, nodes, cur, wantStream, dialect = OPENAI, deadline = Infinity,
-    identity = null, effort = '', affinityKey = '') {
+    identity = null, effort = '', affinityKey = '', lane = null) {
     const tried = new Set();
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
@@ -1502,8 +1550,11 @@ export class Gateway {
     const fails = { timeout: 0, rateLimited: 0 };
     const bind = (node) => { if (affinityKey) this.affinity.bind(affinityKey, node); };
     const unbind = (node) => { if (affinityKey) this.affinity.release(affinityKey, node); };
+    // 子 lane 的 selector 在它自己的 mihomo 进程里,切节点只能走它的控制端口;
+    // 主 lane 才动全局 selector。cooling 状态永远共享同一份,不影响。
+    const doSwitch = (node) => lane ? this._childSwitch(lane.inst, node) : this.switchNode(node);
     const switchTo = async (node) => {
-      if (!(await this.switchNode(node))) {
+      if (!(await doSwitch(node))) {
         unbind(node);
         return false;
       }
@@ -1518,6 +1569,8 @@ export class Gateway {
         available: (node) => !this.cooldown.isCooling(node, group),
       })
       : this.cooldown.pickAvailable(nodes, group, exclude);
+    // 终态统一释放 lane。成功/失败都会走到,子 lane 由此空闲计数归零、可被回收。
+    const finishLane = () => { if (lane) this.lanes.release(lane); };
 
     /**
      * 终态失败的统一出口。原来三处各写一套文案,其中「Tried N nodes, all
@@ -1529,6 +1582,7 @@ export class Gateway {
      * forceTimeout 给「预算烧穿」用 —— 那本身就是超时,和试了几次无关。
      */
     const giveUp = (note, forceTimeout = false) => {
+      finishLane();
       this.usage.record(body.model, null, false);
       // 只在失败路径上序列化:成功路径不该为一句错误文案付几 MiB 的代价
       const mib = JSON.stringify(body).length / 1048576;
@@ -1546,6 +1600,7 @@ export class Gateway {
     };
 
     const returnUpstreamError = (e, attemptRecorded = false) => {
+      finishLane();
       const status = Number(e?.status) || 502;
       if (!attemptRecorded) this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
       this.usage.record(body.model, null, false);
@@ -1568,8 +1623,8 @@ export class Gateway {
       const t0 = Date.now();
       try {
         const result = wantStream
-          ? await this.forwardStream(res, body, dialect, left(), identity)
-          : await this.forward(body, left(), identity, dialect.path);
+          ? await this.forwardStream(res, body, dialect, left(), identity, lane?.agent)
+          : await this.forward(body, left(), identity, dialect.path, lane?.agent);
 
         const dt = Date.now() - t0;
         if (wantStream) {
@@ -1577,9 +1632,12 @@ export class Gateway {
           // ok:false = 首字节之后断的 —— 响应已经发出去一半,重试不了,
           // 但这次尝试对节点来说是上游错误,对客户端来说是一次失败。
           if (result.ok) {
-            this.lockedNode = cur;
+            // 子 lane 不更新全局 lockedNode:并发子请求不该把主 lane 的粘滞顶掉
+            if (!lane) {
+              this.lockedNode = cur;
+              this.saveLastNode(cur);
+            }
             this.cooldown.clear(cur);
-            this.saveLastNode(cur);
             bind(cur);
           } else {
             unbind(cur);
@@ -1590,17 +1648,21 @@ export class Gateway {
             result.ok ? { ttfb: result.ttfb, total: dt } : null, call);
           this.usage.record(body.model, result.usage, result.ok);
           this.logger(result.ok ? 'ok' : 'error',
-            `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}" ${dt}ms effort=${effort || '默认'}`);
+            `[stream-${result.ok ? 'ok' : 'cut'}] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms effort=${effort || '默认'}`);
+          finishLane();
           return;
         }
-        this.lockedNode = cur;
+        if (!lane) {
+          this.lockedNode = cur;
+          this.saveLastNode(cur);
+        }
         this.cooldown.clear(cur);
-        this.saveLastNode(cur);
         bind(cur);
         this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
         this.usage.record(body.model, result.usage, true);
-        this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`
+        this.logger('ok', `[ok] node="${cur}"${lane ? ` lane=${lane.id}` : ''} ${dt}ms tokens=${result.usage?.total_tokens ?? '?'}`
           + ` effort=${effort || '默认'}`);
+        finishLane();
         return dialect.respond(res, result, body.model);
       } catch (e) {
         const status = e.status || 0;
@@ -1613,6 +1675,7 @@ export class Gateway {
           this.usage.record(body.model, null, false);
           this.logger('error', `[stream-mid] node="${cur}" 中断: ${e.body || e.message}`);
           try { res.end(); } catch {}
+          finishLane();
           return;
         }
 
@@ -1633,6 +1696,7 @@ export class Gateway {
             const s = this.cooldown.summary();
             this.usage.record(body.model, null, false);
             this.logger('error', `[chat] 全部节点冷却中: ${s.length} 个`);
+            finishLane();
             return dialect.fail(res, 429,
               `All nodes rate-limited, retry in ~${s[0]?.remain || Math.ceil(COOLDOWN_MS / 1000)}s`, 'all_nodes_429', { cooldown: s });
           }
@@ -1765,7 +1829,7 @@ export class Gateway {
    * identity 非空时补上稳定 session;完整 identity 对象(实验开关开着)还会覆盖
    * User-Agent 并补上 OpenCode 那组头。Authorization 始终不加入。
    */
-  reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH }) {
+  reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH, agent = this.agent }) {
     return {
       host: OPENCODE_HOST,
       port: 443,
@@ -1778,18 +1842,18 @@ export class Gateway {
         ...identity,
         'Content-Length': Buffer.byteLength(bodyStr),
       },
-      agent: this.agent,     // ← 真正经 mihomo 出站的地方
+      agent,     // ← 真正经 mihomo 出站的地方(子 lane 传自己的 agent,走独立出口)
       timeout,
     };
   }
 
-  forward(body, budget = Infinity, identity = null, path = CHAT_PATH) {
+  forward(body, budget = Infinity, identity = null, path = CHAT_PATH, agent = this.agent) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: false });
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       const t0 = Date.now();
-      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path, agent }), (resp) => {
         let data = '';
         // 非流式的「首字」= 上游开始回话的时刻。整个 body 是一次攒完的,
         // 所以它和总耗时差的就是传输那点时间,不像流式那样能差几十秒
@@ -1823,7 +1887,7 @@ export class Gateway {
    * 首字节发出去之后就不再 reject,而是 resolve 成 { ok, usage } —— 记账
    * 交给 attempt 一处做,不然「按节点分类」这件事得在两个文件里各写一遍。
    */
-  forwardStream(res, body, dialect = OPENAI, budget = Infinity, identity = null) {
+  forwardStream(res, body, dialect = OPENAI, budget = Infinity, identity = null, agent = this.agent) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
       const ttfb = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
@@ -1854,7 +1918,7 @@ export class Gateway {
       let keepAlive = null;
       const stopHeartbeat = () => { keepAlive?.stop(); keepAlive = null; };
 
-      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path, agent }), (resp) => {
         if (resp.statusCode !== 200) {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
@@ -2140,6 +2204,124 @@ export class Gateway {
 
   forgetLastNode() {
     try { fs.rmSync(LAST_NODE_FILE, { force: true }); } catch {}
+  }
+
+  // ── 子 lane 生命周期 ─────────────────────────────────
+
+  /**
+   * 拉起一个子 lane:独立 mihomo 进程 + 独立端口 + 独立数据目录,只为固定走
+   * 某个节点。它不拉订阅(配置里 provider 直接引用主 lane 的订阅 url),
+   * 不维护冷却(全在主进程 Gateway 内存里)。subscriptionUrl 由调用方传入。
+   */
+  async _spawnChildLane({ node }) {
+    const id = ++this._laneSeq;
+    const { mixedPort, ctrlPort } = lanePorts(id);
+    const dataDir = laneDataDir(id);
+    const configFile = writeMihomoConfig(this.config.subscriptionUrl, { mixedPort, ctrlPort, name: `lane${id}` });
+
+    const inst = new MihomoInstance({
+      configFile,
+      dataDir,
+      ctrlPort,
+      label: `lane${id}`,
+    });
+    await inst.start(this.logger);
+
+    // 选中的节点可能已被主 lane 冷却或下掉:以配置里有的为准,先切过去,失败再退
+    const ok = await this._childSwitch(inst, node);
+    if (!ok) {
+      await inst.stop(this.logger);
+      throw new Error(`子 lane ${id} 无法切换到节点 ${node}`);
+    }
+    const lane = {
+      id,
+      node,
+      inst,
+      ctrlPort,
+      mixedPort,
+      agent: new MihomoAgent(mixedPort),
+      active: 0,
+      lastUsed: this.lanes.now(),
+    };
+    this.logger('ok', `[lane${id}] 已拉起,绑定节点 ${node} (mixed ${mixedPort} / ctrl ${ctrlPort})`);
+    return lane;
+  }
+
+  async _destroyChildLane(lane) {
+    try {
+      this.logger('info', `[lane${lane.id}] 空闲回收,关闭节点 ${lane.node}`);
+      await lane.inst?.stop(this.logger);
+    } catch (e) {
+      this.logger('warn', `[lane${lane.id}] 回收失败: ${e.message}`);
+    }
+  }
+
+  /** 经子 lane 的控制端口切节点(它有自己的 ctrl 端口,不能动主 lane 的 selector) */
+  async _childSwitch(inst, name) {
+    try {
+      const r = await this._mihomoApi(inst.ctrlPort, `/proxies/${encodeURIComponent(POOL_NAME)}`, 'PUT', JSON.stringify({ name }));
+      return !!r;
+    } catch (e) {
+      this.logger('error', `[lane] 子实例切换失败: ${e.message}`);
+      return false;
+    }
+  }
+
+  /** 经指定 ctrl 端口发控制请求。默认主 lane(CTRL_PORT)。 */
+  _mihomoApi(ctrlPort = CTRL_PORT, p, method = 'GET', body = null) {
+    return new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port: ctrlPort, path: p, method, timeout: 10_000,
+        headers: body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } : {},
+      }, (resp) => {
+        let data = '';
+        resp.on('data', (c) => (data += c));
+        resp.on('end', () => {
+          if (resp.statusCode < 200 || resp.statusCode >= 300) {
+            let msg = '';
+            try { msg = JSON.parse(data)?.message || ''; } catch { msg = data.trim().slice(0, 120); }
+            return reject(new Error(`HTTP ${resp.statusCode}${msg ? `: ${msg}` : ''}`));
+          }
+          if (method !== 'GET') return resolve({});
+          try { resolve(JSON.parse(data)); } catch { resolve({}); }
+        });
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      req.end(body ?? undefined);
+    });
+  }
+
+  /** mihomoApi 仍走主 lane 控制端口 */
+  mihomoApi(p, method = 'GET', body = null) {
+    return this._mihomoApi(CTRL_PORT, p, method, body);
+  }
+
+  /**
+   * 为一次请求拿一个 lane。主 lane 忙时按实时节点快照看能否开子 lane;
+   * 没有独立节点或已达上限就回落主 lane,绝不丢请求。
+   */
+  async acquireLane({ nodes, mainNode, available }) {
+    return this.lanes.acquire({ nodes, mainNode, available });
+  }
+
+  /** 经子 lane 控制端口查当前节点 */
+  async _childGetCurrent(inst) {
+    try {
+      return (await this._mihomoApi(inst.ctrlPort, `/proxies/${encodeURIComponent(POOL_NAME)}`))?.now ?? null;
+    } catch { return null; }
+  }
+
+  /** 回收空闲子 lane。定时器/退出路径调用。 */
+  async reapIdleLanes() {
+    try { await this.lanes.reap(); } catch (e) {
+      this.logger('warn', `[lane] 回收异常: ${e.message}`);
+    }
+  }
+
+  /** 退出时回收全部子 lane(主 lane 由 mihomo.stop 管) */
+  async stopChildLanes() {
+    await this.lanes.clear();
   }
 }
 

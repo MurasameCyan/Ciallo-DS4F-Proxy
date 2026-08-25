@@ -642,12 +642,20 @@ async function main() {
   // 可用性结果六小时刷新一次。探测本身只在有节点时执行;没有订阅时定时器
   // 仍然 unref,不会阻止进程退出,配置保存后 /api/status 会立即补一次。
   gateway.startAvailabilityScheduler?.();
+  // 子 lane 空闲回收:每 60s 检查一次,空闲满 5 分钟(见 LANE_IDLE_MS)的子 lane
+  // 关掉并释放端口。unref:没有子 lane 时空转一秒钟也不挡进程退出。
+  const laneReaper = setInterval(() => {
+    gateway.reapIdleLanes().catch((e) => log('warn', `[lane] 回收异常: ${e.message}`));
+  }, 60_000);
+  laneReaper.unref?.();
 
   const bye = async (sig) => {
     log('info', `[exit] 收到 ${sig},收尾中`);
     subscriptionUpdater.stop();
     gateway.stopAvailabilityScheduler?.();
+    clearInterval(laneReaper);
     server.close();
+    await gateway.stopChildLanes?.();
     await mihomo.stop(log);
     process.exit(0);
   };
