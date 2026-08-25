@@ -1552,13 +1552,21 @@ export class Gateway {
     const unbind = (node) => { if (affinityKey) this.affinity.release(affinityKey, node); };
     // 子 lane 的 selector 在它自己的 mihomo 进程里,切节点只能走它的控制端口;
     // 主 lane 才动全局 selector。cooling 状态永远共享同一份,不影响。
-    const doSwitch = (node) => lane ? this._childSwitch(lane.inst, node) : this.switchNode(node);
+    // 节点名以子 lane 自己的表为准:名字在它表里就直切,不在(机场刚换节点、
+    // 主 lane 名字过期)就退到它表里第一个,保证切得动、不撞 proxy not exist。
+    const resolveChildName = (node) => (lane && lane.nodes && lane.nodes.includes(node))
+      ? node
+      : (lane && lane.nodes && lane.nodes.length ? lane.nodes[0] : node);
+    const doSwitch = (node) => lane
+      ? this._childSwitch(lane.inst, resolveChildName(node))
+      : this.switchNode(node);
     const switchTo = async (node) => {
+      const target = lane ? resolveChildName(node) : node;
       if (!(await doSwitch(node))) {
         unbind(node);
         return false;
       }
-      cur = node;
+      cur = target;   // 子 lane 可能落到它自己的第一个节点,记录实际名字而非请求名
       bind(cur);
       return true;
     };
@@ -2227,15 +2235,25 @@ export class Gateway {
     });
     await inst.start(this.logger);
 
-    // 选中的节点可能已被主 lane 冷却或下掉:以配置里有的为准,先切过去,失败再退
-    const ok = await this._childSwitch(inst, node);
+    // inst.start 只保证控制端口就绪,provider 还在异步拉订阅。等子 lane 自己的
+    // 节点表出来(带 | 的节点名必须用它自己那份为准,不能拿主 lane 的名字硬切)。
+    const own = await this._childNodes(inst);
+    if (!own.length) {
+      await inst.stop(this.logger);
+      throw new Error(`子 lane ${id} 拉不到节点`);
+    }
+    // 优先用主 lane 选定的节点(名字一致说明同一订阅);不一致(机场刚换节点)
+    // 就退到子 lane 自己的第一个,保证落在不同出口而不是硬切一个不存在的名字。
+    const chosen = own.includes(node) ? node : own[0];
+    const ok = await this._childSwitch(inst, chosen);
     if (!ok) {
       await inst.stop(this.logger);
-      throw new Error(`子 lane ${id} 无法切换到节点 ${node}`);
+      throw new Error(`子 lane ${id} 无法切换到节点 ${chosen}`);
     }
     const lane = {
       id,
-      node,
+      node: chosen,
+      nodes: own,
       inst,
       ctrlPort,
       mixedPort,
@@ -2243,8 +2261,20 @@ export class Gateway {
       active: 0,
       lastUsed: this.lanes.now(),
     };
-    this.logger('ok', `[lane${id}] 已拉起,绑定节点 ${node} (mixed ${mixedPort} / ctrl ${ctrlPort})`);
+    this.logger('ok', `[lane${id}] 已拉起,绑定节点 ${chosen} (mixed ${mixedPort} / ctrl ${ctrlPort})`);
     return lane;
+  }
+
+  /** 轮询子 lane 自己的 zen-pool 节点表,最多等 30s(provider 拉订阅需要时间) */
+  async _childNodes(inst) {
+    for (let waited = 0; waited < 30_000; waited += 500) {
+      try {
+        const r = await this._mihomoApi(inst.ctrlPort, `/proxies/${encodeURIComponent(POOL_NAME)}`);
+        if (Array.isArray(r?.all) && r.all.length) return r.all;
+      } catch { /* provider 还没拉完,继续等 */ }
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return [];
   }
 
   async _destroyChildLane(lane) {

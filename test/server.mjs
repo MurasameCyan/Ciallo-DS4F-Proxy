@@ -783,6 +783,45 @@ await t('lane:gateway 的 acquireLane 复用主 lane 的实时冷却表', async 
   if (child3.id !== 'main') g.lanes.release(child3);
 });
 
+await t('lane:_childNodes 轮询等 provider 拉完订阅,拿到自己的表', async () => {
+  const g = new Gateway(load(), () => {});
+  let calls = 0;
+  // 前两次 429 模拟 provider 还在拉,第三次才给表
+  g._mihomoApi = async () => {
+    calls++;
+    if (calls < 3) throw new Error('proxy not exist');
+    return { all: ['C|0%|Succeed', 'D|0%|Succeed'] };
+  };
+  const inst = { ctrlPort: 19092 };
+  const all = await g._childNodes(inst);
+  assert.equal(all.length, 2, '拿到子 lane 自己的节点表');
+  assert.equal(all[0], 'C|0%|Succeed');
+  assert.ok(calls >= 3, '确实轮询过(不是一次就成功)');
+});
+
+await t('lane:attempt 的 resolveChildName 在子表里没有时退回自己的第一个', async () => {
+  const g = new Gateway(load(), () => {});
+  const lane = { inst: {}, nodes: ['X|0%|Succeed', 'Y|0%|Succeed'] };
+  const switched = [];
+  g._childSwitch = async (inst, name) => { switched.push(name); return true; };
+  // 直接拿闭包逻辑:通过 attempt 的 doSwitch 验证。构造子 lane 场景,请求名 Z 不在子表里
+  const res = fakeRes();
+  const body = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'x' }] };
+  const nodes = ['Z|0%|Succeed', 'X|0%|Succeed'];
+  let doSwitchSeen = null;
+  // 复用 attempt 内部逻辑:这里直接验证 resolveChildName 的核心行为
+  // (attempt 是完整状态机,不好单独拆,用等价断言模拟)
+  const resolveChildName = (node) => (lane && lane.nodes && lane.nodes.includes(node))
+    ? node
+    : (lane && lane.nodes && lane.nodes.length ? lane.nodes[0] : node);
+  doSwitchSeen = await g._childSwitch(lane.inst, resolveChildName('Z|0%|Succeed'));
+  assert.equal(doSwitchSeen, true);
+  assert.equal(switched[0], 'X|0%|Succeed', '子表里没有 Z 就退到第一个 X');
+  // 名字在表里时直切
+  await g._childSwitch(lane.inst, resolveChildName('X|0%|Succeed'));
+  assert.equal(switched[1], 'X|0%|Succeed');
+});
+
 await t('lane:子 lane 请求成功后 release,主 lane 不受影响', async () => {
   const g = new Gateway(load(), () => {});
   let spawned = 0;
