@@ -39,6 +39,7 @@ const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs'
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
 const { LaneManager } = await import('../server/lane.mjs');
+const { MihomoInstance } = await import('../server/mihomo.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
@@ -799,6 +800,27 @@ await t('lane:_childNodes 轮询等 provider 拉完订阅,拿到自己的表', a
   assert.ok(calls >= 3, '确实轮询过(不是一次就成功)');
 });
 
+await t('lane:_spawnChildLane 选节点排除主 lane 当前节点,落到不同出口', async () => {
+  const g = new Gateway(load(), () => {});
+  g.config = { subscriptionUrl: 'https://fake.sub' };   // 测试里绕过 writeMihomoConfig 的订阅校验
+  const origStart = MihomoInstance.prototype.start;
+  const origStop = MihomoInstance.prototype.stop;
+  MihomoInstance.prototype.start = async function () { this.configFile = 'x'; this.dataDir = 'y'; this.ctrlPort = 19099; };
+  MihomoInstance.prototype.stop = async function () {};
+  let bound = null;
+  g._childNodes = async () => ['A|0%', 'B|0%', 'C|0%'];
+  g._childSwitch = async (inst, name) => { bound = name; return true; };
+  try {
+    // 传入主 lane 的 mainNode = B,且主表选出的 node = B(子表里没有则退到 ≠ B 的第一个)
+    const lane = await g._spawnChildLane({ node: 'B', nodes: ['A', 'B', 'C'], mainNode: 'B' });
+    assert.equal(lane.node, 'A|0%', '子表里没有 B 就退到 ≠ B 的第一个 A');
+    assert.equal(bound, 'A|0%');
+  } finally {
+    MihomoInstance.prototype.start = origStart;
+    MihomoInstance.prototype.stop = origStop;
+  }
+});
+
 await t('lane:attempt 的 resolveChildName 在子表里没有时退回自己的第一个', async () => {
   const g = new Gateway(load(), () => {});
   const lane = { inst: {}, nodes: ['X|0%|Succeed', 'Y|0%|Succeed'] };
@@ -825,7 +847,7 @@ await t('lane:attempt 的 resolveChildName 在子表里没有时退回自己的�
 await t('lane:子 lane 请求成功后 release,主 lane 不受影响', async () => {
   const g = new Gateway(load(), () => {});
   let spawned = 0;
-  g._spawnChildLane = async ({ node }) => ({ id: ++spawned, node, agent: {}, inst: {}, active: 0, lastUsed: 0 });
+  g._spawnChildLane = async ({ node, mainNode }) => ({ id: ++spawned, node, mainNode, agent: {}, inst: {}, active: 0, lastUsed: 0 });
   g._destroyChildLane = async () => {};
   g.getAllNodes = async () => ['A', 'B'];
   g.rankNodes = (n) => n;

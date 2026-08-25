@@ -33,7 +33,7 @@ export class LaneManager {
       this.main.active++;
       return this.main;
     }
-    const lane = await this.createChild({ node, nodes });
+    const lane = await this.createChild({ node, nodes, mainNode });
     lane.active = 1;
     lane.lastUsed = this.now();
     this._children.set(lane.id, lane);

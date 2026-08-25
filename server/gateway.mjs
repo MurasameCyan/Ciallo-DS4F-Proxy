@@ -2221,7 +2221,7 @@ export class Gateway {
    * 某个节点。它不拉订阅(配置里 provider 直接引用主 lane 的订阅 url),
    * 不维护冷却(全在主进程 Gateway 内存里)。subscriptionUrl 由调用方传入。
    */
-  async _spawnChildLane({ node }) {
+  async _spawnChildLane({ node, nodes, mainNode }) {
     const id = ++this._laneSeq;
     const { mixedPort, ctrlPort } = lanePorts(id);
     const dataDir = laneDataDir(id);
@@ -2242,9 +2242,16 @@ export class Gateway {
       await inst.stop(this.logger);
       throw new Error(`子 lane ${id} 拉不到节点`);
     }
-    // 优先用主 lane 选定的节点(名字一致说明同一订阅);不一致(机场刚换节点)
-    // 就退到子 lane 自己的第一个,保证落在不同出口而不是硬切一个不存在的名字。
-    const chosen = own.includes(node) ? node : own[0];
+    // 选节点只认子 lane 自己的表:
+    //   1. 主 lane 选定的 node 在子表里存在 → 用同一个(同一订阅,名字一致)
+    //   2. 不存在 → 在子表里挑第一个 ≠ mainNode 的节点,保证出口和主 lane 不同
+    //   3. 子表只剩 mainNode → 退到 own[0],至少让请求走通
+    // 关键点:子 lane 是独立 mihomo 进程,它有自己那份订阅快照,节点名可能和
+    // 主 lane 的缓存对不上 —— 绝不能用主表选出的名字去硬切(会 400 proxy not exist)。
+    const prefer = node && own.includes(node) ? node : null;
+    const chosen = prefer
+      ?? own.find((n) => n !== mainNode)
+      ?? own[0];
     const ok = await this._childSwitch(inst, chosen);
     if (!ok) {
       await inst.stop(this.logger);
