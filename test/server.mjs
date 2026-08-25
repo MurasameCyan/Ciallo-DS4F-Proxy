@@ -33,6 +33,7 @@ const {
   NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
   classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
+  StreamKeepAlive, SSE_HEARTBEAT_MS,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -1018,6 +1019,33 @@ await t('推理模型的思考时间不能被网关自己掐死', () => {
   assert.ok(silentFor(2_000) >= 120_000, 'TTFB 窗口至少 120s:实测有节点 61-63s 才回首个字节');
   assert.ok(budgetFor(4.3 * 1048576) >= silentFor(4.3 * 1048576),
     '总预算必须 ≥ 单次静默上限,否则一次等待就烧穿整个预算');
+});
+
+await t('流式心跳覆盖整条流,首字节之后遇到中段静默也继续保活', () => {
+  // 用假时钟驱动:interval 1000ms。真实时钟里 heartbeat 每 15s 一拍,
+  // 这里不 sleep,直接手动推进 tick,验证「重置-发 ping」状态机本身。
+  let clock = 0;
+  const writes = [];
+  const k = new StreamKeepAlive((s) => writes.push(s), {
+    interval: 1000,
+    now: () => clock,
+    setTimer: () => ({ unref() {} }),   // 不真挂 interval,由我们手动 tick
+    clearTimer: () => {},
+  });
+  k.stop(); // 先清掉构造器里那个假 timer,确保只有手动 tick 在推进
+  clock += 500;  k.tick();
+  assert.equal(writes.length, 0, '距上次数据不到一个间隔,不发 ping');
+  clock += 500;  k.tick();
+  assert.equal(writes.length, 1, '静默满一个间隔,补一次 ping');
+  assert.equal(writes[0], ': ping\n\n');
+
+  // 模拟长任务:吐一段数据(中段静默计时归零),然后继续停 1200ms
+  k.touch();
+  clock += 1200; k.tick();
+  assert.equal(writes.length, 2, '首字节之后中段静默仍会保活 —— 这是本次修复的核心');
+  k.touch();
+  clock += 300;   k.tick();
+  assert.equal(writes.length, 2, '活跃的流不额外插 ping');
 });
 
 // ── 节点延迟与排序 ──────────────────────────────────────

@@ -64,6 +64,56 @@ export function isNodeBlockedError(e) {
 const MODEL_AVAILABILITY_RETRY_MS = 60 * 1000;
 
 /**
+ * SSE 心跳间隔。宝塔 nginx 默认 proxy_read_timeout 60s,客户端(OpenCode CLI、
+ * 浏览器)也各有自己的空闲上限 —— 静默一旦超过其中最短的那个,连接就被中间层
+ * 掐掉,而网关这侧还在正常收流,于是表现为「长任务莫名截断」。15s 给三倍余量。
+ */
+export const SSE_HEARTBEAT_MS = 15_000;
+
+/**
+ * 流式连接的保活器。
+ *
+ * 原来的心跳只活到首字节:上游一开口就 clearInterval。这在「思考完就一口气吐
+ * 完」的模型上够用,长任务上不够 —— 实测长任务的静默不在开头而在中段:模型吐
+ * 一段 reasoning 后停下来想下一步、或者工具调用之间空转,几分钟没有任何字节。
+ * 那时心跳已经关了,nginx 60s 一到就断,客户端看到的是流被截断。
+ *
+ * 所以保活要覆盖整条流,直到 end/error 才停。`touch()` 在每次真实数据到达时
+ * 调用:只有「距上次数据超过一个间隔」才补 ping,活跃的流里一个字节都不多发。
+ *
+ * `: ping` 是 SSE 规范里的注释行,所有合规客户端都会忽略,不会污染业务事件。
+ */
+export class StreamKeepAlive {
+  constructor(write, { interval = SSE_HEARTBEAT_MS, now = () => Date.now(),
+    setTimer = setInterval, clearTimer = clearInterval } = {}) {
+    this.write = write;
+    this.interval = interval;
+    this.now = now;
+    this.clearTimer = clearTimer;
+    this.last = now();
+    this.pings = 0;
+    this.timer = setTimer(() => this.tick(), interval);
+    // 心跳不该让进程为了它多活一秒 —— 真正决定生命周期的是那条流
+    this.timer?.unref?.();
+  }
+
+  /** 到点检查:只有静默满一个间隔才发 ping,活跃的流不插东西 */
+  tick() {
+    if (this.now() - this.last < this.interval) return;
+    try { this.write(': ping\n\n'); this.pings++; } catch { this.stop(); }
+  }
+
+  /** 真实数据到达 —— 重置静默计时,这一拍不用 ping */
+  touch() { this.last = this.now(); }
+
+  stop() {
+    if (!this.timer) return;
+    this.clearTimer(this.timer);
+    this.timer = null;
+  }
+}
+
+/**
  * 解析 Retry-After 响应头,返回秒数(null 表示没有或解析失败)。
  * 格式二选一:相对秒数(120)或 HTTP-date(Tue, 13 Aug 2026 00:00:00 GMT)。
  */
@@ -1796,19 +1846,13 @@ export class Gateway {
       const finish = (fn) => { if (!settled) { settled = true; fn(); } };
 
       /**
-       * 思考期心跳:上游 200 之后到首个业务事件之间可能静默几分钟(DS4F 实测
-       * 200s+),网关和上游之间有 TCP keepalive 撑着,但网关和客户端之间还隔着
-       * 宝塔 nginx —— 它默认 proxy_read_timeout 60s,静默期一到就掐浏览器这条
-       * 连接(「web 进不去 / 长任务被截断」的另一半)。SSE 注释行(: ping)是
-       * 协议允许的 keepalive,所有客户端都会忽略它;首字节到了就停。
+       * 保活心跳。覆盖整条流,不是只活到首字节 —— 长任务的静默主要发生在中段
+       * (吐一段推理后停下来想、工具调用之间空转),而不是只在开头。网关到上游有 TCP
+       * keepalive 撑着,但网关到客户端中间还隔着宝塔 nginx(默认 proxy_read_timeout
+       * 60s)和客户端自己的空闲上限。详见 StreamKeepAlive。
        */
-      let heartbeat = null;
-      const startHeartbeat = () => {
-        heartbeat = setInterval(() => {
-          try { res.write(': ping\n\n'); } catch {}
-        }, 15_000);
-      };
-      const stopHeartbeat = () => { clearInterval(heartbeat); heartbeat = null; };
+      let keepAlive = null;
+      const stopHeartbeat = () => { keepAlive?.stop(); keepAlive = null; };
 
       const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path }), (resp) => {
         if (resp.statusCode !== 200) {
@@ -1828,7 +1872,7 @@ export class Gateway {
           'X-Accel-Buffering': 'no',
         });
         started = true;
-        startHeartbeat();
+        keepAlive = new StreamKeepAlive((s) => res.write(s));
         const sink = dialect.sink(res, body.model);
 
         // 首字节已到,把「等第一个字节」的短超时换成宽松的空闲超时:
@@ -1841,7 +1885,8 @@ export class Gateway {
 
         let buf = '';
         resp.on('data', (chunk) => {
-          if (!firstByte) stopHeartbeat();   // 真数据来了,心跳使命完成
+          // 保活计时重置:活跃的流不发 ping,静默满一个间隔才补
+          keepAlive?.touch();
           firstByte ||= Date.now() - t0;
           sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
           buf += chunk.toString();
