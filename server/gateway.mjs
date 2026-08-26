@@ -50,7 +50,8 @@ export const MODEL_COOLDOWN_MS = 15 * 60 * 1000;
 export const BLOCKED_COOLDOWN_MS = 30 * 60 * 1000;
 // 并发分摊:主 lane 忙时最多再拉起几个独立出口,每个子 lane 空闲满这个时间就回收。
 // 主 lane 常驻负责订阅刷新和默认出站;子 lane 只在真正并发时才存在,平时和现状一样。
-export const MAX_CHILD_LANES = 2;
+// env 可调(ZEN_MAX_CHILD_LANES),config.json 里存的 maxChildLanes 优先。
+export const MAX_CHILD_LANES = Number(process.env.ZEN_MAX_CHILD_LANES) || 2;
 export const LANE_IDLE_MS = 5 * 60 * 1000;
 
 /**
@@ -1019,8 +1020,8 @@ export class Gateway {
     this._laneSeq = 0;
     this.lanes = new LaneManager({
       idleMs: LANE_IDLE_MS,
-      maxChildren: MAX_CHILD_LANES,
-      createChild: ({ node }) => this._spawnChildLane({ node }),
+      maxChildren: Number(cfg.maxChildLanes) || MAX_CHILD_LANES,
+      createChild: ({ node, nodes, mainNode }) => this._spawnChildLane({ node, nodes, mainNode }),
       destroyChild: (lane) => this._destroyChildLane(lane),
     });
     this.nodeCache = null;

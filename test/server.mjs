@@ -755,6 +755,52 @@ await t('lane:没有可用独立节点时回退主 lane,不丢请求', async () 
   manager.release(fallback);
 });
 
+await t('lane:子 lane 创建中,并发的 acquire 直接回落主 lane,不等(防 fork 雪崩)', async () => {
+  let releaseCreate;
+  const createGate = new Promise((res) => { releaseCreate = res; });
+  let created = 0;
+  const manager = new LaneManager({
+    now: () => 0,
+    createChild: async () => {
+      created++;
+      await createGate;   // 卡住,模拟拉起 mihomo 进程的 1-3s
+      return { id: 'child-1', node: 'B' };
+    },
+    destroyChild: async () => {},
+  });
+  const main = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  // 第一个并发触发子 lane 创建,正卡着
+  const p1 = manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  await new Promise((res) => setImmediate(res));
+  // 第二个并发在创建期间到达 —— 必须回落主 lane,而不是再 fork 一个
+  const p2 = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  assert.equal(p2.id, 'main', '创建中必须回落主 lane');
+  releaseCreate();
+  const child = await p1;
+  assert.equal(child.node, 'B');
+  assert.equal(created, 1, '整个创建期间只能 fork 一个子进程');
+  manager.release(main);
+  manager.release(child);
+  manager.release(p2);
+});
+
+await t('lane:createChild 失败回落主 lane,请求不丢', async () => {
+  let attempts = 0;
+  const manager = new LaneManager({
+    createChild: async () => {
+      attempts++;
+      if (attempts === 1) return null;   // 第一次模拟拉起失败
+      return { id: 'child-1', node: 'B' };
+    },
+    destroyChild: async () => {},
+  });
+  const main = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  const failed = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  assert.equal(failed.id, 'main', '创建失败必须回落主 lane');
+  manager.release(main);
+  manager.release(failed);
+});
+
 await t('lane:gateway 的 acquireLane 复用主 lane 的实时冷却表', async () => {
   const g = new Gateway(load(), () => {});
   let seq = 0;

@@ -34,6 +34,7 @@ const DEFAULTS = {
   subscriptionUrl: '', apiKey: '', port: 9527,
   opencodeIdentityHeaders: false, subscriptionUpdateHours: 1,
   persistUsage: false,
+  maxChildLanes: Number(process.env.ZEN_MAX_CHILD_LANES) || 2,
 };
 
 export function genApiKey() {
@@ -83,13 +84,14 @@ export function save(cfg) {
   const {
     subscriptionUrl = '', apiKey = '', port = 9527,
     opencodeIdentityHeaders = false, subscriptionUpdateHours = 1,
-    persistUsage = false,
+    persistUsage = false, maxChildLanes = 2,
   } = cfg;
   fs.writeFileSync(CONFIG_FILE, JSON.stringify({
     subscriptionUrl, apiKey, port,
     opencodeIdentityHeaders: opencodeIdentityHeaders === true,
     subscriptionUpdateHours,
     persistUsage: persistUsage === true,
+    maxChildLanes: Number(maxChildLanes) || 2,
   }, null, 2), 'utf8');
 }
 

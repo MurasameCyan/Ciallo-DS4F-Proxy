@@ -89,15 +89,18 @@ export class MihomoInstance {
     });
     this.child = child;
 
-    const feed = (level) => (buf) => {
+    const feed = (level, emit = true) => (buf) => {
       for (const line of buf.toString().split('\n')) {
         const s = line.trim();
         if (!s) continue;
         if (level === 'error') this.lastErr = s;
-        logger(level, `[${this.label}] ${s}`);
+        // 子进程的 stdout 是 mihomo 的例行日志:健康检查(测速)、provider 拉取
+        // 等,399 个节点轮流测速时每秒几十条,喂给面板纯属噪音。emit=false
+        // 时静默丢弃;stderr 只出真错误,保留。
+        if (emit) logger(level, `[${this.label}] ${s}`);
       }
     };
-    child.stdout.on('data', feed('info'));
+    child.stdout.on('data', feed('info', false));
     child.stderr.on('data', feed('error'));
 
     // 闭包里捏住这一个进程。读 this.child 会串:重启时旧进程的 exit

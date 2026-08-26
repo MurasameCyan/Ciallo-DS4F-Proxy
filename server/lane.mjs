@@ -17,6 +17,7 @@ export class LaneManager {
     this.destroyChild = destroyChild;
     this.main = { id: 'main', active: 0, lastUsed: now() };
     this._children = new Map();
+    this._creating = false;   // 同时只许 1 个子 lane 在创建(拉起 mihomo 进程 1-3s)
   }
 
   children() { return [...this._children.values()]; }
@@ -29,15 +30,29 @@ export class LaneManager {
     }
     const occupied = new Set([mainNode, ...this.children().map((lane) => lane.node)]);
     const node = nodes.find((candidate) => !occupied.has(candidate) && available(candidate));
-    if (!node || this._children.size >= this.maxChildren) {
+    // 三个回落条件:没有可用的空闲节点 / 子 lane 已满 / 已有子 lane 正在创建。
+    // 高并发下几十个请求同时 acquire,若都同步 await createChild 会雪崩式 fork
+    // mihomo 进程,CPU 和事件循环全被占(几百并发卡住的根因)。正在创建时直接
+    // 回落主 lane —— 那个子 lane 起来后自然会接走后面的一批并发。
+    if (!node || this._children.size >= this.maxChildren || this._creating) {
       this.main.active++;
       return this.main;
     }
-    const lane = await this.createChild({ node, nodes, mainNode });
-    lane.active = 1;
-    lane.lastUsed = this.now();
-    this._children.set(lane.id, lane);
-    return lane;
+    this._creating = true;
+    try {
+      const lane = await this.createChild({ node, nodes, mainNode });
+      if (lane) {
+        lane.active = 1;
+        lane.lastUsed = this.now();
+        this._children.set(lane.id, lane);
+        return lane;
+      }
+    } finally {
+      this._creating = false;
+    }
+    // createChild 失败(返回 null/抛错)也回落主 lane,请求不丢
+    this.main.active++;
+    return this.main;
   }
 
   release(lane) {
