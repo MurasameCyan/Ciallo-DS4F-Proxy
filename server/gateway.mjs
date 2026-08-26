@@ -725,13 +725,40 @@ export class NodeCooldown {
     this.lastMarked.set(this.#key(node, group), Date.now());
   }
 
+  /**
+   * 5xx 秒拒冷却。上游(zen)对爆满的出口直接秒回 5xx,这种坏节点用 429 同款
+   * 短冷却(COOLDOWN_MS),让整批坏出口在一段时间内被排到队尾,而不是每来一个
+   * 请求都优先挑到延迟最低的这批(它们延迟最低,专挑坏的打)。reason 标
+   * '5xx' 让面板能区分「被限流(429)」「被机场封(blocked)」「上游 5xx」。
+   */
+  mark5xx(node, group = 'default') {
+    const now = Date.now();
+    const key = this.#key(node, group);
+    const until = now + COOLDOWN_MS;
+    const existing = this.cooldowns.get(key);
+    // 并发请求可能交错落标记:不能让 5xx 的 60s 覆盖更强的 429
+    // Retry-After 或机场封域冷却,否则会把 1h/30min 错缩成 60s。
+    if (!existing || existing.until <= now || existing.until < until) {
+      this.cooldowns.set(key, { until, retryAfter: null, reason: '5xx' });
+    }
+    this.lastMarked.set(key, now);
+  }
+
+  /** 返回仍在生效的节点冷却详情;过期项顺手清掉。 */
+  get(node, group = 'default') {
+    const key = this.#key(node, group);
+    const c = this.cooldowns.get(key);
+    if (!c) return null;
+    const remain = c.until - Date.now();
+    if (remain <= 0) {
+      this.cooldowns.delete(key);
+      return null;
+    }
+    return { ...c, remain };
+  }
+
   isCooling(node, group = 'default') {
-    const k = this.#key(node, group);
-    const c = this.cooldowns.get(k);
-    if (!c) return false;
-    if (Date.now() < c.until) return true;
-    this.cooldowns.delete(k);
-    return false;
+    return this.get(node, group) !== null;
   }
 
   clear(node, group = null) {
@@ -785,11 +812,8 @@ export class NodeCooldown {
   soonest(nodes, group = 'default') {
     let node = null, remain = Infinity;
     for (const n of nodes) {
-      const c = this.cooldowns.get(this.#key(n, group));
-      if (!c) continue;
-      const left = c.until - Date.now();
-      if (left <= 0) continue;   // 已解冻的不算「在冷却」(过期项通常已被删,这里防御一下)
-      if (left < remain) { remain = left; node = n; }
+      const c = this.get(n, group);
+      if (c && c.remain < remain) { remain = c.remain; node = n; }
     }
     return node ? { node, remain } : null;
   }
@@ -806,7 +830,8 @@ export class NodeCooldown {
         group,
         remain: Math.ceil(left / 1000),
         retryAfter: c.retryAfter,
-        blocked: c.blocked === true
+        blocked: c.blocked === true,
+        reason: c.reason
       });
     }
     return out;
@@ -1453,7 +1478,12 @@ export class Gateway {
     }
 
     const cur = await this.ensureNode(nodes, res, dialect, deadline, model, affinityKey, lane);
-    if (!cur) return;   // ensureNode 已经回过错误了
+    if (!cur) {
+      // ensureNode 可能在选点前就回错误(例如全员 5xx 冷却);这次请求已经
+      // acquire 过 lane,必须在提前返回前归还,否则连续失败会把 active 越堆越高。
+      if (lane) this.lanes.release(lane);
+      return;
+    }
     // 子 lane 绑定节点被冷却时 ensureNode 内部回退了,返回的 cur 是主 lane 选的。
     // 此时 lane 已失去意义(它固定绑在冷却节点上),释放它、改走主 lane。
     if (lane && lane.node !== cur) {
@@ -1504,6 +1534,18 @@ export class Gateway {
 
     cur = this.cooldown.pickAvailable(nodes, group);
     if (!cur) {
+      // 5xx/封域冷却不是用户限流:不能按 429 等待 60s,也不能把它伪报成
+      // all_nodes_429。此时入口直接回 503,让调用方按自己的策略重试。
+      const cooling = nodes
+        .map((node) => this.cooldown.get(node, group))
+        .filter(Boolean);
+      const allUpstreamFailure = cooling.length === nodes.length && cooling.every((c) =>
+        c.reason === '5xx' || c.blocked === true);
+      if (allUpstreamFailure) {
+        this.logger('warn', `[cooldown] 所有节点都因上游 5xx/封域不可用,不等待 429 冷却`);
+        dialect.fail(res, 503, 'No usable upstream node', 'all_nodes_unavailable');
+        return null;
+      }
       // 全员冷却:等剩余最短的那个恢复,而不是直接失败
       const s = this.cooldown.soonest(nodes, group);
       if (s && s.remain > 0) {
@@ -1546,6 +1588,9 @@ export class Gateway {
     const MAX_NET_RETRY = 2;
     let netRetry = 0;
     let switches = 0;
+    // 连续 5xx 秒拒计数:连续 3 个节点都被上游 5xx 拒就停(见 retryable 分支),
+    // 不在这批坏出口里空转。任何非 5xx 分支(成功、429、超时、其它 4xx)都重置。
+    let consecutive5xx = 0;
     const left = () => deadline - Date.now();
     const call = { model: body.model, effort };
     const fails = { timeout: 0, rateLimited: 0 };
@@ -1647,6 +1692,7 @@ export class Gateway {
               this.saveLastNode(cur);
             }
             this.cooldown.clear(cur);
+            consecutive5xx = 0;
             bind(cur);
           } else {
             unbind(cur);
@@ -1666,6 +1712,7 @@ export class Gateway {
           this.saveLastNode(cur);
         }
         this.cooldown.clear(cur);
+        consecutive5xx = 0;
         bind(cur);
         this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
         this.usage.record(body.model, result.usage, true);
@@ -1699,6 +1746,7 @@ export class Gateway {
           this.logger('warn', `[429] node="${cur}" model="${body.model}" group="${group}" 限流,冷却 ${coolSec}s${retryAfter ? ' (Retry-After)' : ''}`);
           tried.add(cur);
           netRetry = 0;
+          consecutive5xx = 0;
 
           const next = pickNext(group, tried);
           if (!next) {
@@ -1743,6 +1791,7 @@ export class Gateway {
             this.cooldown.markBlocked(cur, group);
             tried.add(cur);
             netRetry = 0;
+            consecutive5xx = 0;
             this.logger('warn', `[blocked] node="${cur}" 疑似机场拒连该域名(${String(e.body || e.message).slice(0, 80)}),冷却 ${BLOCKED_COOLDOWN_MS / 60_000}min,立即换下一个`);
             unbind(cur);
             if (this.lockedNode === cur) this.lockedNode = null;
@@ -1764,6 +1813,7 @@ export class Gateway {
           }
           tried.add(cur);
           netRetry = 0;
+          consecutive5xx = 0;
           this.logger('warn', `[timeout] node="${cur}" 重试 ${MAX_NET_RETRY} 次仍失败,换下一个`);
           unbind(cur);
           const group = providerGroup(body.model);
@@ -1798,11 +1848,23 @@ export class Gateway {
 
         if (kind === 'retryable') {
           this.usage.recordAttempt(cur, 'upstreamError', null, null, call);
+          // 5xx 秒拒是坏出口的确定性特征:记一笔短冷却,让这一整批被上游爆满
+          // 拒掉的节点一段时间内排到队尾,而不是每来一个请求都优先挑到延迟
+          // 最低的这批(它们延迟最低,专挑坏的打)。
+          const group = providerGroup(body.model);
+          const is5xx = status >= 500 && status < 600;
+          if (is5xx) this.cooldown.mark5xx(cur, group);
           tried.add(cur);
           netRetry = 0;
           if (this.lockedNode === cur) this.lockedNode = null;
           unbind(cur);
-          const group = providerGroup(body.model);
+          // 连续 3 个节点都 5xx 秒拒,说明整批出口都被上游爆满拒掉,再空转也是
+          // 同样结果,直接把上游的 5xx 原样带给客户端,让调用方自己决定重试。
+          if (is5xx && ++consecutive5xx >= 3) {
+            this.logger('warn', `[5xx] 连续 ${consecutive5xx} 个节点被上游 5xx 秒拒,停止换节点,原样回上游错误`);
+            return returnUpstreamError(e, true);
+          }
+          if (!is5xx) consecutive5xx = 0;
           let moved = false;
           while (!moved) {
             const next = pickNext(group, tried);

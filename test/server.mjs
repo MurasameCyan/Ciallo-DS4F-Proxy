@@ -107,6 +107,21 @@ await t('Retry-After 覆盖默认冷却时长', () => {
   assert.equal(entry.retryAfter, 30);
 });
 
+await t('5xx 冷却不覆盖更长的限流或封域冷却', () => {
+  const c = new NodeCooldown();
+  c.mark429('A', 'default', 3600);
+  const rateLimited = { ...c.cooldowns.get('A:default') };
+  c.mark5xx('A', 'default');
+  assert.deepEqual(c.cooldowns.get('A:default'), rateLimited,
+    '长 Retry-After 不能被 5xx 的 60s 冷却缩短');
+
+  c.markBlocked('B', 'default');
+  const blocked = { ...c.cooldowns.get('B:default') };
+  c.mark5xx('B', 'default');
+  assert.deepEqual(c.cooldowns.get('B:default'), blocked,
+    '封域冷却不能被 5xx 覆盖');
+});
+
 await t('机场封域特征(TLS 握手断/证书不符/EPROTO)识别为节点封锁', () => {
   // 三种都是远端日志里实测出现过的确定性故障:mihomo 日志 dial → err code: 403,
   // 客户端侧就是这三副面孔。它们不是「慢」,重试同一节点纯烧时间。
@@ -1095,6 +1110,118 @@ await t('所有节点都 5xx 时保留上游最后一个错误,不伪报节点�
   assert.match(res.body, /upstream overloaded/);
   assert.deepEqual(g.tries, ['A', 'B']);
   assert.ok(!res.body.includes('all_nodes_unavailable'));
+});
+
+await t('5xx 节点进 60s 短冷却,后续请求不再优先挑到它', async () => {
+  const g = retryGateway('sm-5xx-cooldown.json', () => {
+    throw Object.assign(new Error('upstream overloaded'), {
+      status: 503,
+      body: '{"error":{"message":"upstream overloaded"}}',
+    });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  // 5xx 秒拒的节点要进冷却,否则它延迟最低,下次请求又优先挑到它空转
+  assert.ok(g.cooldown.isCooling('A', 'default'), '5xx 过的节点要进冷却');
+  const s = g.cooldown.summary().find((x) => x.node === 'A');
+  assert.equal(s.reason, '5xx', '冷却条目要标 reason,面板才能区分「被限流」「被机场封」「上游 5xx」');
+});
+
+await t('连续 3 个节点 5xx 立即停,不在这批坏出口里空转', async () => {
+  const g = retryGateway('sm-5xx-stop-early.json', () => {
+    throw Object.assign(new Error('upstream overloaded'), {
+      status: 503,
+      body: '{"error":{"message":"upstream overloaded"}}',
+    });
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  // 给 6 个节点:旧逻辑会空转满 MAX_NODE_TRIES,新逻辑连续 3 个 5xx 就该停
+  await g.attempt(res, BODY, ['A', 'B', 'C', 'D', 'E', 'F'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 503, '把上游的 5xx 原样带回');
+  assert.match(res.body, /upstream overloaded/);
+  assert.equal(g.tries.length, 3, '连续 3 个 5xx 立即停,不空转 6 个');
+});
+
+await t('408 不计入连续 5xx,也不标 5xx 冷却', async () => {
+  const g = retryGateway('sm-408-reset.json', (i) => {
+    if (i === 0) throw Object.assign(new Error('upstream overloaded'), {
+      status: 503, body: '{"error":{"message":"overloaded"}}',
+    });
+    if (i === 1) throw Object.assign(new Error('request timeout'), {
+      status: 408, body: '{"error":{"message":"request timeout"}}',
+    });
+    if (i === 2) throw Object.assign(new Error('upstream overloaded'), {
+      status: 503, body: '{"error":{"message":"overloaded"}}',
+    });
+    return { choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 } };
+  });
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A', 'B', 'C', 'D'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.equal(res.code, 200, '408 应重置 5xx 连续计数,让后续节点继续尝试');
+  assert.deepEqual(g.tries, ['A', 'B', 'C', 'D']);
+  assert.equal(g.cooldown.summary().find((x) => x.node === 'B'), undefined,
+    '408 节点不能标成 5xx 冷却');
+});
+
+await t('全员 5xx 冷却时立即回 503,不等待并误报 429', async () => {
+  const g = new Gateway(load(), () => {});
+  g.cooldown.mark5xx('A', 'default');
+  g.cooldown.mark5xx('B', 'default');
+  const res = fakeRes();
+  const cur = await g.ensureNode(['A', 'B'], res, OPENAI, Date.now() + 5_000, BODY.model, '');
+  assert.equal(cur, null);
+  assert.equal(res.code, 503, '5xx 冷却属于上游不可用,不是限流');
+  assert.doesNotMatch(res.body, /all_nodes_429/);
+  assert.match(res.body, /all_nodes_unavailable/);
+});
+
+await t('混合 5xx 与 429 冷却时仍等待可恢复的节点', async () => {
+  const g = new Gateway(load(), () => {});
+  g.cooldown.cooldowns.set('A:default', {
+    until: Date.now() + 60_000, retryAfter: null, reason: '5xx',
+  });
+  g.cooldown.cooldowns.set('B:default', {
+    until: Date.now() + 20, retryAfter: 1,
+  });
+  g.getCurrentNode = async () => null;
+  g.switchNode = async () => true;
+  const res = fakeRes();
+  const cur = await g.ensureNode(['A', 'B'], res, OPENAI, Date.now() + 5_000, BODY.model, '');
+  assert.equal(cur, 'B', '不能因另一个节点 5xx 就跳过仍可恢复的 429 节点');
+  assert.equal(res.code, 0);
+});
+
+await t('ensureNode 提前失败会释放已占用的 lane', async () => {
+  const g = new Gateway(load(), () => {});
+  g.getAllNodes = async () => ['A', 'B'];
+  g.rankNodes = (nodes) => nodes;
+  const held = await g.acquireLane({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  g.cooldown.mark5xx('A', 'default');
+  g.cooldown.mark5xx('B', 'default');
+
+  const req = Readable.from([JSON.stringify(BODY)]);
+  req.headers = {};
+  const res = fakeRes();
+  await g.handleChat(req, res, OPENAI);
+
+  assert.equal(res.code, 503);
+  assert.equal(g.lanes.main.active, 1, '失败请求占用的 lane 必须释放,只留下预先占用的那一个');
+  g.lanes.release(held);
+});
+
+await t('5xx 冷却解冻后仍排队尾,不凭低延迟插回队首', async () => {
+  const g = fakeGateway({ A: 1, B: 2, C: 3 });
+  await g.testNodes();
+  g.cooldown.mark5xx('A', 'default');
+  g.cooldown.cooldowns.delete('A:default'); // 模拟冷却已解冻,lastMarked 仍保留
+  assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['B', 'C', 'A'],
+    '5xx 过的节点排到队尾,不凭低延迟插回队首');
 });
 
 await t('同一节点上的网络重试:每次真发出去都记一笔,不是整段算一次', async () => {
