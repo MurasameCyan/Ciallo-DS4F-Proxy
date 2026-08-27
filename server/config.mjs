@@ -25,6 +25,11 @@ export const USAGE_FILE = path.join(DATA_DIR, 'usage.json');
 export const CAPS_FILE = path.join(DATA_DIR, 'capabilities.json');
 export const MODELS_DEV_FILE = path.join(DATA_DIR, 'models.dev.json');
 
+// buildMihomoYaml 里写的是 `path: ./providers/airport.yaml`,相对内核的 -d 数据目录。
+// 子 lane 各有自己的数据目录,但订阅是同一份,节点名到落地 IP 的映射也就同一份,
+// 所以只读主 lane 这一个文件。
+export const PROVIDER_FILE = path.join(MIHOMO_DATA_DIR, 'providers', 'airport.yaml');
+
 export const MIHOMO_BIN = process.env.MIHOMO_BIN || '/usr/local/bin/mihomo';
 export const MIXED_PORT = 17897;
 export const CTRL_PORT = 19090;
@@ -181,6 +186,80 @@ export function writeMihomoConfig(subscriptionUrl, { mixedPort = MIXED_PORT, ctr
  * 数据目录也要分开,否则会抢同一份 cache.db 锁。
  * id 从 1 起(0 就是主 lane,直接用默认)。
  */
+/**
+ * 从一段 proxy 条目文本里取一个字段。同时认 flow 风格(`{"server":"1.2.3.4"}`)
+ * 和块风格(`server: 1.2.3.4`),引号可有可无。
+ * 前置的 `(?:^|[,{\s])` 是为了不让 `server` 匹配到 `servername`、
+ * `name` 匹配到 `username`。
+ */
+function field(text, key) {
+  const re = new RegExp(`(?:^|[,{\\s])["']?${key}["']?\\s*:\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|'([^']*)'|([^,}\\r\\n]*))`);
+  const m = re.exec(text);
+  if (!m) return '';
+  if (m[1] !== undefined) return m[1].replace(/\\(.)/g, '$1').trim();
+  return (m[2] !== undefined ? m[2] : m[3] || '').trim();
+}
+
+/**
+ * 解析 provider 缓存文件,得到 节点名 -> 落地地址(server 字段)。
+ *
+ * 为什么要这个:免费额度是按出口 IP 计的,而一个机场里几十个节点名常常
+ * 指向同一台机器 —— 实测 396 个名字只有 291 个 server。按名字冷却等于
+ * 同一个 IP 被 429 之后还会被换着名字反复撞。
+ *
+ * 为什么不问内核:mihomo 的 /providers/proxies 不返回 server 字段,
+ * 它的 id 又是按节点算的(396 个名字 396 个 id),没法用来分组。
+ *
+ * 不引 yaml 库(本项目零依赖),所以按"条目"切:一行以 `- ` 开头算一条,
+ * 后面缩进更深的行算它的续行。机场订阅就这两种形状。
+ */
+export function parseProviderEgress(text) {
+  const map = new Map();
+  const lines = String(text || '').split(/\r?\n/);
+  let entry = null;
+  const flush = () => {
+    if (!entry) return;
+    const name = field(entry, 'name');
+    const server = field(entry, 'server');
+    // ponytail: server 可能是域名而不是 IP,不同域名也可能解析到同一个 IP。
+    // 这里不做 DNS 解析,按字符串区分 —— 会少合并,但不会误合并。
+    // 真要更准就得在这里查 A 记录并按解析结果分组。
+    if (name && server) map.set(name, server);
+    entry = null;
+  };
+  for (const line of lines) {
+    if (/^\s*-\s/.test(line)) {
+      flush();
+      entry = line;
+    } else if (entry !== null && /^\s+\S/.test(line)) {
+      entry += '\n' + line;
+    } else if (entry !== null) {
+      flush();
+    }
+  }
+  flush();
+  return map;
+}
+
+/**
+ * 带 mtime 缓存的 provider 读取。订阅更新才会动这个文件,
+ * 每次请求都重解析 400 个节点没必要。
+ */
+let egressCache = { key: '', map: new Map() };
+export function loadProviderEgress(file = PROVIDER_FILE) {
+  try {
+    const st = fs.statSync(file);
+    const key = `${file}:${st.mtimeMs}:${st.size}`;
+    if (key !== egressCache.key) {
+      egressCache = { key, map: parseProviderEgress(fs.readFileSync(file, 'utf8')) };
+    }
+  } catch {
+    // 文件还没拉下来(首启)或读不了:留着上一次的结果,没有就空 Map。
+    // 空 Map 时上层退回"按节点名冷却",也就是改动前的行为。
+  }
+  return egressCache.map;
+}
+
 export function lanePorts(id) {
   return { mixedPort: MIXED_PORT + id, ctrlPort: CTRL_PORT + id };
 }

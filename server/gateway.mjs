@@ -16,6 +16,7 @@ import { MihomoAgent } from './proxy.mjs';
 import {
   LAST_NODE_FILE, USAGE_FILE, CAPS_FILE, MODELS_DEV_FILE,
   MIXED_PORT, CTRL_PORT, POOL_NAME, lanePorts, laneDataDir, writeMihomoConfig,
+  loadProviderEgress,
 } from './config.mjs';
 import { MihomoInstance } from './mihomo.mjs';
 import { LaneManager } from './lane.mjs';
@@ -24,7 +25,7 @@ import {
   reasoningEffort, setModelEfforts,
 } from './anthropic.mjs';
 import { Capabilities } from './capabilities.mjs';
-import { ModelMetadataStore, MODELS_DEV_TTL_MS } from './model-metadata.mjs';
+import { ModelMetadataStore, MODELS_DEV_TTL_MS, metadataFree } from './model-metadata.mjs';
 import { ModelAvailability, MODEL_AVAILABILITY_TTL_MS } from './model-availability.mjs';
 import { safeEqual } from './auth.mjs';
 import { classifyUpstreamError, upstreamErrorMessage } from './upstream-errors.mjs';
@@ -210,10 +211,11 @@ const HEALTH_TIMEOUT_MS = Math.min(Math.max(Number(process.env.NODE_TEST_TIMEOUT
  * 也不能因为一次网络抖动变空。
  *
  * 写死过一次的代价:上游后来加了 longcat-2.0-free,而这份列表没人记得改,
- * 面板于是少列一个能用的模型。所以现在它只是 fallback。这份是 2026-08-21
- * 核对上游清单的结果:8 个 —— 2026-08-11 拉到的 11 个里,ling-3.0-flash/tiny-free、
- * longcat-2.0-free、north-mini-code-free 这 4 个已经下线,外加当天上线的
- * x-preview-f-free。
+ * 面板于是少列一个能用的模型。所以现在它只是 fallback。这份是 2026-08-28
+ * 核对上游清单的结果:8 个。上游当天列了 63 个模型,免费的就这 8 个。
+ * 历史:2026-08-11 拉到 11 个,ling-3.0-flash/tiny-free、longcat-2.0-free、
+ * north-mini-code-free 这 4 个下线;x-preview-f-free(Ox Alpha)2026-08-20
+ * 上线、免费一周,现已从上游清单消失,一并删掉。
  *
  * 下线的那 4 个从这里删掉了,但它们的**实测记录留着**(server/capabilities.mjs
  * 的 SEED):记录是一张按 id 查的字典,清单里没有它就不显示,哪天回来了 id 一样
@@ -238,9 +240,6 @@ export const FREE_MODELS = [
   'muse-spark-1.2-contributor-free',
   'nemotron-3-ultra-free',
   'nemotron-3.5-lightning-free',
-  // Ox Alpha(上游文档里的显示名是「Ox Alpha Free」,id 没带这三个字)。
-  // 2026-08-20 上线的匿名 stealth 模型,免费一周,别按 id 猜它是什么。
-  'x-preview-f-free',
 ];
 
 /**
@@ -252,22 +251,43 @@ const MODELS_TTL_MS = 24 * 60 * 60 * 1000;
 /**
  * 从上游那份「全部模型」里挑出免费的。
  *
- * /zen/v1/models 会列 60+ 个,绝大多数是付费的(claude-* / gpt-* / gemini-*),
- * 而本网关不带 Authorization 出站,付费模型必然 401 —— 列出来就是骗人。
- * 判据只能靠 id:`-free` 后缀,外加 big-pickle 这个没后缀但确实在免费清单里的
- * 例外(上游没给任何价格字段,只能这么认)。
+ * /zen/v1/models 会列 60+ 个(2026-08-28 实测 63),绝大多数是付费的
+ * (claude-* / gpt-* / gemini-*),而本网关不带 Authorization 出站,付费模型
+ * 必然 401 —— 列出来就是骗人。
  *
- * ponytail: 上游哪天给免费模型换个命名法,这里会漏掉它们,那时靠调用方的
- * fallback 顶着(不会变空),改的话就是往 EXTRA_FREE 里加一条。
+ * 两道判据,取并集:
+ *
+ * 1. id 的 `-free` 后缀,外加 EXTRA_FREE 里的例外。上游响应本身不带价格字段,
+ *    离线也能判,所以它是主判据,models.dev 拉不到时全靠它。
+ * 2. models.dev 的价格。补的是「免费但 id 没后缀」这一类 —— big-pickle 就是
+ *    现成的例子,它得靠 EXTRA_FREE 手写一条才认得出来。有了价格判据,下次
+ *    上游再来一个这种命名的免费模型就不用改代码了。
+ *
+ * 为什么价格判据只敢当补充,不敢当唯一判据:models.dev 把
+ * deepseek-v4-flash-free 和 laguna-s-2.1-free 标成 deprecated=true,可它们
+ * 此刻在上游清单里活得好好的。metadataFree 先看名字里有没有 free 才看价格,
+ * 所以这两个不会被漏掉 —— 但要是改成只信 cost+deprecated 就会误删。
+ *
+ * 反向的误判风险(models.dev 把付费模型标成 0 元 → 列出来 → 用户拿到 401):
+ * 实测 63 个 live 模型 models.dev 全查得到,付费的价格都是真的
+ * (claude-opus-5 in=5/out=25、deepseek-v4-flash in=0.14),两道判据结论完全
+ * 一致 8/8。再加一道 provider 限制:只认 opencode 自己那份记录,免得 3349 条
+ * 全网模型里别家的同名免费模型被 findModelMetadata 模糊匹配上。
  */
 const EXTRA_FREE = new Set(['big-pickle']);
 
-export function pickFreeModels(ids) {
+/** models.dev 里 opencode 自家的 provider 名 */
+const isOpencodeProvider = (p) => String(p || '').toLowerCase().includes('opencode');
+
+export function pickFreeModels(ids, lookup = null) {
   const seen = new Set();
   for (const raw of ids || []) {
     const id = String(raw ?? '').trim();
     if (!id) continue;
-    if (id.endsWith('-free') || EXTRA_FREE.has(id)) seen.add(id);
+    if (id.endsWith('-free') || EXTRA_FREE.has(id)) { seen.add(id); continue; }
+    if (!lookup) continue;
+    const meta = lookup(id);
+    if (meta && isOpencodeProvider(meta.provider) && metadataFree(meta, id)) seen.add(id);
   }
   return [...seen];
 }
@@ -699,20 +719,36 @@ export class NodeAffinity {
  * 冷却时长优先读上游的 Retry-After(实测指向 UTC 零点的日额度重置),没给就兜底 COOLDOWN_MS。
  */
 export class NodeCooldown {
-  constructor() {
-    this.cooldowns = new Map();   // "node:group" -> { until, retryAfter };过期即删,summary 才干净
-    // "node:group" -> 最近一次被限流的时刻。冷却过期会把上面那条删掉,但这条留着,
+  /**
+   * egressOf: 节点名 -> 落地地址。默认恒等,也就是退回「按节点名冷却」的老行为 ——
+   * provider 文件还没拉下来时就是这样。
+   * namesOf: 落地地址 -> 用这个落地的所有节点名,只给 summary() 展开用(面板按节点名画)。
+   */
+  constructor({ egressOf = null, namesOf = null } = {}) {
+    this.cooldowns = new Map();   // key(egress,group) -> { until, retryAfter, egress, group }
+    // 同 key -> 最近一次被限流的时刻。冷却过期会把上面那条删掉,但这条留着,
     // rankNodes 靠它把刚解冻的节点排到可用节点最后(见 recentMark)。只有 clear/clearAll 清。
     this.lastMarked = new Map();
+    this.egressOf = egressOf || ((node) => node);
+    this.namesOf = namesOf || ((egress) => [egress]);
   }
-  #key(node, group = 'default') { return `${node}:${group}`; }
+
+  /** 落地地址。解析不出来就用节点名本身,宁可少合并也不要误合并。 */
+  egress(node) {
+    return this.egressOf(node) || node;
+  }
+
+  // 分隔符用 NUL:IPv6 落地地址里带冒号,再用 `${x}:${g}` 就没法切了。
+  // 不过下面一律不切 key —— egress/group 存在 value 里。
+  #key(node, group = 'default') { return `${this.egress(node)}\u0000${group}`; }
 
   mark429(node, group = 'default', retryAfterSec = null) {
     const ms = retryAfterSec != null && retryAfterSec > 0
       ? Math.min(retryAfterSec * 1000, 24 * 3600 * 1000)  // 上限一天,防止解析错误
       : COOLDOWN_MS;
+    const egress = this.egress(node);
     const key = this.#key(node, group);
-    this.cooldowns.set(key, { until: Date.now() + ms, retryAfter: retryAfterSec });
+    this.cooldowns.set(key, { until: Date.now() + ms, retryAfter: retryAfterSec, egress, group });
     this.lastMarked.set(key, Date.now());
   }
 
@@ -721,7 +757,10 @@ export class NodeCooldown {
    * summary 里标 reason 让面板能区分「被限流」和「被机场封了」。
    */
   markBlocked(node, group = 'default') {
-    this.cooldowns.set(this.#key(node, group), { until: Date.now() + BLOCKED_COOLDOWN_MS, retryAfter: null, blocked: true });
+    this.cooldowns.set(this.#key(node, group), {
+      until: Date.now() + BLOCKED_COOLDOWN_MS, retryAfter: null, blocked: true,
+      egress: this.egress(node), group,
+    });
     this.lastMarked.set(this.#key(node, group), Date.now());
   }
 
@@ -739,7 +778,7 @@ export class NodeCooldown {
     // 并发请求可能交错落标记:不能让 5xx 的 60s 覆盖更强的 429
     // Retry-After 或机场封域冷却,否则会把 1h/30min 错缩成 60s。
     if (!existing || existing.until <= now || existing.until < until) {
-      this.cooldowns.set(key, { until, retryAfter: null, reason: '5xx' });
+      this.cooldowns.set(key, { until, retryAfter: null, reason: '5xx', egress: this.egress(node), group });
     }
     this.lastMarked.set(key, now);
   }
@@ -763,13 +802,14 @@ export class NodeCooldown {
 
   clear(node, group = null) {
     if (group === null) {
-      // 清该节点所有分组(冷却记录和「最近限流时刻」一起清,恢复它的正常优先级)
+      // 清该落地所有分组(冷却记录和「最近限流时刻」一起清,恢复它的正常优先级)
+      const prefix = `${this.egress(node)}\u0000`;
       let n = 0;
       for (const k of [...this.cooldowns.keys()]) {
-        if (k.startsWith(`${node}:`)) { this.cooldowns.delete(k); n++; }
+        if (k.startsWith(prefix)) { this.cooldowns.delete(k); n++; }
       }
       for (const k of [...this.lastMarked.keys()]) {
-        if (k.startsWith(`${node}:`)) this.lastMarked.delete(k);
+        if (k.startsWith(prefix)) this.lastMarked.delete(k);
       }
       return n;
     }
@@ -792,16 +832,27 @@ export class NodeCooldown {
    * 一解冻就凭低延迟插回队首、又被打,后面的节点永远轮不到。成功(clear)后归零。
    */
   recentMark(node) {
+    const prefix = `${this.egress(node)}\u0000`;
     let ts = 0;
     for (const [k, t] of this.lastMarked) {
-      if (k.startsWith(`${node}:`)) ts = Math.max(ts, t);
+      if (k.startsWith(prefix)) ts = Math.max(ts, t);
     }
     return ts;
   }
 
+  /**
+   * exclude 里装的是节点名(调用方的 tried 集合)。这里要按落地地址排除:
+   * 超时那条分支只 tried.add 不打冷却标记,不换算的话 7 次重试可能全落在
+   * 同一台机器的 7 个不同名字上 —— 实测有一个 IP 挂了 51 个名字。
+   */
   pickAvailable(nodes, group = 'default', exclude = null) {
+    let banned = null;
+    if (exclude?.size) {
+      banned = new Set();
+      for (const n of exclude) banned.add(this.egress(n));
+    }
     for (const n of nodes) {
-      if (exclude?.has(n)) continue;
+      if (banned?.has(this.egress(n))) continue;
       if (this.isCooling(n, group)) continue;
       return n;
     }
@@ -818,21 +869,27 @@ export class NodeCooldown {
     return node ? { node, remain } : null;
   }
 
-  /** 供 /api/nodes 用,remain 单位秒。返回该节点所有分组的冷却状态 */
+  /**
+   * 供 /api/nodes 用,remain 单位秒。
+   *
+   * 冷却按落地地址记,面板按节点名画(web/core.js 拿 c.node 建表),所以这里
+   * 要把一条落地冷却摊回它名下所有节点名。顺带把「同一台机器的另外 50 个名字
+   * 其实也在冷却」这件事显示出来 —— 以前面板只标被打中的那一个。
+   */
   summary() {
     const out = [];
-    for (const [k, c] of this.cooldowns) {
+    for (const c of this.cooldowns.values()) {
       const left = c.until - Date.now();
       if (left <= 0) continue;
-      const [node, group] = k.split(':');
-      out.push({
-        node,
-        group,
+      const row = {
+        group: c.group,
         remain: Math.ceil(left / 1000),
         retryAfter: c.retryAfter,
         blocked: c.blocked === true,
-        reason: c.reason
-      });
+        reason: c.reason,
+        egress: c.egress,
+      };
+      for (const node of this.namesOf(c.egress)) out.push({ node, ...row });
     }
     return out;
   }
@@ -1035,7 +1092,15 @@ export class Gateway {
   constructor(cfg, logger) {
     this.config = cfg;          // { apiKey, port, ... },外部改了这里立即生效
     this.logger = logger;
-    this.cooldown = new NodeCooldown();
+    // 冷却按「落地地址」而不是节点名记。免费额度是按出口 IP 计的,而机场里
+    // 几十个节点名常常指向同一台机器(实测 396 个名字只有 291 个落地,其中一个
+    // IP 独占 51 个名字)。按名字记就会出现:同一个 IP 被 429 之后,换个名字
+    // 继续撞它,一次请求 7 次重试全烧在同一台机器上。
+    // loadProviderEgress 自带 mtime 缓存,provider 文件没变就不重复解析。
+    this.cooldown = new NodeCooldown({
+      egressOf: (node) => loadProviderEgress().get(node),
+      namesOf: (egress) => this.nodesOfEgress(egress),
+    });
     this.modelCooldown = new ModelCooldown();
     this.usage = new UsageTracker(USAGE_FILE, logger, cfg.persistUsage === true);
     this.agent = new MihomoAgent(MIXED_PORT);
@@ -1296,7 +1361,9 @@ export class Gateway {
         return this.upstreamGet(MODELS_PATH);
       })
       .then((d) => {
-        const free = pickFreeModels((d?.data || []).map((m) => m?.id));
+        // 第二个参数是 models.dev 的价格查询:补「免费但 id 没 -free 后缀」那一类。
+        // 缓存空(冷启动还没拉到)时 get 返回 null,自动退回纯后缀判据。
+        const free = pickFreeModels((d?.data || []).map((m) => m?.id), (id) => this.metadata.get(id));
         // 空结果不接受:上游改了形状或返回了个错误页时,旧清单比空列表有用
         if (!free.length) throw new Error('返回里没有免费模型');
         const added = free.filter((m) => !this.models.includes(m));
@@ -1648,7 +1715,14 @@ export class Gateway {
         return dialect.fail(res, 504, `Upstream timed out after ${fails.timeout} attempt(s)${hint}`, 'timeout');
       }
       if (fails.rateLimited) {
-        return dialect.fail(res, 429, 'All nodes rate-limited', 'all_nodes_429', { cooldown: this.cooldown.summary() });
+        // 只报这次请求真撞过的出口。以前这里挂的是全局 cooldown.summary():
+        // 一次请求最多试 MAX_NODE_TRIES+1 个出口,却把全表几百条冷却甩给客户端,
+        // 读起来像「所有节点都被限流了」,而实际上多数出口根本没碰过。
+        const egresses = new Set([...tried].map((n) => this.cooldown.egress(n)));
+        return dialect.fail(res, 429,
+          `Rate-limited on ${egresses.size} egress IP(s) after ${fails.rateLimited} attempt(s)`,
+          'all_nodes_429',
+          { cooldown: this.cooldown.summary().filter((c) => egresses.has(c.egress)) });
       }
       return dialect.fail(res, 503, 'No usable upstream node', 'all_nodes_unavailable');
     };
@@ -1750,12 +1824,17 @@ export class Gateway {
 
           const next = pickNext(group, tried);
           if (!next) {
-            const s = this.cooldown.summary();
+            // 只带这个供应商组的冷却。summary() 是全表(还会把一个落地摊成它名下
+            // 所有节点名),整表甩出去几百条,而客户端要的只是「还要等多久」。
+            const s = this.cooldown.summary().filter((c) => c.group === group);
+            // 等多久看剩余最短的那个,不是表里碰巧排第一的那个
+            const soon = this.cooldown.soonest(nodes, group);
             this.usage.record(body.model, null, false);
-            this.logger('error', `[chat] 全部节点冷却中: ${s.length} 个`);
+            this.logger('error', `[chat] 候选出口全在冷却或已试过: 本组冷却 ${s.length} 条,已试 ${tried.size} 个节点`);
             finishLane();
             return dialect.fail(res, 429,
-              `All nodes rate-limited, retry in ~${s[0]?.remain || Math.ceil(COOLDOWN_MS / 1000)}s`, 'all_nodes_429', { cooldown: s });
+              `All nodes rate-limited, retry in ~${soon ? Math.ceil(soon.remain / 1000) : Math.ceil(COOLDOWN_MS / 1000)}s`,
+              'all_nodes_429', { cooldown: s });
           }
           // 换之前喘 2 秒:重置后一口气把所有节点扫成 429 就是这么来的,
           // 上游限流是按窗口算的,给它一点恢复时间
@@ -2218,6 +2297,26 @@ export class Gateway {
       (this.cooldown.recentMark(a) - this.cooldown.recentMark(b))
       || (this.delay.get(a) - this.delay.get(b)));
     return [...alive, ...untested];
+  }
+
+  /**
+   * 同一个落地地址下的所有节点名。summary() 摊冷却状态给面板用。
+   * 反向索引跟着 provider 文件的 Map 走(那个 Map 只在订阅更新后换新对象),
+   * 所以缓存到对象身份变了才重建。
+   */
+  nodesOfEgress(egress) {
+    const map = loadProviderEgress();
+    if (this._revSrc !== map) {
+      const rev = new Map();
+      for (const [node, server] of map) {
+        if (rev.has(server)) rev.get(server).push(node);
+        else rev.set(server, [node]);
+      }
+      this._revSrc = map;
+      this._rev = rev;
+    }
+    // 解析不出来时 egress 就是节点名本身,原样返回
+    return this._rev.get(egress) || [egress];
   }
 
   /** 被剔除的节点,面板要显示出来 —— 静默消失会让人以为订阅少了节点 */

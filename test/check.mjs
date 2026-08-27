@@ -89,6 +89,16 @@ t('当前节点正在冷却时标 cooling 而不是 active', () => {
   assert.equal(r[0].name, 'B', '排头应让给真正可用的');
 });
 
+t('同一节点多条冷却时显示最长的那条,不是最后一条', () => {
+  // 冷却按落地记、按供应商组分开,所以一个节点名会出现多次
+  const r = nodeRows({
+    nodes: NODES, now: 0,
+    cooldowns: [{ node: 'A', remain: 300 }, { node: 'A', remain: 20 }],
+  });
+  const a = r.find((x) => x.name === 'A');
+  assert.equal(a.remain, 300_000, '报最短的那条会让人以为 20 秒后就能用');
+});
+
 t('冷却已过期的条目直接当可用', () => {
   const r = nodeRows({ nodes: NODES, cooldowns: [{ node: 'B', remain: 0 }], now: 0 });
   assert.equal(r.find((x) => x.name === 'B').state, 'idle');

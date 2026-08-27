@@ -7,7 +7,7 @@
   "scripts": {
     "preview": "node server/preview.mjs",
     "start": "node server/index.mjs",
-    "test": "node test/check.mjs && node test/anthropic.mjs && node test/capabilities.mjs && node test/model-metadata.mjs && node test/model-availability.mjs && node test/server.mjs && node test/e2e.mjs",
+    "test": "node test/check.mjs && node test/anthropic.mjs && node test/capabilities.mjs && node test/model-metadata.mjs && node test/model-availability.mjs && node test/provider-egress.mjs && node test/server.mjs && node test/e2e.mjs",
     "verify:tunnel": "node scripts/verify-tunnel.mjs",
     "verify:upstream": "node scripts/verify-upstream.mjs",
     "verify:api": "node scripts/verify-api.mjs",

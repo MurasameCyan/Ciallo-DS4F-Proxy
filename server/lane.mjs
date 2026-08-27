@@ -28,6 +28,19 @@ export class LaneManager {
       this.main.active++;
       return this.main;
     }
+    // 先看有没有现成的空闲子 lane。少了这一步,子 lane 就是「一次性」的:
+    // 创建它的那个请求用完,它空转到 idleMs 被回收,后续请求全挤回主 lane ——
+    // 稳态并发实际上还是 1,调大 maxChildren 也没有任何效果。
+    // 只接 active === 0 的:一条 lane = 一个 mihomo 进程 = 一个出口 IP,
+    // 塞第二个并发请求进去等于两个请求共用一个出口,白费一条 lane。
+    for (const lane of this._children.values()) {
+      if (lane.active === 0 && lane.node && available(lane.node)) {
+        lane.active = 1;
+        lane.lastUsed = this.now();
+        return lane;
+      }
+    }
+
     const occupied = new Set([mainNode, ...this.children().map((lane) => lane.node)]);
     const node = nodes.find((candidate) => !occupied.has(candidate) && available(candidate));
     // 三个回落条件:没有可用的空闲节点 / 子 lane 已满 / 已有子 lane 正在创建。

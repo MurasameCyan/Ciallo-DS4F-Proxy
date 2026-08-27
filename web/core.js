@@ -135,7 +135,10 @@ export function nodeRows({ nodes = [], cooldowns = [], current = '', locked = ''
   for (const c of cooldowns) {
     if (!c?.node) continue;
     const ms = remainMs(c.deadline ?? cooldownDeadline(c.remain, now), now);
-    if (ms > 0) cooling.set(c.node, ms);
+    // 同一个节点可能有多条:按供应商组分开记,而且一条落地冷却会摊到它名下
+    // 所有节点名上。取最长的那条 —— 这一格显示的是「还要多久能用」,
+    // 直接 set 会变成最后一条覆盖前面的,可能报出一个偏短的时间。
+    if (ms > (cooling.get(c.node) || 0)) cooling.set(c.node, ms);
   }
 
   const mk = (name, i, dead) => {

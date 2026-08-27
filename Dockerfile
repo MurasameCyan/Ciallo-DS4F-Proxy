@@ -11,7 +11,8 @@
 # 而不是等用户 docker run 之后收到 exec format error。
 # 代价只有一次 gunzip 和一次 -v,可以忽略。
 FROM alpine:3.20 AS kernel
-ARG MIHOMO_VERSION=v1.19.29
+# v1.19.30 (2026-08-16) 修了 crypto/tls 的 CVE-2026-56862。
+ARG MIHOMO_VERSION=v1.19.30
 ARG TARGETARCH
 RUN apk add --no-cache curl
 WORKDIR /out

@@ -52,6 +52,28 @@ const t = async (name, fn) => { await fn(); n++; console.log(`  ok  ${name}`); }
 
 const NODES = ['A', 'B', 'C'];
 
+// 冷却表的 key 是内部编码(落地地址 + 分组),测试不该拼它。
+// 这几个 helper 按 value 里存的 egress/group 找条目。
+const entryOf = (c, node, group = 'default') => {
+  const egress = c.egress(node);
+  for (const v of c.cooldowns.values()) {
+    if (v.egress === egress && v.group === group) return v;
+  }
+  return undefined;
+};
+/** 直接摆一个「还剩 remainMs」的冷却,用于构造相对关系 */
+const setRemain = (c, node, remainMs, group = 'default', extra = {}) => {
+  c.mark429(node, group);
+  Object.assign(entryOf(c, node, group), { until: Date.now() + remainMs, retryAfter: null, ...extra });
+};
+/** 模拟冷却已过期被清掉,但 lastMarked 还留着 */
+const thaw = (c, node, group = 'default') => {
+  const egress = c.egress(node);
+  for (const [k, v] of c.cooldowns) {
+    if (v.egress === egress && v.group === group) c.cooldowns.delete(k);
+  }
+};
+
 await t('429 的节点进冷却,pickAvailable 跳过它', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default');
@@ -71,18 +93,18 @@ await t('不同供应商组独立冷却', () => {
 
 await t('冷却过期后自动放行,不用等谁来清', () => {
   const c = new NodeCooldown();
-  c.cooldowns.set('A:default', { until: Date.now() - COOLDOWN_MS - 1, retryAfter: null });
+  setRemain(c, 'A', -COOLDOWN_MS - 1);
   assert.equal(c.isCooling('A', 'default'), false);
-  assert.equal(c.cooldowns.has('A:default'), false, '过期项应就地删掉,否则 summary 会一直带着它');
+  assert.equal(entryOf(c, 'A'), undefined, '过期项应就地删掉,否则 summary 会一直带着它');
   assert.equal(c.pickAvailable(NODES, 'default'), 'A');
 });
 
 await t('全员冷却时 soonest 给出剩余最短的那个', () => {
   const c = new NodeCooldown();
   // 用绝对剩余量构造,只看相对关系(B<C<A),不绑死 COOLDOWN_MS 的具体值
-  c.cooldowns.set('A:default', { until: Date.now() + 290_000, retryAfter: null });   // 剩 290s
-  c.cooldowns.set('B:default', { until: Date.now() + 220_000, retryAfter: null });   // 剩 220s(最短)
-  c.cooldowns.set('C:default', { until: Date.now() + 260_000, retryAfter: null });   // 剩 260s
+  setRemain(c, 'A', 290_000);   // 剩 290s
+  setRemain(c, 'B', 220_000);   // 剩 220s(最短)
+  setRemain(c, 'C', 260_000);   // 剩 260s
   assert.equal(c.pickAvailable(NODES, 'default'), null);
   assert.equal(c.soonest(NODES, 'default').node, 'B');
   assert.equal(c.soonest([], 'default'), null, '没节点时不能返回半个对象');
@@ -91,7 +113,7 @@ await t('全员冷却时 soonest 给出剩余最短的那个', () => {
 await t('summary 的 remain 是秒,且不含已过期项', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default');
-  c.cooldowns.set('B:default', { until: Date.now() - COOLDOWN_MS - 1, retryAfter: null });
+  setRemain(c, 'B', -COOLDOWN_MS - 1);
   const s = c.summary();
   assert.equal(s.length, 1);
   assert.equal(s[0].node, 'A');
@@ -101,7 +123,7 @@ await t('summary 的 remain 是秒,且不含已过期项', () => {
 await t('Retry-After 覆盖默认冷却时长', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default', 30);  // 30s
-  const entry = c.cooldowns.get('A:default');
+  const entry = entryOf(c, 'A');
   const expected = Date.now() + 30_000;
   assert.ok(Math.abs(entry.until - expected) < 100, `应是 now+30s,差了 ${entry.until - expected}ms`);
   assert.equal(entry.retryAfter, 30);
@@ -110,15 +132,15 @@ await t('Retry-After 覆盖默认冷却时长', () => {
 await t('5xx 冷却不覆盖更长的限流或封域冷却', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default', 3600);
-  const rateLimited = { ...c.cooldowns.get('A:default') };
+  const rateLimited = { ...entryOf(c, 'A') };
   c.mark5xx('A', 'default');
-  assert.deepEqual(c.cooldowns.get('A:default'), rateLimited,
+  assert.deepEqual(entryOf(c, 'A'), rateLimited,
     '长 Retry-After 不能被 5xx 的 60s 冷却缩短');
 
   c.markBlocked('B', 'default');
-  const blocked = { ...c.cooldowns.get('B:default') };
+  const blocked = { ...entryOf(c, 'B') };
   c.mark5xx('B', 'default');
-  assert.deepEqual(c.cooldowns.get('B:default'), blocked,
+  assert.deepEqual(entryOf(c, 'B'), blocked,
     '封域冷却不能被 5xx 覆盖');
 });
 
@@ -165,7 +187,7 @@ await t('封域节点第一次失败就换下一个,不再烧两次同节点重�
 await t('无 Retry-After 时兜底冷却 60 秒(不是 5 分钟)', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default');   // 不带 Retry-After,走兜底
-  const entry = c.cooldowns.get('A:default');
+  const entry = entryOf(c, 'A');
   assert.equal(COOLDOWN_MS, 60 * 1000, '无 Retry-After 的兜底应为 60 秒');
   assert.ok(Math.abs(entry.until - (Date.now() + COOLDOWN_MS)) < 100,
     `应是 now+COOLDOWN_MS,差了 ${entry.until - (Date.now() + COOLDOWN_MS)}ms`);
@@ -193,12 +215,100 @@ await t('模型冷却会过期,且默认窗口足够短不永久隐藏恢复的�
 await t('冷却过期即删,但 lastMarked 记着最近限流时刻(供 rankNodes 排队尾)', () => {
   const c = new NodeCooldown();
   c.mark429('A', 'default');
-  c.cooldowns.delete('A:default');    // 模拟解冻后过期项被清
+  thaw(c, 'A');    // 模拟解冻后过期项被清
   assert.equal(c.isCooling('A', 'default'), false, '解冻了就不算在冷却');
   assert.ok(c.recentMark('A') > 0, '但 lastMarked 记得它刚限流过,好让它排到队尾');
   assert.equal(c.recentMark('Z'), 0, '没限流过的是 0,享受最前优先级');
   c.clear('A', 'default');
   assert.equal(c.recentMark('A'), 0, '成功(clear)后归零,恢复正常优先级');
+});
+
+// ── 冷却按落地 IP 而不是节点名 ────────────────────────────
+// 实测:396 个节点名只有 291 个落地地址,其中一个 IP 挂了 51 个名字。
+// 免费额度按出口 IP 计,所以按名字冷却会让一次请求的 7 次重试全撞同一台机器。
+
+// A1/A2/A3 同一台机器,B1 另一台
+const SHARED = new Map([['A1', '1.1.1.1'], ['A2', '1.1.1.1'], ['A3', '1.1.1.1'], ['B1', '2.2.2.2']]);
+const shared = () => new NodeCooldown({
+  egressOf: (n) => SHARED.get(n),
+  namesOf: (e) => [...SHARED].filter(([, s]) => s === e).map(([n]) => n),
+});
+const SHARED_NODES = ['A1', 'A2', 'A3', 'B1'];
+
+await t('一个名字被 429,同落地的其它名字一起进冷却', () => {
+  const c = shared();
+  c.mark429('A1', 'default');
+  assert.equal(c.isCooling('A2', 'default'), true, '同一台机器换个名字不该还能打');
+  assert.equal(c.isCooling('A3', 'default'), true);
+  assert.equal(c.isCooling('B1', 'default'), false, '别的落地不受影响');
+  assert.equal(c.pickAvailable(SHARED_NODES, 'default'), 'B1', '直接跳到下一个真出口');
+});
+
+await t('落地共享仍按供应商组分开', () => {
+  const c = shared();
+  c.mark429('A1', 'deepseek');
+  assert.equal(c.isCooling('A2', 'deepseek'), true);
+  assert.equal(c.isCooling('A2', 'nemotron'), false, '同落地被限的是某个组,不是整台机器');
+});
+
+await t('exclude 里的节点名按落地换算,超时分支才不会连撞同一台机器', () => {
+  const c = shared();
+  // 超时那条分支只 tried.add(cur),不打冷却标记
+  assert.equal(c.pickAvailable(SHARED_NODES, 'default', new Set(['A1'])), 'B1',
+    'A1 试过了就该跳过 A2/A3 —— 它们是同一台机器');
+  assert.equal(c.pickAvailable(SHARED_NODES, 'default', new Set(['B1'])), 'A1');
+  assert.equal(c.pickAvailable(SHARED_NODES, 'default', new Set(['A1', 'B1'])), null,
+    '两个落地都试过了就是真没得挑,别再返回同机器的别名');
+});
+
+await t('summary 把落地冷却摊回所有同机器的节点名(面板按名字画)', () => {
+  const c = shared();
+  c.mark429('A1', 'default', 30);
+  const s = c.summary();
+  assert.deepEqual(s.map((x) => x.node).sort(), ['A1', 'A2', 'A3'],
+    '同落地的三个名字都该显示成冷却中,以前只标被打中的那一个');
+  for (const row of s) {
+    assert.equal(row.egress, '1.1.1.1');
+    assert.equal(row.group, 'default');
+    assert.equal(row.retryAfter, 30);
+    assert.ok(row.remain > 25 && row.remain <= 30);
+  }
+});
+
+await t('成功清冷却按落地清,同机器的别名一起放行', () => {
+  const c = shared();
+  c.mark429('A1', 'default');
+  c.clear('A2');   // 用另一个名字成功
+  assert.equal(c.isCooling('A1', 'default'), false);
+  assert.equal(c.recentMark('A3'), 0, 'recentMark 也按落地,不然队尾惩罚会残留');
+});
+
+await t('解析不出落地时退回按节点名(provider 文件还没拉下来)', () => {
+  const c = new NodeCooldown({ egressOf: () => undefined });
+  c.mark429('A', 'default');
+  assert.equal(c.isCooling('A', 'default'), true);
+  assert.equal(c.isCooling('B', 'default'), false, '拿不到落地就宁可少合并,不能全表连坐');
+  assert.equal(c.summary()[0].node, 'A');
+});
+
+await t('IPv6 落地地址(带冒号)不会把 key 切错', () => {
+  const V6 = new Map([['v6a', '2001:db8::1'], ['v6b', '2001:db8::1'], ['v6c', '2001:db8::2']]);
+  const c = new NodeCooldown({
+    egressOf: (n) => V6.get(n),
+    namesOf: (e) => [...V6].filter(([, s]) => s === e).map(([n]) => n),
+  });
+  c.mark429('v6a', 'default');
+  assert.equal(c.isCooling('v6b', 'default'), true);
+  assert.equal(c.isCooling('v6c', 'default'), false);
+  assert.equal(c.summary()[0].group, 'default', 'group 不能被地址里的冒号吃掉');
+  assert.equal(c.summary()[0].egress, '2001:db8::1');
+});
+
+await t('Gateway 默认从 provider 文件取落地,反向索引跟着文件走', () => {
+  const g = new Gateway(load(), () => {});
+  // 没有 provider 文件时 egressOf 返回 undefined,退回节点名
+  assert.equal(g.cooldown.egress('某节点'), '某节点');
+  assert.deepEqual(g.nodesOfEgress('某节点'), ['某节点']);
 });
 
 await t('clearAll 返回清掉的个数(面板要显示)', () => {
@@ -758,6 +868,67 @@ await t('lane:子 lane 有活动请求时不会被回收', async () => {
   assert.equal(destroyed, 1);
 });
 
+await t('lane:空闲的子 lane 被复用,而不是放着等回收、请求全挤回主 lane', async () => {
+  let now = 0;
+  let created = 0;
+  const manager = new LaneManager({
+    idleMs: 100,
+    now: () => now,
+    createChild: async ({ node }) => { created++; return { id: `child-${created}`, node }; },
+    destroyChild: async () => {},
+  });
+  const main = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  const child = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  assert.equal(created, 1);
+  manager.release(child);          // 这个请求做完了,子 lane 空着但进程还在
+
+  const again = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  assert.equal(again.id, child.id, '空闲子 lane 必须接下一个请求');
+  assert.equal(created, 1, '不该为此再 fork 一个 mihomo');
+  assert.equal(again.active, 1);
+  assert.equal(manager.main.active, 1, '主 lane 不该被塞第二个请求');
+
+  manager.release(main);
+  manager.release(again);
+});
+
+await t('lane:忙着的子 lane 不接第二个并发(一条 lane = 一个出口 IP)', async () => {
+  const manager = new LaneManager({
+    maxChildren: 1,
+    now: () => 0,
+    createChild: async ({ node }) => ({ id: `child-${node}`, node }),
+    destroyChild: async () => {},
+  });
+  const main = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  const child = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  assert.equal(child.node, 'B');
+  // 子 lane 还占着,又满额了 —— 只能回落主 lane,不能给 child 再塞一个
+  const third = await manager.acquire({ nodes: ['A', 'B'], mainNode: 'A', available: () => true });
+  assert.equal(third.id, 'main');
+  assert.equal(child.active, 1, '忙着的子 lane 不该被叠加并发');
+  manager.release(main); manager.release(child); manager.release(third);
+});
+
+await t('lane:空闲子 lane 的节点已被冷却时跳过它,不拿去撞', async () => {
+  let created = 0;
+  const manager = new LaneManager({
+    maxChildren: 2,
+    now: () => 0,
+    createChild: async ({ node }) => { created++; return { id: `child-${node}`, node }; },
+    destroyChild: async () => {},
+  });
+  const main = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  const child = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: () => true });
+  assert.equal(child.node, 'B');
+  manager.release(child);
+  // B 被冷却了:空闲的 child 绑死在 B 上,不能复用
+  const notB = (node) => node !== 'B';
+  const next = await manager.acquire({ nodes: ['A', 'B', 'C'], mainNode: 'A', available: notB });
+  assert.equal(next.node, 'C', '该另起一个绑到没冷却的 C 上');
+  assert.equal(child.active, 0, '冷却节点上的空闲 lane 不该被占用');
+  manager.release(main); manager.release(next);
+});
+
 await t('lane:没有可用独立节点时回退主 lane,不丢请求', async () => {
   const manager = new LaneManager({
     createChild: async () => { throw new Error('不应创建'); },
@@ -1183,12 +1354,8 @@ await t('全员 5xx 冷却时立即回 503,不等待并误报 429', async () => 
 
 await t('混合 5xx 与 429 冷却时仍等待可恢复的节点', async () => {
   const g = new Gateway(load(), () => {});
-  g.cooldown.cooldowns.set('A:default', {
-    until: Date.now() + 60_000, retryAfter: null, reason: '5xx',
-  });
-  g.cooldown.cooldowns.set('B:default', {
-    until: Date.now() + 20, retryAfter: 1,
-  });
+  setRemain(g.cooldown, 'A', 60_000, 'default', { reason: '5xx' });
+  setRemain(g.cooldown, 'B', 20, 'default', { retryAfter: 1 });
   g.getCurrentNode = async () => null;
   g.switchNode = async () => true;
   const res = fakeRes();
@@ -1219,7 +1386,7 @@ await t('5xx 冷却解冻后仍排队尾,不凭低延迟插回队首', async () 
   const g = fakeGateway({ A: 1, B: 2, C: 3 });
   await g.testNodes();
   g.cooldown.mark5xx('A', 'default');
-  g.cooldown.cooldowns.delete('A:default'); // 模拟冷却已解冻,lastMarked 仍保留
+  thaw(g.cooldown, 'A'); // 模拟冷却已解冻,lastMarked 仍保留
   assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['B', 'C', 'A'],
     '5xx 过的节点排到队尾,不凭低延迟插回队首');
 });
@@ -1473,7 +1640,7 @@ await t('限流过的节点在 rankNodes 里让到队尾,不凭低延迟插回�
   await g.testNodes();
   assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['B', 'C', 'A'], '基线:纯延迟序 B<C<A');
   g.cooldown.mark429('B', 'default');          // 最快的 B 撞了限流
-  g.cooldown.cooldowns.delete('B:default');    // 模拟已解冻(冷却过期清掉,lastMarked 还在)
+  thaw(g.cooldown, 'B');    // 模拟已解冻(冷却过期清掉,lastMarked 还在)
   assert.deepEqual(g.rankNodes(['A', 'B', 'C']), ['C', 'A', 'B'],
     'B 刚限流过,即便解冻也排到没限流的 C/A 后面,不靠低延迟插队');
 });
@@ -1549,6 +1716,39 @@ await t('pickFreeModels 只认 -free 后缀和 big-pickle,顺带去重', () => {
   assert.deepEqual(pickFreeModels([null, '', '   ', undefined, 42]), [], '坏值全丢掉,不抛');
   assert.deepEqual(pickFreeModels(), []);
   assert.deepEqual(pickFreeModels(['  x-free  ']), ['x-free'], '两头空白得修掉,不然面板上那个胶囊里带空格');
+});
+
+await t('pickFreeModels 用 models.dev 价格补「没 -free 后缀的免费模型」', () => {
+  const META = {
+    'new-thing': { provider: 'opencode', inputCost: 0, outputCost: 0, deprecated: false, name: 'New Thing' },
+    'gpt-5': { provider: 'opencode', inputCost: 5, outputCost: 30, deprecated: false, name: 'GPT-5' },
+    // 别家的同名免费模型:findModelMetadata 是模糊匹配,可能匹到它
+    'someone-else': { provider: 'openrouter', inputCost: 0, outputCost: 0, deprecated: false, name: 'Free Thing' },
+  };
+  const lookup = (id) => META[id] || null;
+  assert.deepEqual(
+    pickFreeModels(['gpt-5', 'new-thing', 'mimo-v2.5-free'], lookup).sort(),
+    ['mimo-v2.5-free', 'new-thing'],
+    '0 元的收,有价格的不收 —— big-pickle 那种以后不用再手写一条');
+  assert.deepEqual(pickFreeModels(['someone-else'], lookup), [],
+    '只认 opencode 自己那份记录,别家的 0 元模型不算');
+  assert.deepEqual(pickFreeModels(['gpt-5', 'new-thing']), [],
+    '没给 lookup 就退回纯后缀判据(models.dev 拉不到时的行为)');
+});
+
+await t('models.dev 标 deprecated 但上游还在列的免费模型不能被漏掉', () => {
+  // 实测:models.dev 把 deepseek-v4-flash-free / laguna-s-2.1-free 标成
+  // deprecated=true,而它们此刻在上游清单里活着。后缀判据先行,所以不受影响。
+  const lookup = () => ({ provider: 'opencode', inputCost: 0, outputCost: 0, deprecated: true, name: 'x' });
+  assert.deepEqual(pickFreeModels(['deepseek-v4-flash-free'], lookup), ['deepseek-v4-flash-free']);
+});
+
+await t('FREE_MODELS 兜底就是 2026-08-28 上游那 8 个', () => {
+  assert.equal(FREE_MODELS.length, 8);
+  assert.equal(FREE_MODELS.includes('x-preview-f-free'), false,
+    'Ox Alpha 免费一周已到期,上游清单里没有了');
+  assert.deepEqual(pickFreeModels(FREE_MODELS).sort(), [...FREE_MODELS].sort(),
+    '兜底清单自己必须能过判据,否则冷启动时它会被自己筛掉');
 });
 
 await t('拉到清单就换成上游那份,新增了什么记一行日志', async () => {
