@@ -208,6 +208,14 @@ const HEALTH_TIMEOUT_MS = Math.min(Math.max(Number(process.env.NODE_TEST_TIMEOUT
  * north-mini-code-free 这 4 个下线;x-preview-f-free(Ox Alpha)2026-08-20
  * 上线、免费一周,现已从上游清单消失,一并删掉。
  *
+ * 2026-08-29 上游多了第 9 个 ling-3.0-flash-fin-free(当天 64 个模型)。
+ * **刻意没加进这里**:兜底清单里的每个模型都要有一条实测能力记录
+ * (server/capabilities.mjs 的 SEED,test/server.mjs 有断言挡着),没记录的会
+ * 按「顶档 high + 宽松」处理 —— 而这个模型至今没探出来过(线上容器的清单里有它,
+ * capabilities.json 里没有它)。记录是手工量的,凭空编一个 ctx 比不列更糟。
+ * 它靠拉清单进来,不靠这份常量:每天一次的定时器(见 index.mjs 的
+ * createModelsSync)加开机那次,兜底常量只在两条网络路径都断时才露面。
+ *
  * 下线的那 4 个从这里删掉了,但它们的**实测记录留着**(server/capabilities.mjs
  * 的 SEED):记录是一张按 id 查的字典,清单里没有它就不显示,哪天回来了 id 一样
  * 直接复用,不用再探一遍。早先不敢删是因为删了要连带动一张手写的上下文表和三处
@@ -234,10 +242,15 @@ export const FREE_MODELS = [
 ];
 
 /**
- * 免费清单的 TTL。上游几周才动一次,拉太勤没意义(还多一次出站),
- * 所以一天一次;真正保证「不旧」的是开机那一次(见 index.mjs 的 main)。
+ * 免费清单的 TTL,同时也是自动同步的周期。上游几周才动一次,拉太勤没意义
+ * (还多一次出站),所以一天一次。
+ *
+ * 两条路都按它走:freeModels() 被问到时顺手看一眼旧不旧,以及 index.mjs 里
+ * 那个每天一拍的定时器(见 createModelsSync)。只有前一条的时代,「每天一次」
+ * 其实是「有人问的话每天一次」—— 面板关着又连着一天没请求,清单就一直是开机
+ * 那份,开机那次要是也失败就一直是 FREE_MODELS 兜底常量。
  */
-const MODELS_TTL_MS = 24 * 60 * 60 * 1000;
+export const MODELS_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 从上游那份「全部模型」里挑出免费的。

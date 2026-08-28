@@ -15,7 +15,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfgMod from './config.mjs';
 import * as mihomo from './mihomo.mjs';
-import { Gateway, OPENAI, ANTHROPIC, RESPONSES, json } from './gateway.mjs';
+import { Gateway, OPENAI, ANTHROPIC, RESPONSES, json, MODELS_TTL_MS } from './gateway.mjs';
 import { buildInfo, checkUpdate } from './build.mjs';
 import {
   matches, parseBasic, readCookie, resolveCredentials,
@@ -576,6 +576,68 @@ export function createSubscriptionUpdater({
   return { run, schedule, stop };
 }
 
+/**
+ * 免费模型清单的每日自动同步。
+ *
+ * 开机那一次在 main 里,这个定时器管之后的每一天。为什么需要它:以前「之后每天
+ * 一次」是搭面板轮询的车 —— freeModels() 被问到时发现过期了,才在后台补拉一遍。
+ * 那条路要有人问才走,于是面板关着、又连着一天没请求的话,清单就一直是开机那份;
+ * 开机那次要是也没拉到,跑的就是写死的 FREE_MODELS 兜底常量。而下一个请求恰好
+ * 会被那份旧清单挡掉 —— 上游新上的免费模型在这儿是 400 Model not available。
+ *
+ * models.dev 元数据搭同一趟车:周期一样,开机也是这两件挨着做,而且免费清单的
+ * 第二道判据(按价格认出「免费但 id 没 -free 后缀」的模型)查的就是它 ——
+ * 元数据旧了,清单跟着判错。
+ *
+ * refreshModels 自己不看 TTL,所以每一拍都是真拉;它内部对并发调用共用同一个
+ * Promise,跟面板那条路撞上也只出站一次。元数据那侧带 force:是它自己有一层
+ * 「每 TTL 只试一次」的节流,不 force 的话定时器正好踩在边界上会被跳过,
+ * 而这一拍本来就是「到点了,去拉」。
+ *
+ * allSettled 而不是两个 catch:refreshModels 失败是**往外抛**的(「同步模型」
+ * 那个按钮要能把失败报给用户),定时器这条路没人接就是 unhandledRejection,
+ * Node 20 起默认直接把进程带走。失败的原因两边各自都记了 warn,这里不用再记。
+ */
+export function createModelsSync({
+  gateway, logger = log, intervalMs = MODELS_TTL_MS,
+  setTimer = setInterval, clearTimer = clearInterval,
+}) {
+  let timer = null;
+
+  // 收尾那行日志是刻意的:一天才响一次的定时任务,没有结果记录就等于没法确认它
+  // 还活着 —— refreshModels 只在清单**有变化**时记一行,元数据成功时一个字都不记。
+  const run = async () => {
+    logger('info', '[models-auto] 开始同步免费清单');
+    const [list, meta] = await Promise.allSettled([
+      gateway.refreshModels(),
+      gateway.refreshModelMetadata({ force: true }),
+    ]);
+    const listPart = list.status === 'fulfilled' ? `清单 ${list.value.models.length} 个` : '清单未更新';
+    const metaPart = meta.status === 'fulfilled' ? `元数据 ${meta.value?.models ?? 0} 条` : '元数据未更新';
+    logger(list.status === 'fulfilled' ? 'ok' : 'warn', `[models-auto] ${listPart},${metaPart}`);
+    return [list, meta];
+  };
+
+  const stop = () => {
+    if (timer) clearTimer(timer);
+    timer = null;
+  };
+
+  const schedule = () => {
+    stop();
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+    timer = setTimer(run, intervalMs);
+    // 不挡进程退出:清单晚同步一天没关系,SIGTERM 卡住有关系
+    timer?.unref?.();
+    const every = intervalMs >= 3600_000
+      ? `${Math.round(intervalMs / 3600_000)} 小时`
+      : `${Math.round(intervalMs / 1000)} 秒`;
+    logger('info', `[models-auto] 免费清单每 ${every}自动同步一次`);
+  };
+
+  return { run, schedule, stop };
+}
+
 // ── 启动 ────────────────────────────────────────────────
 
 async function main() {
@@ -584,6 +646,7 @@ async function main() {
   const creds = resolveCredentials();
   const gateway = new Gateway(cfg, log);
   const subscriptionUpdater = createSubscriptionUpdater({ cfg, gateway });
+  const modelsSync = createModelsSync({ gateway });
   const server = createApp({ cfg, creds, gateway, subscriptionUpdater });
 
   await new Promise((resolve, reject) => {
@@ -593,7 +656,7 @@ async function main() {
   log('ok', `[gateway] 监听 0.0.0.0:${cfg.port}`);
   // 开机立刻拉一次清单。不 await:拉取要几秒,这期间面板和 /v1 都该能用
   // —— 没拉到之前用的是 FREE_MODELS 兜底,退化成旧行为而不是失败。
-  // 之后每天一次(MODELS_TTL_MS),搭面板轮询的车走,不另起定时器。
+  // 之后每天一次,由下面 modelsSync 那个定时器负责(见 createModelsSync)。
   const modelsReady = gateway.refreshModels()
     .then((r) => log('info', `[gateway] 免费模型 ${r.models.length} 个,客户端选哪个转发哪个`))
     // 拉不到就用兜底那份跑,refreshModels 已经记过一行 warn 了。
@@ -639,6 +702,9 @@ async function main() {
     log('warn', '[config] 还没有订阅地址 —— 打开面板在「配置」里填,或设 SUBSCRIPTION_URL 环境变量');
   }
   subscriptionUpdater.schedule();
+  // 免费清单每天自动同步一次。放在这里而不是更早:开机那一次(上面的
+  // refreshModels)已经拉过了,这个定时器接的是「之后每天」。
+  modelsSync.schedule();
   // 可用性结果六小时刷新一次。探测本身只在有节点时执行;没有订阅时定时器
   // 仍然 unref,不会阻止进程退出,配置保存后 /api/status 会立即补一次。
   gateway.startAvailabilityScheduler?.();
@@ -652,6 +718,7 @@ async function main() {
   const bye = async (sig) => {
     log('info', `[exit] 收到 ${sig},收尾中`);
     subscriptionUpdater.stop();
+    modelsSync.stop();
     gateway.stopAvailabilityScheduler?.();
     clearInterval(laneReaper);
     server.close();

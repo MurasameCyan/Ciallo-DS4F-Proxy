@@ -33,7 +33,7 @@ const {
   NodeCooldown, NodeAffinity, UsageTracker, Gateway, COOLDOWN_MS, FREE_MODELS, pickFreeModels,
   identityHeaders, OPENAI, ANTHROPIC, RESPONSES, readUsage, CALL_LOG_LIMIT, REQUEST_DEADLINE_MS, budgetFor, silentFor,
   classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
-  StreamKeepAlive, SSE_HEARTBEAT_MS,
+  StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS,
 } = await import('../server/gateway.mjs');
 const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
@@ -43,7 +43,7 @@ const { MihomoInstance } = await import('../server/mihomo.mjs');
 const { shortSha, buildId, buildInfo, checkUpdate } = await import('../server/build.mjs');
 const { ModelMetadataStore } = await import('../server/model-metadata.mjs');
 const indexMod = await import('../server/index.mjs');
-const { createApp, createSubscriptionUpdater } = indexMod;
+const { createApp, createSubscriptionUpdater, createModelsSync } = indexMod;
 
 let n = 0;
 const t = async (name, fn) => { await fn(); n++; console.log(`  ok  ${name}`); };
@@ -1747,6 +1747,10 @@ await t('FREE_MODELS 兜底就是 2026-08-28 上游那 8 个', () => {
   assert.equal(FREE_MODELS.length, 8);
   assert.equal(FREE_MODELS.includes('x-preview-f-free'), false,
     'Ox Alpha 免费一周已到期,上游清单里没有了');
+  // 2026-08-29 上游多了 ling-3.0-flash-fin-free,刻意不在这份兜底里:
+  // 它还没有实测能力记录,而下面那条断言要求兜底清单 ⊆ 记录。它靠每天一次的
+  // 自动同步进来(见 createModelsSync),不靠这份常量。
+  assert.equal(FREE_MODELS.includes('ling-3.0-flash-fin-free'), false);
   assert.deepEqual(pickFreeModels(FREE_MODELS).sort(), [...FREE_MODELS].sort(),
     '兜底清单自己必须能过判据,否则冷启动时它会被自己筛掉');
 });
@@ -2019,6 +2023,59 @@ await t('自动更新成功后即使节点为空也会自动测速', async () =>
   });
   await updater.run();
   assert.equal(speed, 1, '每次更新都必须紧接自动测速,空节点也不能跳过');
+});
+
+await t('免费清单每 24 小时自动同步一次,清单拉失败不会带走进程', async () => {
+  const scheduled = [];
+  const cleared = [];
+  const calls = [];
+  const lines = [];
+  const gateway = {
+    // 真的 refreshModels 失败时是**往外抛**的(「同步模型」按钮要能报错),
+    // 所以这里照着抛,验证定时器那条路自己接住了
+    refreshModels: async () => { calls.push('models'); throw new Error('两条路都不通'); },
+    refreshModelMetadata: async (opt) => { calls.push(`meta:force=${opt?.force === true}`); return { models: 3 }; },
+  };
+  const sync = createModelsSync({
+    gateway,
+    logger: (lv, msg) => lines.push(`${lv}:${msg}`),
+    setTimer: (fn, ms) => { const h = { fn, ms, unref() { h.unrefed = true; } }; scheduled.push(h); return h; },
+    clearTimer: (h) => cleared.push(h),
+  });
+
+  sync.schedule();
+  assert.equal(scheduled.length, 1, 'schedule 必须真挂一个定时器 —— 只靠 TTL 等人来问的话,面板关着就不同步了');
+  assert.equal(scheduled[0].ms, MODELS_TTL_MS, '周期就是清单的 TTL,一天一次');
+  assert.equal(scheduled[0].unrefed, true, '定时器必须 unref,否则 SIGTERM 要等满一天才退得掉');
+
+  // 定时器那一拍走的就是 run。allSettled 是关键:少了它,清单拉失败就是一条
+  // 没人接的 rejection,Node 20 起默认直接把进程带走 —— 每天一次的定时崩溃
+  const settled = await scheduled[0].fn();
+  assert.deepEqual(calls, ['models', 'meta:force=true'],
+    '一拍同步两样:免费清单 + models.dev 元数据,后者带 force 才不会被它自身的 TTL 节流跳过');
+  assert.deepEqual(settled.map((r) => r.status), ['rejected', 'fulfilled'],
+    '两件事互不影响:清单没拉到,元数据照样更新');
+  assert.equal(lines.at(-1), 'warn:[models-auto] 清单未更新,元数据 3 条',
+    '一天才响一次,必须留下结果 —— 不然没法确认它还活着');
+
+  sync.schedule();
+  assert.equal(cleared.at(-1), scheduled[0], '重排必须先取消旧定时器,不能留两个一起跑');
+  sync.stop();
+  assert.equal(cleared.at(-1), scheduled.at(-1));
+  assert.equal(scheduled.length, 2, 'stop 之后不再安排新的');
+
+  // 成功那一路:清单更新了要报个数,而且级别是 ok 不是 warn
+  const good = createModelsSync({
+    gateway: {
+      refreshModels: async () => ({ models: ['a-free', 'b-free'], added: ['b-free'], gone: [] }),
+      refreshModelMetadata: async () => ({ models: 12 }),
+    },
+    logger: (lv, msg) => lines.push(`${lv}:${msg}`),
+    setTimer: () => ({ unref() {} }),
+    clearTimer: () => {},
+  });
+  await good.run();
+  assert.equal(lines.at(-1), 'ok:[models-auto] 清单 2 个,元数据 12 条');
 });
 
 // ── 鉴权 ────────────────────────────────────────────────
