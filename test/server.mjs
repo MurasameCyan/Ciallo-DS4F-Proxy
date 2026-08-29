@@ -1743,14 +1743,15 @@ await t('models.dev 标 deprecated 但上游还在列的免费模型不能被漏
   assert.deepEqual(pickFreeModels(['deepseek-v4-flash-free'], lookup), ['deepseek-v4-flash-free']);
 });
 
-await t('FREE_MODELS 兜底就是 2026-08-28 上游那 8 个', () => {
-  assert.equal(FREE_MODELS.length, 8);
+await t('FREE_MODELS 兜底就是 2026-08-29 上游那 9 个', () => {
+  assert.equal(FREE_MODELS.length, 9);
   assert.equal(FREE_MODELS.includes('x-preview-f-free'), false,
     'Ox Alpha 免费一周已到期,上游清单里没有了');
-  // 2026-08-29 上游多了 ling-3.0-flash-fin-free,刻意不在这份兜底里:
-  // 它还没有实测能力记录,而下面那条断言要求兜底清单 ⊆ 记录。它靠每天一次的
-  // 自动同步进来(见 createModelsSync),不靠这份常量。
-  assert.equal(FREE_MODELS.includes('ling-3.0-flash-fin-free'), false);
+  // 2026-08-29 上游多了 ling-3.0-flash-fin-free。一开始刻意没进兜底,因为下面那条
+  // 断言要求兜底清单 ⊆ 实测记录,而它当时没有记录;同日实测出来了(ctx 262144、
+  // 顶档 max、六档全认),记录进了 SEED,所以这里也补上 —— 兜底只在两条网络路径
+  // 都断时才露面,那时候少列一个模型就是真的用不上它
+  assert.equal(FREE_MODELS.includes('ling-3.0-flash-fin-free'), true);
   assert.deepEqual(pickFreeModels(FREE_MODELS).sort(), [...FREE_MODELS].sort(),
     '兜底清单自己必须能过判据,否则冷启动时它会被自己筛掉');
 });

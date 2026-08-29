@@ -58,9 +58,34 @@ await t('parseCtx 取原文里最大的合理整数,不会把错误码当成上�
   // [1261] 是错误码。不设下界的话它会被当成「这个模型只吃 1261 token」——
   // 面板显示 [1K],而真值是 1M
   assert.equal(parseCtx('[1261] Prompt exceeds max length'), null);
-  assert.equal(parseCtx('[1261] input 1300000 tokens > limit 1048576'), 1300000, '取最大的那个,让顶探自己去夹');
   assert.equal(parseCtx('limit is 999999999999'), null, '离谱的大数不采信');
   assert.equal(parseCtx(''), null);
+});
+
+await t('parseCtx 优先认原文点名的上限,而不是盲取最大值', () => {
+  // ling-3.0-flash-fin-free 的实测原文(2026-08-29)。这里 limit 在前、我请求的量
+  // 在后,盲取最大值会读成 1500001 —— 那是**我发出去的量**,不是上限。而这个数会
+  // 以 method=validator 落盘,且 run 只探没记录的,所以再也不会重探:面板从此
+  // 显示 [1M],真值其实是 256K。
+  assert.equal(parseCtx("This endpoint's maximum context length is 262144 tokens. "
+    + 'However, you requested about 1500001 tokens (1500000 of text input, 1 in the output).'), 262144);
+  // 反过来的写法(请求量在前、limit 在后)也得读出 limit。两种格式方向相反,
+  // 所以单靠取最值必然错一边 —— 这正是要按句式认的原因
+  assert.equal(parseCtx('[1261] input 1300000 tokens > limit 1048576'), 1048576);
+  // 点名的上限允许小于 100000。那个下界是给「盲取最大值」防错误码用的,句式既然
+  // 点了名就没有这个歧义;沿用下界的话 64K 级模型永远读不出上限
+  assert.equal(parseCtx('maximum context length is 65536 tokens'), 65536);
+  assert.equal(parseCtx('限制上下文长度[1,262144]'), 262144);
+  // 点名但离谱的数照样不采信,退回盲取那条路(它也拒),最终 null
+  assert.equal(parseCtx('limit is 999999999999'), null);
+  // 「rate limit」里也有个 limit,但它说的是每天多少次请求,不是上下文上限。
+  // 按裸 \blimit\b 认会把配额读成上下文 —— 现实里 parseCtx 只在超限探测的
+  // terminal 4xx 上被调用(429 走的是限流分支,压根到不了这儿),但原文里带一句
+  // rate limit 的 400 是存在的,不该因此记下一个假上限
+  assert.equal(parseCtx('rate limit: 1000000 requests per day exceeded'), null);
+  assert.equal(parseCtx('Rate limit exceeded, retry after 3600 seconds'), null);
+  // 收紧之后真上限仍然要读得出来 —— 同一句话里两种 limit 都在时以上下文那个为准
+  assert.equal(parseCtx('rate limit ok; input 1300000 tokens > limit 1048576'), 1048576);
 });
 
 // ── SEED 和记录 ─────────────────────────────────────────

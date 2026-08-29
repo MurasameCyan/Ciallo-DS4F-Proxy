@@ -232,6 +232,9 @@ export const FREE_MODELS = [
   'deepseek-v4-flash-free',
   'hy3-free',
   'laguna-s-2.1-free',
+  // 2026-08-29 上游上线。上一版刻意没列它 —— 当时没有实测能力记录,
+  // 而兜底清单必须 ⊆ SEED。现在它有了(262144 / 顶档 max,见 capabilities.mjs)
+  'ling-3.0-flash-fin-free',
   'mimo-v2.5-free',
   // 2026-08-21 上线。实测是**坏的**:不管发什么都回一个没有 error 字段的
   // 「成功壳子」配一个怪状态码(基线 400、max_tokens=9e8 却是 429),

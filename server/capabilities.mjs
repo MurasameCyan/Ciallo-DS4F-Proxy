@@ -59,6 +59,24 @@ export const SEED = {
   'muse-spark-1.2-contributor-free': {
     ctx: null, method: 'unknown', ctxAt: 1787328070506, top: 'high', efforts: null,
   },
+  // 2026-08-29 实测(上游 2026-08-29 上线)。校验器把上限直接写在原文里:
+  //   This endpoint's maximum context length is 262144 tokens.
+  //   However, you requested about 1500001 tokens (1500000 of text input, 1 in the output).
+  // 注意这条原文是**先 limit 后 requested**,盲取最大值会读成 1500001 ——
+  // 那是发出去的量,不是上限。parseCtx 因此改成先认点名句式(见那边的注释)。
+  //
+  // 独立复核过 262144:261900/262200/300000 词全部 400 且都报同一个 limit;
+  // 二分出「最大能过」是 197568 词 → 上游计 197589 tokens。差额不是矛盾,是
+  // 上游按 1.25 倍折算(1500000 词 → 1500000 tokens),262144 ÷ 1.25 ≈ 197568。
+  //
+  // 严格型:非法档位报 400 并点名六档全认,所以 efforts 有值、顶档是 max
+  'ling-3.0-flash-fin-free': {
+    ctx: 262144,
+    method: 'validator',
+    maxOut: 262144,
+    top: 'max',
+    efforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  },
   // ↓ 2026-08-21 已从上游清单下线。记录留着:id 一样的话回来了直接复用
   'longcat-2.0-free': { ctx: 1048580, method: 'validator', top: 'high', efforts: null },
   'ling-3.0-flash-free': { ctx: 262144, method: 'validator', top: 'high', efforts: null },
@@ -123,19 +141,77 @@ export function parseMaxOut(msg) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+/** 采信一个上限数字的上界。防的是把时间戳之类的东西读成上限 */
+const CTX_SANE_MAX = 20_000_000;
+
+/**
+ * 点名上限的句式。命中这些就直接采信括号里那个数,不再看原文里其它数字。
+ *
+ * 顺序无所谓(都试一遍取第一个命中的),但**必须**盖住两种排列 —— 上游有的把
+ * limit 写在前、有的写在后,见 parseCtx 的注释。
+ */
+/**
+ * 限流话术。命中就整条原文都不采信 —— 配额消息同样带「limit + 大数字」,
+ * 但那是**每天多少 token**,不是一次能吃多长。读成上限会以 method=validator
+ * 落盘,而 run 只探没记录的,于是永不重探。
+ */
+/**
+ * 限流话术那一句。摘掉它再解析上下文上限 —— 它同样带「limit + 大数字」,但说的是
+ * **配额**(每天多少次请求),不是上下文容量。
+ *
+ * 摘一句而不是整条原文一律不认:后者会让「同时提到限流和真上限」的原文退回去夹,
+ * 白花几 MB 出站;只摘这一句,两种信息都不丢。`[^;.。]*` 到分句符就停,免得把
+ * 后半句真上限一起吃掉。
+ */
+const RATE_CLAUSE = /(?:rate[\s_-]?limit|too\s+many\s+requests|quota|配额|请求过于频繁)[^;.。]*/gi;
+
+const CTX_NAMED = [
+  // This endpoint's maximum context length is 262144 tokens
+  /max(?:imum)?\s+context\s+length\s+is\s+(\d+)/i,
+  // ... > limit 1048576  /  limit is 262144  /  limit: 262144
+  /\blimit\b\D{0,12}?(\d+)/i,
+  // Prompt exceeds max length 1048576
+  /max(?:imum)?\s+length\D{0,12}?(\d+)/i,
+  // 中文校验器:限制上下文长度[1,262144] —— 取区间上界
+  /(?:上下文|context)[^[\]]{0,12}\[\s*\d+\s*[,,]\s*(\d+)\s*\]/i,
+];
+
 /**
  * 从超限错误原文里读出上下文上限。
  *
- * 取原文里**最大的那个在合理区间内的整数**。区间下界 100_000 是刻意的:错误码
- * 本身就是个数字(`[1261] Prompt exceeds max length` 里那个 1261),不设下界会把
- * 错误码当成上下文上限。上界防的是把时间戳之类的东西读进来。
+ * 两条路,**先句式后取最值**:
  *
- * 读不到就返回 null,交给 probeContext 去夹 —— x-preview-f-free 就是这种,
+ * 1. 原文点名了上限(`maximum context length is N`、`> limit N`)就直接采信 N。
+ *    这条是后加的,因为盲取最大值在这种原文上会读错 —— ling-3.0-flash-fin-free
+ *    的实测原文是「limit 262144 ... you requested about 1500001」,最大的那个数
+ *    是**我发出去的量**。而错值会以 method=validator 落盘、且 run 只探没记录的,
+ *    于是永不重探:面板显示 [1M],真值 256K。
+ *
+ *    反方向的写法(`input 1300000 tokens > limit 1048576`)同样得读出 limit。
+ *    两种排列方向相反,所以单靠取最值必然错一边。
+ *
+ * 2. 没点名就退回**取最大的那个在合理区间内的整数**。下界 100_000 是刻意的:
+ *    错误码本身就是个数字(`[1261] Prompt exceeds max length` 里那个 1261),
+ *    不设下界会把错误码当成上下文上限。
+ *
+ *    句式那条路不套这个下界 —— 下界是给盲取防错误码用的,既然点了名就没有这个
+ *    歧义,沿用的话 64K 级模型永远读不出上限。
+ *
+ * 两条都读不到就返回 null,交给 probeContext 去夹 —— x-preview-f-free 就是这种,
  * 它的原文压根没写上限是多少。
+ *
+ * 限流话术先摘掉(见 RATE_CLAUSE):它同样带「limit + 大数字」,但那是**配额**不是
+ * 上下文容量。生产路径上 429 早被 informative() 挡掉了,这里再防一层是因为上游
+ * 偶尔把配额话术塞进 400 —— 那种一旦读成上限就会以 validator 落盘,永不重探。
  */
 export function parseCtx(msg) {
-  const nums = String(msg ?? '').match(/\d{6,}/g) || [];
-  const ok = nums.map(Number).filter((n) => n >= 100_000 && n <= 20_000_000);
+  const text = String(msg ?? '').replace(RATE_CLAUSE, ' ');
+  for (const re of CTX_NAMED) {
+    const n = Number(text.match(re)?.[1]);
+    if (Number.isInteger(n) && n > 0 && n <= CTX_SANE_MAX) return n;
+  }
+  const nums = text.match(/\d{6,}/g) || [];
+  const ok = nums.map(Number).filter((n) => n >= 100_000 && n <= CTX_SANE_MAX);
   return ok.length ? Math.max(...ok) : null;
 }
 
