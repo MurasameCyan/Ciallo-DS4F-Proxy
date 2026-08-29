@@ -13,6 +13,7 @@
 
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -725,6 +726,45 @@ await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 
   assert.notEqual(first['x-opencode-session'], other['x-opencode-session']);
   assert.equal(first['x-opencode-request'], 'req-a', 'request ID 仍是每个请求单独生成');
   assert.equal(grown['x-opencode-request'], 'req-b');
+});
+
+await t('身份头的值必须洗掉 CR/LF —— 否则一个畸形 body 字段能烧掉整轮重试', () => {
+  // 实测(2026-08-29):客户端在 body 里塞 conversation_id: "a\r\nX: y",这个值
+  // 会原样进 x-opencode-session。Node 构造请求时用 ERR_INVALID_CHAR 拒发,
+  // 而那个错的 status 是 0,被 classifyUpstreamError 判成 transport(可重试),
+  // 于是同一个必然失败的请求被重试 30 次、换掉 7 个节点、挂 21 秒才回 504。
+  //
+  // 头注入本身进不去(Node 挡住了),真正的伤害是**放大**:一个 JSON 字段换
+  // 30 次出站。所以要在源头洗值,而不是在重试循环里补救。
+  const dirty = [
+    ['conversation_id', 'a\r\nX-Injected: yes'],
+    ['conversation_id', 'a\nbare-lf'],
+    ['conversation_id', 'a\rbare-cr'],
+  ];
+  for (const [field, value] of dirty) {
+    const h = identityHeaders({ headers: {}, body: { [field]: value } }, () => 'u');
+    const got = h['x-opencode-session'];
+    assert.ok(!/[\r\n]/.test(got), `${field}=${JSON.stringify(value)} 的 CR/LF 必须被洗掉,得到 ${JSON.stringify(got)}`);
+  }
+  // metadata.session_id 是同一条路的另一个入口
+  const meta = identityHeaders({ headers: {}, body: { metadata: { session_id: 'm\r\nX: y' } } }, () => 'u');
+  assert.ok(!/[\r\n]/.test(meta['x-opencode-session']));
+
+  // 每一个头值都得干净,不只是 session —— x-title 之类同样来自客户端
+  const all = identityHeaders({
+    headers: { 'x-title': 't\r\nX: y', 'x-opencode-client': 'c\nlf' },
+    body: {},
+  }, () => 'u');
+  for (const [k, v] of Object.entries(all)) {
+    assert.ok(!/[\r\n]/.test(String(v)), `${k} 仍带 CR/LF: ${JSON.stringify(v)}`);
+  }
+
+  // 洗过之后必须仍是 Node 认的头值,否则只是把一种失败换成另一种
+  for (const [k, v] of Object.entries(all)) http.validateHeaderValue(k, String(v));
+
+  // 正常值一个字都不能动 —— 洗值不该改变已经好用的 session
+  const clean = identityHeaders({ headers: {}, body: { conversation_id: 'sess-normal-1' } }, () => 'u');
+  assert.equal(clean['x-opencode-session'], 'sess-normal-1');
 });
 
 await t('Chat、Responses、Anthropic 三个入口用同一套稳定 session', async () => {

@@ -309,6 +309,33 @@ const IDENTITY_DEFAULTS = {
   'x-opencode-project': 'default',
 };
 
+/**
+ * 把一个值洗成 Node 肯发的头值。
+ *
+ * 两类字符会让 http.request 在**构造阶段**就抛 ERR_INVALID_CHAR:
+ *
+ *   1. CR/LF —— 头注入的载体。Node 挡住了注入本身,但请求也发不出去。
+ *   2. 非 latin1(码点 > 255)—— 中文/emoji 的会话标题。这不是攻击,
+ *      是正常用户行为:`conversation_id: '会话-1'` 就够了。
+ *
+ * 而那个抛错的 status 是 0,classifyUpstreamError 判成 transport(可重试),
+ * 于是一个**必然失败**的请求被当成网络抖动反复重试:实测真 HTTP 上
+ * CRLF 换 30 次出站、中文换 9 次,最后 504,耗时 8-21 秒。
+ *
+ * 所以在源头洗,而不是在重试循环里补救 —— 重试循环没法区分「这次网络不好」
+ * 和「这个值永远发不出去」,而这里可以。
+ *
+ * 洗法:CR/LF/Tab 折成空格(保住词边界,不把两个词粘成一个),非 latin1 整段
+ * 剥掉;剥空了就返回空串,由调用方决定是补默认值还是不发这个头 —— 那比发一个
+ * 空头或一串问号都更诚实。
+ */
+function headerSafe(value) {
+  return String(value ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[^\x20-\xFF]/g, '')
+    .trim();
+}
+
 function contentSignal(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -360,10 +387,14 @@ function stableSessionId(signal) {
 export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   const h = {};
   for (const [k, v] of Object.entries(inbound?.headers || {})) h[k.toLowerCase()] = v;
+  // 洗在 pick 里而不是最后统一扫一遍:这样「洗完变空」自然走到 `|| dflt` 那条路,
+  // 不会发出一个空头值。见 headerSafe。
   const pick = (...names) => {
     for (const n of names) {
       const v = h[n];
-      if (typeof v === 'string' && v.trim()) return v.trim();
+      if (typeof v !== 'string' || !v.trim()) continue;
+      const safe = headerSafe(v);
+      if (safe) return safe;
     }
     return '';
   };
@@ -374,9 +405,12 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   }
   out['x-opencode-request'] = pick('x-opencode-request') || uuid();
   const body = inbound?.body;
+  // body 里的两个入口同样要洗 —— 它们不经入站头解析器,所以 CR/LF 和中文都能活着
+  // 走到这里(头那条路会先被 Node 的入站解析器 400 挡下)。洗完为空就当没给,
+  // 退回对话哈希/uuid,而不是拿个空串当 session。
   const explicitSession = pick('x-opencode-session', 'x-session-id', 'conversation-id', 'x-session-affinity')
-    || (typeof body?.conversation_id === 'string' ? body.conversation_id.trim() : '')
-    || (typeof body?.metadata?.session_id === 'string' ? body.metadata.session_id.trim() : '');
+    || (typeof body?.conversation_id === 'string' ? headerSafe(body.conversation_id) : '')
+    || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
   out['x-opencode-session'] = explicitSession || (seed ? stableSessionId(seed) : uuid());
   // 这两个没有合理的默认值,客户端没给就别凭空造
