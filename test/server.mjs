@@ -677,6 +677,15 @@ await t('身份头:兼容旧的 session-affinity 和通用 session-id', () => {
   assert.equal(b['x-session-id'], 'sid-1', 'x-session-id 本身也照原样透传');
 });
 
+await t('身份头:Claude Code 原生会话 ID 优先于通用会话头', () => {
+  const h = identityHeaders({ headers: {
+    'x-claude-code-session-id': 'claude-conversation-1',
+    'x-session-id': 'generic-session',
+    'conversation-id': 'generic-conversation',
+  } }, () => 'fallback');
+  assert.equal(h['x-opencode-session'], 'claude-conversation-1');
+});
+
 await t('身份头:显式 session 按头和 body 的优先级选,不被内容 hash 覆盖', () => {
   const body = {
     conversation_id: 'body-conv',
@@ -813,6 +822,37 @@ await t('完整身份头开关关闭时仍发送稳定 session 标识', async ()
   await g.handleChat(req, fakeRes(), OPENAI);
   assert.match(sent?.['x-opencode-session'] || '', /^ses_[0-9a-f]{24}$/);
   assert.equal(sent?.['x-opencode-client'], undefined, '完整身份头仍受开关控制');
+});
+
+await t('文本模型附件降级接入真实 Messages 请求流,未知模态仍透传图片', async () => {
+  const run = async (meta) => {
+    const g = new Gateway({ ...load(), opencodeIdentityHeaders: false }, () => {});
+    g.metadata = { get: () => meta };
+    g.getAllNodes = async () => ['A'];
+    g.rankNodes = (nodes) => nodes;
+    g.ensureNode = async () => 'A';
+    let sent = null;
+    g.attempt = async (_res, body) => { sent = body; };
+    const req = Readable.from([JSON.stringify({
+      model: FREE_MODELS[0],
+      max_tokens: 16,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } },
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'AQID' } },
+        { type: 'text', text: '解释附件' },
+      ] }],
+    })]);
+    req.headers = {};
+    await g.handleMessages(req, fakeRes());
+    return sent.messages[0].content;
+  };
+
+  assert.equal(await run({ inputModalities: ['text'] }), '[image attached]\n[document attached]\n解释附件');
+  assert.deepEqual(await run(null), [
+    { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+    { type: 'file', file: { file_data: 'data:application/pdf;base64,AQID' } },
+    { type: 'text', text: '解释附件' },
+  ]);
 });
 
 await t('身份头:不同请求的 request ID 不一样', () => {
@@ -2361,6 +2401,38 @@ await t('RESPONSES.toUpstream:字符串 input 补成上游要的数组,数组原
     '纯字符串上游会 400 Empty input messages,必须补成数组');
   const arr = [{ role: 'user', content: [{ type: 'input_text', text: 'a' }] }];
   assert.equal(RESPONSES.toUpstream({ model: 'm', input: arr }).input, arr, '数组不动它');
+});
+
+await t('Chat 和 Responses 仅为明确文本模型降级图片与文件', () => {
+  const textOnly = { inputModalities: ['text'] };
+  const unknown = null;
+  const chat = {
+    model: 'm',
+    messages: [{ role: 'user', content: [
+      { type: 'image_url', image_url: { url: 'https://example.com/a.png' } },
+      { type: 'file', file: { file_data: 'data:application/pdf;base64,AQID' } },
+    ] }],
+  };
+  assert.deepEqual(OPENAI.toUpstream(structuredClone(chat), textOnly).messages[0].content, [
+    { type: 'text', text: '[image attached]' },
+    { type: 'text', text: '[document attached]' },
+  ]);
+  assert.deepEqual(OPENAI.toUpstream(structuredClone(chat), unknown).messages[0].content, chat.messages[0].content,
+    '元数据未知时 fail-open,不能凭空假定模型不支持图片');
+
+  const responses = {
+    model: 'm',
+    input: [{ role: 'user', content: [
+      { type: 'input_image', image_url: 'https://example.com/a.png' },
+      { type: 'input_file', file_data: 'data:application/pdf;base64,AQID' },
+    ] }],
+  };
+  assert.deepEqual(RESPONSES.toUpstream(structuredClone(responses), textOnly).input[0].content, [
+    { type: 'input_text', text: '[image attached]' },
+    { type: 'input_text', text: '[document attached]' },
+  ]);
+  assert.deepEqual(RESPONSES.toUpstream(structuredClone(responses), unknown).input[0].content,
+    responses.input[0].content);
 });
 
 await t('RESPONSES.applyEffort:走嵌套 reasoning.effort,不碰顶层 reasoning_effort', () => {

@@ -408,7 +408,7 @@ export function identityHeaders(inbound, uuid = () => crypto.randomUUID()) {
   // body 里的两个入口同样要洗 —— 它们不经入站头解析器,所以 CR/LF 和中文都能活着
   // 走到这里(头那条路会先被 Node 的入站解析器 400 挡下)。洗完为空就当没给,
   // 退回对话哈希/uuid,而不是拿个空串当 session。
-  const explicitSession = pick('x-opencode-session', 'x-session-id', 'conversation-id', 'x-session-affinity')
+  const explicitSession = pick('x-opencode-session', 'x-claude-code-session-id', 'x-session-id', 'conversation-id', 'x-session-affinity')
     || (typeof body?.conversation_id === 'string' ? headerSafe(body.conversation_id) : '')
     || (typeof body?.metadata?.session_id === 'string' ? headerSafe(body.metadata.session_id) : '');
   const seed = conversationSeed(body);
@@ -808,9 +808,11 @@ export class Gateway {
     const bad = dialect.validate(inbound);
     if (bad) return dialect.fail(res, 400, bad, 'invalid_request_error');
 
-    // 流式意图在两种方言里都是顶层 stream:true,转换后依然如此
+    // 流式意图在三种方言里都是顶层 stream:true,转换后依然如此。只有 models.dev
+    // 明确报告纯文本时才让方言降级附件;元数据缺失时 fail-open,保持原请求。
     const wantStream = inbound.stream === true;
-    const body = dialect.toUpstream(inbound);
+    const requestedModel = typeof inbound.model === 'string' ? inbound.model.trim() : '';
+    const body = dialect.toUpstream(inbound, requestedModel ? this.modelMetadata(requestedModel) : null);
 
     // 严格透传:客户端点哪个模型就发哪个,但只放行实时免费清单里的。
     // 以前这里无条件改写成一个固定模型 —— 客户端于是拿到的是另一个模型的回答,

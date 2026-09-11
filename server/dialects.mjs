@@ -29,6 +29,37 @@ export const MODELS_PATH = '/zen/v1/models';
  */
 const SHOW_THINKING = process.env.SHOW_THINKING !== '0';
 
+/** 只有明确的纯文本模态才降级;元数据缺失或还含其它模态时保持原请求。 */
+const isTextOnly = (meta) => Array.isArray(meta?.inputModalities)
+  && meta.inputModalities.length > 0
+  && meta.inputModalities.every((m) => String(m).toLowerCase() === 'text');
+
+const attachmentKind = (part) => {
+  const type = String(part?.type || '').toLowerCase();
+  if (type === 'image' || type === 'image_url' || type === 'input_image') return 'image';
+  if (type === 'document' || type === 'file' || type === 'input_file') return 'document';
+  return '';
+};
+
+function downgradeOpenAIAttachments(body, meta, textType) {
+  if (!isTextOnly(meta)) return body;
+  const field = Array.isArray(body?.messages) ? 'messages' : (Array.isArray(body?.input) ? 'input' : '');
+  if (!field) return body;
+  return {
+    ...body,
+    [field]: body[field].map((message) => {
+      if (!Array.isArray(message?.content)) return message;
+      return {
+        ...message,
+        content: message.content.map((part) => {
+          const kind = attachmentKind(part);
+          return kind ? { type: textType, text: `[${kind} attached]` } : part;
+        }),
+      };
+    }),
+  };
+}
+
 /**
  * 方言。/v1/chat/completions、/v1/messages、/v1/responses 共用同一套节点轮换、
  * 冷却、重试,差别只有几件事:请求怎么进来、成功体怎么写回去、错误体和 SSE
@@ -40,7 +71,7 @@ export const OPENAI = {
   name: 'openai',
   path: CHAT_PATH,
   /** 客户端选哪个模型就用哪个 —— handleChat 已经拿实时免费清单挡过一道了 */
-  toUpstream: (body) => body,
+  toUpstream: (body, meta) => downgradeOpenAIAttachments(body, meta, 'text'),
   validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages required'),
   fail: (res, status, message, type, extra) => json(res, { error: { message, type, ...extra } }, status),
   // 顶层 reasoning_effort:有值覆盖,空值删掉(收敛客户端的乱值和会被丢的顶档别名)
@@ -53,7 +84,7 @@ export const ANTHROPIC = {
   name: 'anthropic',
   path: CHAT_PATH,
   // anthropicToOpenAI 已经把 req.model 抄进去了,这里不再覆盖
-  toUpstream: (body) => anthropicToOpenAI(body),
+  toUpstream: (body, meta) => anthropicToOpenAI(body, { textOnly: isTextOnly(meta) }),
   validate: (b) => (Array.isArray(b.messages) && b.messages.length ? null : 'messages: at least one message required'),
   // Anthropic 的错误体没有放附加字段的地方,所以把冷却剩余秒数并进 message,
   // 而不是塞个上游 SDK 会忽略掉的字段 —— 信息宁可在文字里也别丢。
@@ -80,10 +111,13 @@ export const RESPONSES = {
   name: 'responses',
   path: RESPONSES_PATH,
   // OpenAI SDK 允许 input 是字符串,但上游只认数组(纯字符串 → 400 Empty input
-  // messages),所以补成数组;已经是数组的原样透传。
-  toUpstream: (body) => (typeof body.input === 'string'
-    ? { ...body, input: [{ role: 'user', content: [{ type: 'input_text', text: body.input }] }] }
-    : body),
+  // messages),所以先补成数组;明确的纯文本模型再把附件换成 input_text 占位。
+  toUpstream: (body, meta) => {
+    const normalized = typeof body.input === 'string'
+      ? { ...body, input: [{ role: 'user', content: [{ type: 'input_text', text: body.input }] }] }
+      : body;
+    return downgradeOpenAIAttachments(normalized, meta, 'input_text');
+  },
   validate: (b) => ((Array.isArray(b.input) && b.input.length) || (typeof b.input === 'string' && b.input.trim())
     ? null : 'input required'),
   // Responses 的错误体和 OpenAI 同形 {error:{message,type}},复用即可

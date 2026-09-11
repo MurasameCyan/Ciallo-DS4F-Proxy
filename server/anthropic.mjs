@@ -202,6 +202,39 @@ function imageToOpenAI(block) {
   return null;
 }
 
+/** Anthropic base64 document 转 OpenAI Chat 的 file content part。 */
+function documentToOpenAI(block) {
+  const source = block?.source;
+  if (!source || typeof source !== 'object' || source.type !== 'base64') return null;
+  const mediaType = typeof source.media_type === 'string' ? source.media_type.trim() : '';
+  const data = typeof source.data === 'string' ? source.data : '';
+  if (!mediaType || !data) return null;
+  const filename = typeof block.title === 'string' && block.title.trim() ? block.title.trim() : '';
+  return {
+    type: 'file',
+    file: {
+      file_data: `data:${mediaType};base64,${data}`,
+      ...(filename ? { filename } : {}),
+    },
+  };
+}
+
+function toolResultText(content, textOnly) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return flattenText(content);
+  const parts = [];
+  for (const block of content) {
+    if ((block?.type === 'text' || block?.type === 'input_text') && typeof block.text === 'string') {
+      parts.push(block.text);
+    } else if (textOnly && block?.type === 'image') {
+      parts.push('[image attached]');
+    } else if (textOnly && block?.type === 'document') {
+      parts.push('[document attached]');
+    }
+  }
+  return parts.join('\n');
+}
+
 /**
  * 请求:Anthropic → OpenAI。
  *
@@ -209,8 +242,11 @@ function imageToOpenAI(block) {
  *   system   顶层独立字段  → messages 里 role:'system' 的第一条
  *   tool_use assistant 的内容块 → assistant.tool_calls[](arguments 是字符串!)
  *   tool_result user 的内容块  → 独立的 role:'tool' 消息,一个 result 一条
+ *
+ * textOnly 只在 models.dev 明确说模型仅接收 text 时启用。图片/文档换成可见
+ * 占位而不是静默丢掉,让模型知道用户附了它读不了的内容。
  */
-export function anthropicToOpenAI(req) {
+export function anthropicToOpenAI(req, { textOnly = false } = {}) {
   const msgs = [];
 
   const sys = flattenText(req.system);
@@ -228,7 +264,7 @@ export function anthropicToOpenAI(req) {
 
     const texts = [];
     const contentParts = [];
-    let hasImage = false;
+    let hasAttachment = false;
     const reasoning = [];
     const toolCalls = [];
     const toolResults = [];
@@ -244,10 +280,29 @@ export function anthropicToOpenAI(req) {
         case 'image': {
           // Anthropic 只允许 user 消息携图;助手历史中的异常块丢掉,避免 OpenAI assistant validator 400。
           if (role !== 'user') break;
+          if (textOnly) {
+            texts.push('[image attached]');
+            contentParts.push({ type: 'text', text: '[image attached]' });
+            break;
+          }
           const image = imageToOpenAI(b);
           if (image) {
             contentParts.push(image);
-            hasImage = true;
+            hasAttachment = true;
+          }
+          break;
+        }
+        case 'document': {
+          if (role !== 'user') break;
+          if (textOnly) {
+            texts.push('[document attached]');
+            contentParts.push({ type: 'text', text: '[document attached]' });
+            break;
+          }
+          const document = documentToOpenAI(b);
+          if (document) {
+            contentParts.push(document);
+            hasAttachment = true;
           }
           break;
         }
@@ -271,15 +326,15 @@ export function anthropicToOpenAI(req) {
           toolResults.push({
             role: 'tool',
             tool_call_id: String(b.tool_use_id ?? ''),
-            content: typeof b.content === 'string' ? b.content : flattenText(b.content),
+            content: toolResultText(b.content, textOnly),
           });
           break;
-        // document 之类上游不吃,丢掉,别让请求整体失败
+        // 其它上游不吃的块丢掉,别让请求整体失败
       }
     }
 
-    // 纯文本保持旧的字符串形状;只有真正出现图片时才换成 content parts。
-    const content = hasImage ? contentParts : texts.join('\n');
+    // 纯文本保持旧的字符串形状;只有真正出现附件时才换成 content parts。
+    const content = hasAttachment ? contentParts : texts.join('\n');
 
     if (toolResults.length) {
       msgs.push(...toolResults);

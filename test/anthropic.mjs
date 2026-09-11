@@ -167,6 +167,50 @@ t('assistant 历史里的非法 image 仍跳过,不生成上游不接受的 assi
   assert.deepEqual(r.messages[0], { role: 'assistant', content: '看到了' });
 });
 
+t('文本模型把 Anthropic 图片和文档按原顺序降级成可见占位', () => {
+  const r = anthropicToOpenAI({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: '前' },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } },
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'AQID' } },
+        { type: 'text', text: '后' },
+      ],
+    }],
+  }, { textOnly: true });
+  assert.equal(r.messages[0].content, '前\n[image attached]\n[document attached]\n后');
+});
+
+t('非文本模型把 Anthropic 文档翻成 OpenAI file part,不静默丢附件', () => {
+  const r = anthropicToOpenAI({
+    messages: [{ role: 'user', content: [
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'AQID' }, title: 'spec.pdf' },
+      { type: 'text', text: '总结文档' },
+    ] }],
+  });
+  assert.deepEqual(r.messages[0].content, [
+    { type: 'file', file: { file_data: 'data:application/pdf;base64,AQID', filename: 'spec.pdf' } },
+    { type: 'text', text: '总结文档' },
+  ]);
+});
+
+t('文本模型保留 tool_result 内嵌附件的位置和可见占位', () => {
+  const r = anthropicToOpenAI({
+    messages: [{ role: 'user', content: [{
+      type: 'tool_result',
+      tool_use_id: 'tool-1',
+      content: [
+        { type: 'text', text: '前' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'BAUG' } },
+        { type: 'text', text: '后' },
+      ],
+    }] }],
+  }, { textOnly: true });
+  assert.equal(r.messages[0].content, '前\n[image attached]\n[document attached]\n后');
+});
+
 t('采样参数按名字搬过去,top_k 刻意丢掉', () => {
   const r = anthropicToOpenAI({
     messages: [{ role: 'user', content: 'x' }],
