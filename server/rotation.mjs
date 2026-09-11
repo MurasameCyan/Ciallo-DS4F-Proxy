@@ -162,13 +162,27 @@ export class NodeCooldown {
   // 不过下面一律不切 key —— egress/group 存在 value 里。
   #key(node, group = 'default') { return `${this.egress(node)}\u0000${group}`; }
 
+  /**
+   * 防降级:并发请求会交错落标记,一个拿到 Retry-After: 3600 的 429、另一个拿到
+   * 不带 Retry-After 的裸 429(两种响应实测都存在)。后者的 60s 兜底不能把前者
+   * 的 1h 缩短,否则被日额度限流的出口 60s 后就重新排进候选继续被撞。
+   * mark5xx 早就这么做了,这里补齐另外两个写入口。
+   */
+  #setCooldown(key, entry) {
+    const existing = this.cooldowns.get(key);
+    const now = Date.now();
+    // 已过期的旧条目不算数;仍在生效且更久的保留
+    if (existing && existing.until > now && existing.until >= entry.until) return;
+    this.cooldowns.set(key, entry);
+  }
+
   mark429(node, group = 'default', retryAfterSec = null) {
     const ms = retryAfterSec != null && retryAfterSec > 0
       ? Math.min(retryAfterSec * 1000, 24 * 3600 * 1000)  // 上限一天,防止解析错误
       : COOLDOWN_MS;
     const egress = this.egress(node);
     const key = this.#key(node, group);
-    this.cooldowns.set(key, { until: Date.now() + ms, retryAfter: retryAfterSec, egress, group });
+    this.#setCooldown(key, { until: Date.now() + ms, retryAfter: retryAfterSec, egress, group });
     this.lastMarked.set(key, Date.now());
   }
 
@@ -177,11 +191,12 @@ export class NodeCooldown {
    * summary 里标 reason 让面板能区分「被限流」和「被机场封了」。
    */
   markBlocked(node, group = 'default') {
-    this.cooldowns.set(this.#key(node, group), {
+    const key = this.#key(node, group);
+    this.#setCooldown(key, {
       until: Date.now() + BLOCKED_COOLDOWN_MS, retryAfter: null, blocked: true,
       egress: this.egress(node), group,
     });
-    this.lastMarked.set(this.#key(node, group), Date.now());
+    this.lastMarked.set(key, Date.now());
   }
 
   /**

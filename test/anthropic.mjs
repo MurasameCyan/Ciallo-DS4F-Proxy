@@ -402,6 +402,78 @@ t('半个 JSON 跨 chunk 到达时不丢内容', () => {
   assert.equal(text, 'xyz', '缓冲区必须留住半行等下一块');
 });
 
+t('多字节字符被 chunk 边界切开时不产生替换字符', () => {
+  // 上游是 TCP 流,分片位置和字符边界无关。中文 3 字节、emoji 4 字节,
+  // 每块各自 toString() 会把被切开的那个字符变成 U+FFFD,而且不可恢复 ——
+  // 用户看到的就是正文里随机冒出的「�」。
+  const { st, events } = collect();
+  const raw = Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: '中文测试🎉' } }] })}\n\n`, 'utf8');
+  // 切在第一个「中」字的三个字节中间(前缀 "data: {...content":"" 是纯 ASCII)
+  const cut = raw.indexOf(Buffer.from('中', 'utf8')) + 1;
+  st.feed(raw.subarray(0, cut));
+  st.feed(raw.subarray(cut));
+  st.end();
+  const text = events.filter((e) => e.data.delta?.type === 'text_delta').map((e) => e.data.delta.text).join('');
+  assert.equal(text, '中文测试🎉');
+  assert.ok(!text.includes('\uFFFD'), '替换字符是不可恢复的数据损坏,不能出现');
+});
+
+/**
+ * 块不变量:Anthropic 的状态机不允许两个块同时开着,也不允许给一个已经关掉
+ * (或还没开)的 index 发 delta。SDK 收到会直接抛,客户端表现为对话中途断开。
+ * 返回违规说明,没有违规返回 null。
+ */
+const blockViolation = (events) => {
+  const open = new Set();
+  for (const { event, data } of events) {
+    const i = data.index;
+    if (event === 'content_block_start') {
+      if (open.size) return `start ${i} 时块 ${[...open]} 还开着`;
+      open.add(i);
+    } else if (event === 'content_block_delta') {
+      if (!open.has(i)) return `delta 落在没开着的块 ${i} 上`;
+    } else if (event === 'content_block_stop') {
+      if (!open.delete(i)) return `stop 了没开着的块 ${i}`;
+    }
+  }
+  return open.size ? `收尾时块 ${[...open]} 还开着` : null;
+};
+
+t('正文之后又来推理时块不重叠(混合输出模型的真实序列)', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { content: '先说一句' } }] });
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '再想想' } }] });
+  feedJSON(st, { choices: [{ delta: { content: '接着说' } }] });
+  st.end();
+  assert.equal(blockViolation(events), null);
+});
+
+t('先调工具再解释时块不重叠', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { tool_calls: [{ index: 0, id: 't', function: { name: 'f', arguments: '{}' } }] } }] });
+  feedJSON(st, { choices: [{ delta: { content: '我查了一下' } }] });
+  st.end();
+  assert.equal(blockViolation(events), null);
+});
+
+t('工具与正文交错时块不重叠', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { tool_calls: [{ index: 0, id: 'a', function: { name: 'f1', arguments: '{}' } }] } }] });
+  feedJSON(st, { choices: [{ delta: { content: '中间插一句' } }] });
+  feedJSON(st, { choices: [{ delta: { tool_calls: [{ index: 1, id: 'b', function: { name: 'f2', arguments: '{}' } }] } }] });
+  st.end();
+  assert.equal(blockViolation(events), null);
+});
+
+t('理想顺序(推理→正文→工具)同样满足块不变量', () => {
+  const { st, events } = collect();
+  feedJSON(st, { choices: [{ delta: { reasoning_content: '想' } }] });
+  feedJSON(st, { choices: [{ delta: { content: '答' } }] });
+  feedJSON(st, { choices: [{ delta: { tool_calls: [{ index: 0, id: 't', function: { name: 'f', arguments: '{}' } }] } }] });
+  st.end();
+  assert.equal(blockViolation(events), null);
+});
+
 t('工具流:参数分片按 input_json_delta 累积,拼起来是完整 JSON', () => {
   const { st, events, names } = collect();
   feedJSON(st, { choices: [{ delta: { tool_calls: [{ index: 0, id: 't1', function: { name: 'read', arguments: '{"pa' } }] } }] });

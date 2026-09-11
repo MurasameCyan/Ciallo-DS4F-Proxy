@@ -158,6 +158,9 @@ function rawSink(res) {
 function responsesSink(res) {
   const safe = (fn) => { try { fn(); } catch {} };
   let buf = '';
+  // 有状态解码:chunk 边界会切在多字节字符中间(中文 3 字节),每块各自
+  // toString() 会把被切开的字符换成 U+FFFD,而且不可恢复。
+  const decoder = new TextDecoder('utf-8');
   // 按行判断:只有确认是 chat.completion.chunk 的 data 行才丢,其余(response.*
   // 事件、空行、[DONE]、解析不了的行)一律原样转发,保住 SSE 分帧。
   const forwardLine = (line) => {
@@ -174,7 +177,10 @@ function responsesSink(res) {
   };
   return {
     write: (chunk) => {
-      buf += chunk.toString();
+      buf += decoder.decode(
+        Buffer.isBuffer(chunk) || chunk instanceof Uint8Array ? chunk : Buffer.from(String(chunk)),
+        { stream: true },
+      );
       const lines = buf.split('\n');
       buf = lines.pop();          // 末行可能被截断,留着等下一个 chunk
       for (const line of lines) forwardLine(line);

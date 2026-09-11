@@ -25,15 +25,18 @@ delete process.env.SUBSCRIPTION_URL;
 delete process.env.API_KEY;
 
 // 假 mihomo 控制端口:报一个节点,PUT 一律成功。
-// 端口写死成 config.mjs 里的 CTRL_PORT,gateway 才连得上。
-const { CTRL_PORT } = await import('../server/config.mjs');
+//
+// 端口取 0 让内核分配,再把 gateway 的 mihomoApi 指过来 —— 原来这里写死
+// config.mjs 的 CTRL_PORT(19090),容器里真内核正占着那个端口,套件一启动就
+// EADDRINUSE 挂掉。测试不该跟宿主抢固定端口。
 const ctrl = http.createServer((req, res) => {
   res.setHeader('content-type', 'application/json');
   if (req.method === 'PUT') return void res.end('{}');
   if (req.url.startsWith('/proxies/')) return void res.end(JSON.stringify({ all: ['N1'], now: 'N1' }));
   res.end('{}');
 });
-await new Promise((r) => ctrl.listen(CTRL_PORT, '127.0.0.1', r));
+await new Promise((r) => ctrl.listen(0, '127.0.0.1', r));
+const CTRL_PORT = ctrl.address().port;
 
 const { Gateway, FREE_MODELS } = await import('../server/gateway.mjs');
 // 每个请求都得带一个真在免费清单里的模型 —— 网关现在严格校验,
@@ -45,6 +48,9 @@ const cfgMod = await import('../server/config.mjs');
 const cfg = cfgMod.load();
 cfg.apiKey = 'k';
 const gw = new Gateway(cfg, () => {});
+// 主 lane 的控制端口原本硬编码成 CTRL_PORT。改走假服务实际监听的那个端口,
+// 真实的 _mihomoApi 仍然被执行(还是走一次真 HTTP),只是不再抢固定端口。
+gw.mihomoApi = (p, method = 'GET', body = null) => gw._mihomoApi(CTRL_PORT, p, method, body);
 
 /** 假上游:一段带 usage 的流,和一个普通回复 */
 const STREAM_CHUNKS = [

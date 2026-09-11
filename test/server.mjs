@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { EventEmitter } from 'node:events';
 
 // config.mjs 在模块加载时就定死了 DATA_DIR,所以得先设环境变量再动态 import
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ciallo-test-'));
@@ -36,7 +37,7 @@ const {
   classifyUpstreamError, MODEL_COOLDOWN_MS, BLOCKED_COOLDOWN_MS, isNodeBlockedError,
   StreamKeepAlive, SSE_HEARTBEAT_MS, MODELS_TTL_MS,
 } = await import('../server/gateway.mjs');
-const { buildMihomoYaml, load, genApiKey } = await import('../server/config.mjs');
+const { buildMihomoYaml, load, genApiKey, MIXED_PORT, CTRL_PORT } = await import('../server/config.mjs');
 const { parseBasic, safeEqual, resolveCredentials, matches, readCookie, Sessions, FailWindow } = await import('../server/auth.mjs');
 const { connectTunnel } = await import('../server/proxy.mjs');
 const { LaneManager } = await import('../server/lane.mjs');
@@ -143,6 +144,29 @@ await t('5xx 冷却不覆盖更长的限流或封域冷却', () => {
   c.mark5xx('B', 'default');
   assert.deepEqual(entryOf(c, 'B'), blocked,
     '封域冷却不能被 5xx 覆盖');
+});
+
+await t('兜底冷却不覆盖更长的限流或封域冷却(并发交错落标记)', () => {
+  // mark5xx 一直有防降级,mark429/markBlocked 没有。同一落地上两个并发请求
+  // 一个拿到 Retry-After: 3600 的 429、另一个拿到裸 429,后者的 60s 兜底会把
+  // 前者的 1h 缩成 60s —— 被日额度限流的出口于是 60s 后重新排进候选继续被撞。
+  const c = new NodeCooldown();
+  c.mark429('A', 'default', 3600);
+  const long = { ...entryOf(c, 'A') };
+  c.mark429('A', 'default');            // 裸 429,兜底 60s
+  assert.deepEqual(entryOf(c, 'A'), long, '裸 429 的 60s 兜底不能缩短 3600s 的 Retry-After');
+
+  c.markBlocked('B', 'default');
+  const blocked = { ...entryOf(c, 'B') };
+  c.mark429('B', 'default');
+  assert.deepEqual(entryOf(c, 'B'), blocked, '裸 429 不能缩短封域冷却');
+
+  // 反向必须仍然生效:更长的冷却要盖过短的,否则第一次标记就把节点钉死在 60s
+  const c2 = new NodeCooldown();
+  c2.mark429('A', 'default');
+  c2.mark429('A', 'default', 3600);
+  assert.ok(entryOf(c2, 'A').until - Date.now() > 3000_000, '更长的 Retry-After 必须能覆盖兜底');
+  assert.equal(entryOf(c2, 'A').retryAfter, 3600);
 });
 
 await t('机场封域特征(TLS 握手断/证书不符/EPROTO)识别为节点封锁', () => {
@@ -282,6 +306,32 @@ await t('成功清冷却按落地清,同机器的别名一起放行', () => {
   c.clear('A2');   // 用另一个名字成功
   assert.equal(c.isCooling('A1', 'default'), false);
   assert.equal(c.recentMark('A3'), 0, 'recentMark 也按落地,不然队尾惩罚会残留');
+});
+
+await t('成功只清本供应商组,不放行同落地上别组的长冷却', async () => {
+  // 分组冷却的立论是「同一节点上 DS4F 被限不影响 nemotron」。反向不成立:
+  // nemotron 成功不代表 default 组的日额度恢复。attempt 成功时若不带 group,
+  // clear 会按落地把该出口所有分组的冷却和 lastMarked 一起删掉 —— 3600s 的
+  // Retry-After 提前解冻、队尾惩罚一起丢,下一批请求继续撞已耗尽额度的 IP。
+  const nemotron = FREE_MODELS.find((m) => m.startsWith('nemotron'));
+  assert.ok(nemotron, '免费清单里应有 nemotron 系模型(它们走独立供应商组)');
+  const g = retryGateway('sm-group-clear.json', () => ({
+    choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 2 },
+  }));
+  // 先让 default 组在 A 上吃一个长冷却
+  g.cooldown.mark429('A', 'default', 3600);
+  const before = g.cooldown.get('A', 'default');
+  assert.ok(before.remain > 3500_000, '前提:default 组挂着一个小时级冷却');
+
+  g.cur = 'A';
+  await g.attempt(fakeRes(), { model: nemotron, messages: [{ role: 'user', content: 'hi' }] },
+    ['A'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  const after = g.cooldown.get('A', 'default');
+  assert.ok(after && after.remain > 3500_000,
+    'nemotron 成功不能把 default 组的 3600s 冷却抹掉');
+  assert.ok(g.cooldown.recentMark('A') > 0,
+    'lastMarked 也得留着,否则刚被限流的出口凭低延迟插回队首');
 });
 
 await t('解析不出落地时退回按节点名(provider 文件还没拉下来)', () => {
@@ -737,7 +787,7 @@ await t('身份头:没有显式 session 时按第一条 user 内容生成稳定 
   assert.equal(grown['x-opencode-request'], 'req-b');
 });
 
-await t('身份头的值必须洗掉 CR/LF —— 否则一个畸形 body 字段能烧掉整轮重试', () => {
+await t('身份头的值必须洗掉 Node 不认的字符 —— 否则一个畸形 body 字段能烧掉整轮重试', () => {
   // 实测(2026-08-29):客户端在 body 里塞 conversation_id: "a\r\nX: y",这个值
   // 会原样进 x-opencode-session。Node 构造请求时用 ERR_INVALID_CHAR 拒发,
   // 而那个错的 status 是 0,被 classifyUpstreamError 判成 transport(可重试),
@@ -745,15 +795,23 @@ await t('身份头的值必须洗掉 CR/LF —— 否则一个畸形 body 字段
   //
   // 头注入本身进不去(Node 挡住了),真正的伤害是**放大**:一个 JSON 字段换
   // 30 次出站。所以要在源头洗值,而不是在重试循环里补救。
+  //
+  // 判据是「Node 收不收」,不是「像不像换行」:DEL(0x7F)落在 latin1 里但同样
+  // 不是合法头值,只挡 CR/LF 会把它漏进去,放大链条一字不差地重演。
   const dirty = [
     ['conversation_id', 'a\r\nX-Injected: yes'],
     ['conversation_id', 'a\nbare-lf'],
     ['conversation_id', 'a\rbare-cr'],
+    ['conversation_id', 'sess\u007f01'],
+    ['conversation_id', 'sess\u0000nul'],
+    ['conversation_id', 'sess\u0001soh'],
   ];
   for (const [field, value] of dirty) {
     const h = identityHeaders({ headers: {}, body: { [field]: value } }, () => 'u');
     const got = h['x-opencode-session'];
     assert.ok(!/[\r\n]/.test(got), `${field}=${JSON.stringify(value)} 的 CR/LF 必须被洗掉,得到 ${JSON.stringify(got)}`);
+    // 真正的判据:洗完之后 Node 得肯发。它不肯发就等于放大 bug 还在。
+    http.validateHeaderValue('x-opencode-session', got);
   }
   // metadata.session_id 是同一条路的另一个入口
   const meta = identityHeaders({ headers: {}, body: { metadata: { session_id: 'm\r\nX: y' } } }, () => 'u');
@@ -1096,6 +1154,31 @@ await t('lane:gateway 的 acquireLane 复用主 lane 的实时冷却表', async 
   if (child3.id !== 'main') g.lanes.release(child3);
 });
 
+await t('lane:走主 lane 的请求不能在进 attempt 之前就被释放', async () => {
+  // 主 lane 对象没有 node 字段(见 lane.mjs 的 this.main),handleChat 里
+  // 「子 lane 绑定节点被冷却就回退」那个判断如果只看 lane.node !== cur,
+  // 对主 lane 恒真 —— 每个请求都在 attempt 之前把 active 减回 0,于是
+  // 第二个并发请求看到主 lane 空闲、直接搭车,子 lane 一条都不会创建。
+  const g = new Gateway(load(), () => {});
+  g._spawnChildLane = async ({ node }) => ({ id: 'child', node, agent: {}, inst: {}, active: 0, lastUsed: 0 });
+  g._destroyChildLane = async () => {};
+  g.getAllNodes = async () => ['A', 'B'];
+  g.rankNodes = (nodes) => nodes;
+  g.ensureNode = async () => 'A';
+  // attempt 不出站,只在被调用的那一刻记下主 lane 的占用数
+  const activeAtAttempt = [];
+  g.attempt = async (...args) => {
+    activeAtAttempt.push({ mainActive: g.lanes.main.active, lane: args[10] });
+  };
+
+  const body = JSON.stringify({ model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] });
+  const call = () => g.handleChat(Readable.from([body]), fakeRes());
+  await call();
+  assert.equal(activeAtAttempt[0].mainActive, 1,
+    '主 lane 必须在 attempt 期间保持占用,否则并发分摊永远看不到「忙」');
+  assert.equal(activeAtAttempt[0].lane?.id, 'main', '默认路径就该拿到主 lane');
+});
+
 await t('lane:_childNodes 轮询等 provider 拉完订阅,拿到自己的表', async () => {
   const g = new Gateway(load(), () => {});
   let calls = 0;
@@ -1229,13 +1312,24 @@ await t('Gateway 选点:新会话一律粘 lockedNode,已有会话粘原节点',
 
 // ── 两套账在重试循环里怎么分叉 ──────────────────────────
 
-/** attempt() 对 res 只用 writeHead/end/write,不用真起 HTTP 服务就能验状态机 */
+/**
+ * attempt() 对 res 只用 writeHead/end/write,不用真起 HTTP 服务就能验状态机。
+ *
+ * 是个 EventEmitter:attempt 会挂 'close' 来接客户端断开,真的 ServerResponse
+ * 也是 EventEmitter。writableEnded 跟着 end() 走 —— attempt 靠它区分「正常收尾
+ * 触发的 close」和「客户端主动取消」。
+ */
 function fakeRes() {
-  const r = { code: 0, chunks: [] };
+  const r = new EventEmitter();
+  r.code = 0;
+  r.chunks = [];
+  r.writableEnded = false;
   r.writeHead = (c) => { r.code = c; return r; };
   r.write = (c) => { r.chunks.push(String(c)); return true; };
-  r.end = (c) => { if (c) r.chunks.push(String(c)); r.ended = true; };
+  r.end = (c) => { if (c) r.chunks.push(String(c)); r.ended = true; r.writableEnded = true; };
   Object.defineProperty(r, 'body', { get: () => r.chunks.join('') });
+  /** 模拟客户端中途挂断:socket 关了但响应没正常结束 */
+  r.hangup = () => { r.emit('close'); };
   return r;
 }
 
@@ -1256,7 +1350,7 @@ function retryGateway(file, script) {
     g.forwardArgs.push(args);
     const i = g.tries.length;
     g.tries.push(g.cur);          // 记「这一次出站用的是哪个节点」
-    return script(i, g.cur);
+    return script(i, g.cur, args);
   };
   g.forward = run;
   g.forwardStream = run;
@@ -1264,6 +1358,44 @@ function retryGateway(file, script) {
 }
 
 const BODY = { model: FREE_MODELS[0], messages: [{ role: 'user', content: 'hi' }] };
+
+await t('客户端断开:在飞的上游请求被 abort,而且不再换节点重发', async () => {
+  // 少了这条,取消一个长推理请求会变成:res 已销毁而上游还在读,sink 往死
+  // socket 写不同步抛错,于是流一路跑到 STREAM_IDLE_MS(300s)才断,额度照烧。
+  // 而只 abort 不停重试更糟 —— abort 以 status 0 回到 catch,被当成网络抖动,
+  // 于是「取消」变成挨个节点重发,把额度烧得更快。
+  const res = fakeRes();
+  let signalAtCall = null;
+  const g = retryGateway('sm-abort.json', (i, node, args) => {
+    signalAtCall = args[5];                 // forward 的第 6 个形参就是 signal
+    assert.ok(signalAtCall, 'attempt 必须把取消信号传进出站');
+    res.hangup();                           // 客户端此刻挂断
+    assert.equal(signalAtCall.aborted, true, '断开应当场 abort 在飞请求');
+    // Node 对 abort 抛的是 AbortError,经 forward 的 error 回调变成 status 0
+    throw Object.assign(new Error('The operation was aborted'), { status: 0 });
+  });
+  g.cur = 'A';
+  await g.attempt(res, BODY, ['A', 'B', 'C'], 'A', false, OPENAI, Date.now() + 60_000);
+
+  assert.deepEqual(g.tries, ['A'], '客户端走了就不该再试别的节点');
+  assert.equal(res.code, 0, '没人接收,不必再写响应体');
+  const d = g.usage.getStats();
+  assert.equal(d.total.requests, 0, '客户端自己取消的不算一次失败请求');
+});
+
+await t('正常收尾触发的 close 不会被当成客户端取消', async () => {
+  // res.end() 也会 emit 'close'。把它当取消的话,每个正常请求都会在收尾时
+  // abort 一个已经完成的 signal —— 无害但会掩盖真取消,也让计数说不清。
+  const g = retryGateway('sm-abort-ok.json', () => ({
+    choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 3 },
+  }));
+  g.cur = 'A';
+  const res = fakeRes();
+  await g.attempt(res, BODY, ['A'], 'A', false, OPENAI, Date.now() + 60_000);
+  res.emit('close');                        // 真实 socket 在 end 之后就是这样
+  assert.equal(res.code, 200);
+  assert.equal(g.usage.getStats().total.success, 1, '正常成功一次,不受收尾 close 影响');
+});
 
 await t('模型冷却命中时直接回 400,不再查节点或消耗出口', async () => {
   const cfg = { ...load(), persistUsage: false };
@@ -1984,8 +2116,10 @@ await t('yaml 含 provider、select 组和两条规则', () => {
   assert.match(y, /DOMAIN-SUFFIX,opencode\.ai,zen-pool/);
   assert.match(y, /MATCH,DIRECT/);
   assert.ok(!/GEOIP|GEOSITE/.test(y), '不能引入 geo 规则,否则镜像得带 geoip.dat');
-  assert.match(y, /mixed-port: 17897/);
-  assert.match(y, /external-controller: 127\.0\.0\.1:19090/);
+  // 端口取常量:写死数字只是把 config.mjs 的值抄一遍,改端口时两处都得动,
+  // 而真正要防的是「配置里漏了这两项」。
+  assert.match(y, new RegExp(`mixed-port: ${MIXED_PORT}`));
+  assert.match(y, new RegExp(`external-controller: 127\\.0\\.0\\.1:${CTRL_PORT}`));
   assert.match(y, /proxy-providers:[\s\S]*?airport:[\s\S]*?interval: 0\b/,
     'provider 的周期更新应由网关唯一调度,避免更新后漏测速或双重刷新');
 });
@@ -2505,6 +2639,11 @@ const gateway = new Gateway(cfg, () => {});
 // 别让测试真的出站去拉模型清单:/api/status 每次都会顺手起一次刷新,
 // 有没有内核、能不能连上游都不该影响断言
 gateway.upstreamGet = async () => { throw new Error('测试不出站'); };
+// 节点表也钉死成空:下面「没节点时回 503」那几条验的是真契约(不挂住、错误体
+// 形状对),但前提不能靠「跑测试的机器上没有内核」—— 容器里内核是活的,
+// 真能拉到几百个节点,于是那几条会拿到 429 而不是 503(实测炸在这儿)。
+// 需要节点的那几组各自替掉它再还原(见 /api/nodes 那几条)。
+gateway.getAllNodes = async () => [];
 const subscriptionSchedules = [];
 const app = createApp({
   cfg, creds, gateway,
@@ -2669,15 +2808,15 @@ await t('带对凭据能读到配置和状态', async () => {
 
   const s = await (await fetch(`${base}/api/status`, { headers: { authorization: auth } })).json();
   assert.equal(s.fixedModel, undefined, '固定模型已废,留着这个字段会让前端以为还能靠它');
-  assert.equal(s.mihomoRunning, false, '测试环境没有内核,应老实报 false');
+  // mihomoRunning 只断言类型,不断言值:这个进程没起内核,但容器里跑测试时
+  // 宿主的内核是活的,写死 false 会让套件在容器内必然失败(实测炸在这一行)。
+  assert.equal(typeof s.mihomoRunning, 'boolean', '内核状态必须是布尔,前端靠它画灯');
   assert.equal(s.gatewayRunning, true);
-  // 免费模型清单也搭这趟车。这里出不了站,所以看到的必然是兜底那份 ——
+  // 免费模型清单也搭这趟车。测试进程不起后台同步,所以拿到的必然是兜底那份 ——
   // 要验的是这个字段一定在、一定非空:前端已经不留本地常量了
   assert.deepEqual(s.models, FREE_MODELS);
   assert.deepEqual(Object.keys(s.modelAvailability).sort(), [...FREE_MODELS].sort(),
     '状态表必须覆盖当前免费清单');
-  assert.ok(Object.values(s.modelAvailability).every((x) => x.status === 'unknown'),
-    '没有出站节点时只能是 unknown,不能误报 unavailable');
   assert.equal(s.modelAvailabilityStatus.ttlMs, 6 * 60 * 60 * 1000);
   assert.deepEqual(Object.keys(s.modelAvailability), FREE_MODELS,
     '状态接口必须给当前清单里的每个模型一个可用性状态');

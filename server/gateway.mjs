@@ -325,14 +325,18 @@ const IDENTITY_DEFAULTS = {
  * 所以在源头洗,而不是在重试循环里补救 —— 重试循环没法区分「这次网络不好」
  * 和「这个值永远发不出去」,而这里可以。
  *
- * 洗法:CR/LF/Tab 折成空格(保住词边界,不把两个词粘成一个),非 latin1 整段
- * 剥掉;剥空了就返回空串,由调用方决定是补默认值还是不发这个头 —— 那比发一个
- * 空头或一串问号都更诚实。
+ * 洗法:CR/LF/Tab 折成空格(保住词边界,不把两个词粘成一个),Node 的
+ * checkInvalidHeaderChar 不接受的字节整段剥掉;剥空了就返回空串,由调用方决定
+ * 是补默认值还是不发这个头 —— 那比发一个空头或一串问号都更诚实。
+ *
+ * 白名单对齐 RFC 7230 的 field-vchar / obs-text:VCHAR(0x21-0x7E)、SP、以及
+ * 0x80-0xFF。刻意排除 0x7F(DEL)—— 它落在 latin1 里但不是合法头值,只挡
+ * `[^\x20-\xFF]` 会把它漏进去,于是 https.request 照旧在构造阶段抛。
  */
 function headerSafe(value) {
   return String(value ?? '')
     .replace(/[\r\n\t]+/g, ' ')
-    .replace(/[^\x20-\xFF]/g, '')
+    .replace(/[^\x20-\x7E\x80-\xFF]/g, '')
     .trim();
 }
 
@@ -890,7 +894,12 @@ export class Gateway {
     }
     // 子 lane 绑定节点被冷却时 ensureNode 内部回退了,返回的 cur 是主 lane 选的。
     // 此时 lane 已失去意义(它固定绑在冷却节点上),释放它、改走主 lane。
-    if (lane && lane.node !== cur) {
+    //
+    // 必须先看 lane.node:主 lane 对象没有这个字段(见 lane.mjs 的 this.main),
+    // 不判的话 `lane.node !== cur` 恒真,于是每个走主 lane 的请求都在进 attempt
+    // 之前就被 release —— main.active 永远归零,acquire 的快路径永远命中,
+    // 子 lane 一条都不会创建,maxChildLanes 整个功能空转。
+    if (lane && lane.node && lane.node !== cur) {
       this.lanes.release(lane);
       lane = null;
     }
@@ -1027,8 +1036,33 @@ export class Gateway {
         available: (node) => !this.cooldown.isCooling(node, group),
       })
       : this.cooldown.pickAvailable(nodes, group, exclude);
-    // 终态统一释放 lane。成功/失败都会走到,子 lane 由此空闲计数归零、可被回收。
-    const finishLane = () => { if (lane) this.lanes.release(lane); };
+    /**
+     * 客户端断开时把在飞的上游请求一起断掉,并停止换节点。
+     *
+     * 少了这一步:res 已经销毁而上游 resp 还在读,sink.write 往死 socket 写不会
+     * 同步抛错,于是这条流一直跑到自然结束或 STREAM_IDLE_MS(300s)静默才断 ——
+     * 隧道、mihomo 连接和这次请求的免费额度全部照烧,而结果没人接收。
+     *
+     * 只 abort 不够:重试循环会把 abort 当成一次传输失败,接着换下一个节点重发,
+     * 于是「取消一个请求」反而变成挨个节点烧额度。所以另记 clientGone,由循环
+     * 入口和 catch 一起看住。
+     */
+    const aborter = new AbortController();
+    const signal = aborter.signal;
+    let clientGone = false;
+    const onClientClose = () => {
+      if (res.writableEnded) return;   // 正常收尾也会触发 close,那不是取消
+      clientGone = true;
+      aborter.abort();
+    };
+    res.on('close', onClientClose);
+
+    // 终态统一释放 lane,并摘掉断开监听(否则同一个 socket 上的 keep-alive
+    // 请求会一路累积监听器)。成功/失败都会走到,子 lane 由此空闲计数归零。
+    const finishLane = () => {
+      res.off('close', onClientClose);
+      if (lane) this.lanes.release(lane);
+    };
 
     /**
      * 终态失败的统一出口。原来三处各写一套文案,其中「Tried N nodes, all
@@ -1081,6 +1115,13 @@ export class Gateway {
     // 次数和时间两个上限,谁先到都停。次数防「48 个节点挨个试」,
     // 时间防「每次都慢但都没超时」—— 只有次数上限的话后者能拖到几十分钟。
     while (switches <= MAX_NODE_TRIES) {
+      // 客户端已经走了:一个字节都不用再发。放在循环入口而不是只靠 abort ——
+      // abort 会以传输失败的形状回到 catch,那条路会接着换节点重发。
+      if (clientGone) {
+        finishLane();
+        this.logger('warn', `[cancel] 客户端断开,停止重试(换过 ${switches} 个节点)`);
+        return;
+      }
       if (left() < MIN_TRY_MS) {
         // 一个字节都还没发出去,所以只记客户端那一笔,不记节点尝试
         return giveUp(`预算烧穿,放弃(换过 ${switches} 个节点)`, true);
@@ -1088,8 +1129,8 @@ export class Gateway {
       const t0 = Date.now();
       try {
         const result = wantStream
-          ? await this.forwardStream(res, body, dialect, left(), identity, lane?.agent)
-          : await this.forward(body, left(), identity, dialect.path, lane?.agent);
+          ? await this.forwardStream(res, body, dialect, left(), identity, lane?.agent, signal)
+          : await this.forward(body, left(), identity, dialect.path, lane?.agent, signal);
 
         const dt = Date.now() - t0;
         if (wantStream) {
@@ -1102,7 +1143,10 @@ export class Gateway {
               this.lockedNode = cur;
               this.saveLastNode(cur);
             }
-            this.cooldown.clear(cur);
+            // 只清本供应商组:nemotron 成功不代表 default 组的日额度恢复。
+            // 不传 group 会按落地把该出口所有分组的冷却和 lastMarked 一起删掉,
+            // 把 3600s 的 Retry-After 提前解冻,队尾惩罚也一起丢。
+            this.cooldown.clear(cur, providerGroup(body.model));
             consecutive5xx = 0;
             bind(cur);
           } else {
@@ -1122,7 +1166,7 @@ export class Gateway {
           this.lockedNode = cur;
           this.saveLastNode(cur);
         }
-        this.cooldown.clear(cur);
+        this.cooldown.clear(cur, providerGroup(body.model));
         consecutive5xx = 0;
         bind(cur);
         this.usage.recordAttempt(cur, 'success', result.usage, { ttfb: result._ttfb, total: dt }, call);
@@ -1133,6 +1177,15 @@ export class Gateway {
         return dialect.respond(res, result, body.model);
       } catch (e) {
         const status = e.status || 0;
+
+        // abort 的形状和传输失败一样(status 0),不加这一条会被当成网络抖动,
+        // 于是「取消」变成挨个节点重发、烧完额度才停。
+        if (clientGone) {
+          finishLane();
+          this.logger('warn', `[cancel] 客户端断开,已中断上游请求 node="${cur}"`);
+          try { res.end(); } catch {}
+          return;
+        }
 
         // 流已经开始吐了就不能重试:头都发出去了,换节点等于给客户端拼接两半响应。
         // 收尾由 forwardStream 里的 sink 负责(它才拿得到那个 sink),这里只记账。
@@ -1177,16 +1230,17 @@ export class Gateway {
           // 上游限流是按窗口算的,给它一点恢复时间
           await sleep(2000);
           switches++;
-          if (await switchTo(next)) cur = next;
-          else {
+          // cur 由 switchTo 自己维护 —— 子 lane 切不动请求的名字时会落到它表里
+          // 第一个节点。这里写 cur = next 会让后续冷却/记账落在一个子 lane 根本
+          // 没在用的名字上,真正在跑的那个出口于是永远不被冷却。
+          if (!(await switchTo(next))) {
             tried.add(next);
             const fallback = pickNext(group, tried);
             if (!fallback) {
               return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
             switches++;
-            if (await switchTo(fallback)) cur = fallback;
-            else {
+            if (!(await switchTo(fallback))) {
               tried.add(fallback);
               continue;
             }
@@ -1214,11 +1268,7 @@ export class Gateway {
             const next = pickNext(group, tried);
             if (!next) return giveUp('所有节点都被机场拒连或冷却中');
             switches++;
-            if (await switchTo(next)) cur = next;
-            else {
-              tried.add(next);
-              continue;
-            }
+            if (!(await switchTo(next))) tried.add(next);
             continue;
           }
 
@@ -1238,16 +1288,14 @@ export class Gateway {
             return giveUp('所有节点都超时,没有可换的了', true);
           }
           switches++;
-          if (await switchTo(next)) cur = next;
-          else {
+          if (!(await switchTo(next))) {
             tried.add(next);
             const fallback = pickNext(group, tried);
             if (!fallback) {
               return giveUp('切不动节点了(候选全试过或全在冷却)');
             }
             switches++;
-            if (await switchTo(fallback)) cur = fallback;
-            else {
+            if (!(await switchTo(fallback))) {
               tried.add(fallback);
               continue;
             }
@@ -1316,7 +1364,7 @@ export class Gateway {
    * identity 非空时补上稳定 session;完整 identity 对象(实验开关开着)还会覆盖
    * User-Agent 并补上 OpenCode 那组头。Authorization 始终不加入。
    */
-  reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH, agent = this.agent }) {
+  reqOpts(bodyStr, { accept, timeout, identity = null, path = CHAT_PATH, agent = this.agent, signal = undefined }) {
     return {
       host: OPENCODE_HOST,
       port: 443,
@@ -1331,16 +1379,17 @@ export class Gateway {
       },
       agent,     // ← 真正经 mihomo 出站的地方(子 lane 传自己的 agent,走独立出口)
       timeout,
+      signal,    // 客户端断开时由 attempt 触发,把在飞的上游请求一起断掉
     };
   }
 
-  forward(body, budget = Infinity, identity = null, path = CHAT_PATH, agent = this.agent) {
+  forward(body, budget = Infinity, identity = null, path = CHAT_PATH, agent = this.agent, signal = undefined) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: false });
       // 单次超时不能超过整体剩余预算,否则一次慢请求就把预算吃穿
       const timeout = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
       const t0 = Date.now();
-      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path, agent }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: '*/*', timeout, identity, path, agent, signal }), (resp) => {
         let data = '';
         // 非流式的「首字」= 上游开始回话的时刻。整个 body 是一次攒完的,
         // 所以它和总耗时差的就是传输那点时间,不像流式那样能差几十秒
@@ -1374,7 +1423,7 @@ export class Gateway {
    * 首字节发出去之后就不再 reject,而是 resolve 成 { ok, usage } —— 记账
    * 交给 attempt 一处做,不然「按节点分类」这件事得在两个文件里各写一遍。
    */
-  forwardStream(res, body, dialect = OPENAI, budget = Infinity, identity = null, agent = this.agent) {
+  forwardStream(res, body, dialect = OPENAI, budget = Infinity, identity = null, agent = this.agent, signal = undefined) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify({ ...body, stream: true });
       const ttfb = Math.max(1_000, Math.min(silentFor(bodyStr.length), budget));
@@ -1405,7 +1454,7 @@ export class Gateway {
       let keepAlive = null;
       const stopHeartbeat = () => { keepAlive?.stop(); keepAlive = null; };
 
-      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path, agent }), (resp) => {
+      const r = https.request(this.reqOpts(bodyStr, { accept: 'text/event-stream', timeout: ttfb, identity, path: dialect.path, agent, signal }), (resp) => {
         if (resp.statusCode !== 200) {
           // 还没 writeHead,可以安全重试:收完 body 让上层判是 429 还是别的
           let data = '';
@@ -1434,13 +1483,16 @@ export class Gateway {
           r.destroy();
         });
 
+        // 这份缓冲只用来抓 usage,但解码同样要有状态:半个多字节字符会让
+        // JSON.parse 抛在下面那个 catch 里,表现为偶发丢一次 usage 记账。
         let buf = '';
+        const decoder = new TextDecoder('utf-8');
         resp.on('data', (chunk) => {
           // 保活计时重置:活跃的流不发 ping,静默满一个间隔才补
           keepAlive?.touch();
           firstByte ||= Date.now() - t0;
           sink.write(chunk);          // 先转发,统计是副产品,别让它拖慢流
-          buf += chunk.toString();
+          buf += decoder.decode(chunk, { stream: true });
           const lines = buf.split('\n');
           buf = lines.pop();          // 末行可能被截断,留着等下一个 chunk
           for (const line of lines) {

@@ -515,6 +515,8 @@ export class AnthropicStream {
     this.model = model;
     this.showThinking = thinking;  // false 时推理内容丢弃(见 line() 里的说明)
     this.buf = '';
+    // 有状态解码器:上游 chunk 边界会切在多字节字符中间,必须跨块保留残缺字节
+    this.decoder = new TextDecoder('utf-8');
     this.started = false;
     this.nextIndex = 0;
     this.textIndex = -1;           // -1 = 文本块还没开
@@ -549,10 +551,19 @@ export class AnthropicStream {
     this.emit('content_block_stop', { type: 'content_block_stop', index });
   }
 
-  /** 喂上游原始字节;内部按行切,半行留着等下一块 */
+  /**
+   * 喂上游原始字节;内部按行切,半行留着等下一块。
+   *
+   * 解码必须有状态:chunk 边界会切在多字节字符中间(中文 3 字节、emoji 4 字节),
+   * 每块各自 toString() 会把被切开的那个字符变成替换字符 U+FFFD,而且不可恢复。
+   * TextDecoder 的 stream 模式把残缺字节留到下一块再拼。
+   */
   feed(chunk) {
     if (this.done) return;
-    this.buf += chunk.toString();
+    this.buf += this.decoder.decode(
+      Buffer.isBuffer(chunk) || chunk instanceof Uint8Array ? chunk : Buffer.from(String(chunk)),
+      { stream: true },
+    );
     const lines = this.buf.split('\n');
     this.buf = lines.pop();        // 末行可能被截断
     for (const line of lines) this.line(line.trim());
@@ -589,6 +600,7 @@ export class AnthropicStream {
     const reasoning = str(delta.reasoning_content) || str(delta.reasoning);
     if (reasoning && this.showThinking) {
       if (this.thinkIndex < 0) {
+        this.closeOpen();
         this.thinkIndex = this.nextIndex++;
         this.blockStart(this.thinkIndex, { type: 'thinking', thinking: '' });
       }
@@ -603,6 +615,7 @@ export class AnthropicStream {
       // 而且 SDK 的 ThinkingBlock 类型里 signature 是必填,收尾前补上。
       this.closeThinking();
       if (this.textIndex < 0) {
+        this.closeOpen();
         this.textIndex = this.nextIndex++;
         this.blockStart(this.textIndex, { type: 'text', text: '' });
       }
@@ -634,13 +647,31 @@ export class AnthropicStream {
     this.thinkIndex = -1;
   }
 
+  /**
+   * 关掉所有还开着的块。Anthropic 的状态机不允许「上一个块没 stop 就 start
+   * 下一个」—— SDK 收到会直接抛。上游的 chunk 顺序不保证是「先推理、再正文、
+   * 最后工具」:混合输出模型会在正文之后继续吐 reasoning_content,也会先决定
+   * 调工具再解释。所以三条开块路径进入前一律先收干净。
+   *
+   * tools 一起清掉:块关了就不能再收 delta,同一个 tool_calls[].index 之后再来
+   * 分片只能新开一块。代价是「0、1、0 交错分片」会把参数拆成两块(客户端解不出
+   * 完整 JSON),但那比往已关闭的块发 delta 好 —— 后者直接让 SDK 抛掉整条流。
+   * 实测上游是按 index 顺序吐完一个再吐下一个,不会交错。
+   */
+  closeOpen() {
+    this.closeThinking();
+    for (const i of [...this.openBlocks]) this.blockStop(i);
+    // 关掉的块不能再收 delta:下一段正文/参数要新开一个 index
+    this.textIndex = -1;
+    this.tools.clear();
+  }
+
   toolDelta(tc) {
     const key = Number.isFinite(tc?.index) ? tc.index : 0;
     let acc = this.tools.get(key);
     if (!acc) {
-      // 文本/思考块先收掉:Anthropic 不允许两个块同时开着
-      this.closeThinking();
-      if (this.textIndex >= 0) { this.blockStop(this.textIndex); this.textIndex = -1; }
+      // 文本/思考/前一个工具块先收掉:Anthropic 不允许两个块同时开着
+      this.closeOpen();
       acc = { index: this.nextIndex++, id: tc?.id || `toolu_${Math.random().toString(36).slice(2, 10)}`, name: tc?.function?.name || '' };
       this.tools.set(key, acc);
       this.blockStart(acc.index, { type: 'tool_use', id: acc.id, name: acc.name, input: {} });
